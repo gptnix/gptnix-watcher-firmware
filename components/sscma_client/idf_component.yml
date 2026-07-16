@@ -1,7 +1,11 @@
-version: "1.0.2"
-description: SSCMA client
-url: https://github.com/Seeed-Studio/SenseCAP-Watcher/tree/main/components/sscma_client
 dependencies:
-  idf: ">=4.4.2"
   esp_io_expander:
-    version: "^1.0.1"
+    version: ^1.0.1
+  espressif/cjson:
+    rules:
+    - if: idf_version >=6.0
+    version: ^1.7.19
+  idf: '>=4.4.2'
+description: SSCMA client, patched for ESP-IDF 6
+url: https://github.com/Seeed-Studio/SenseCAP-Watcher/tree/main/components/sscma_client
+version: 1.0.3

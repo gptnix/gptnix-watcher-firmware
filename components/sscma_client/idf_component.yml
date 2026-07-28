@@ -6,6 +6,6 @@ dependencies:
     - if: idf_version >=6.0
     version: ^1.7.19
   idf: '>=4.4.2'
-description: SSCMA client, patched for ESP-IDF 6
+description: SSCMA client, compatible with the ESP-IDF I2C master driver
 url: https://github.com/Seeed-Studio/SenseCAP-Watcher/tree/main/components/sscma_client
-version: 1.0.3
+version: 1.0.4

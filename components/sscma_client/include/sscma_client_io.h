@@ -62,6 +62,7 @@ typedef struct
     uint32_t dev_addr; /*!< I2C device address */
     int wait_delay;
     void *user_ctx; /*!< User private data, passed directly to user_ctx */
+    uint32_t scl_speed_hz; /*!< I2C clock frequency, 0 selects the default 100 kHz */
 } sscma_client_io_i2c_config_t;
 
 /**

@@ -1,0 +1,32 @@
+name: GPTNiX Watcher Firmware Build
+
+on:
+  pull_request:
+    branches:
+      - baseline/fw-v1.1.7
+
+permissions:
+  contents: read
+
+jobs:
+  factory-firmware-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Print build metadata
+        run: |
+          echo "CI_BASELINE_EXPECTED=a7c0dfb3c9ed1d74addec41c9fae1a52e0c57dd7"
+          echo "CI_TARGET=esp32s3"
+          echo "CI_IDF_VERSION=v5.2.1"
+
+      - name: Build factory firmware (ESP-IDF v5.2.1, esp32s3)
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
+        with:
+          esp_idf_version: v5.2.1
+          target: esp32s3
+          path: examples/factory_firmware

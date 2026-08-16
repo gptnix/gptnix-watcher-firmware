@@ -102,6 +102,32 @@ sets a terminal state and never creates a new client automatically. The
 event handler (per the component's own documented restriction) — only
 caller-context `disconnect()`/`deinit()` may stop/destroy the client.
 
+## Single-client session lifecycle
+
+```text
+prepare_session() accepted ONLY from state==IDLE with ws_client==NULL
+connect() accepted ONLY from state==SESSION_READY with ws_client==NULL
+```
+
+M2 owns at most one `esp_websocket_client` handle at any point in time.
+`prepare_session()` never replaces an active/connecting/setup/ready session --
+a call made while a client handle already exists, or while the state is
+anything other than IDLE, is rejected with `INVALID_ARGUMENT` and performs no
+mutation of any kind (no parsing, no allocation, no state change, no
+replacement of the current session or client). `connect()` is rejected the
+same way if a client handle already exists.
+
+M2 intentionally has **no reset/reuse API**. After any terminal session
+attempt (`ERROR` or `CLOSED`), the caller must perform caller-side cleanup
+(`disconnect()` if a client handle exists) and then `deinit()`/`init()`
+before preparing another M2 session. A reusable session-reset API is an M3+
+design decision, not part of this milestone's contract.
+
+No implicit reconnect and no second client are ever created by this module
+on any internal failure path -- every pre-start failure destroys at most the
+one client this attempt itself created, then transitions to the terminal
+`ERROR` state.
+
 ## No audio, no Firebase/pairing, in M2
 
 This module never constructs a `realtimeInput`/audio message, never decodes
@@ -119,6 +145,20 @@ All session material (endpoint, token, setup JSON, RX reassembly buffer) is
 RAM-only, module-owned, and explicitly zeroized (`mbedtls_platform_zeroize`)
 once no longer needed, on every return path — not only the success path.
 This module never writes to NVS.
+
+The firmware-owned ephemeral token is zeroized at its point of last use, not
+only at terminal cleanup: immediately after `esp_websocket_client_append_header()`
+returns (success or failure), `s_ctx->token` is fully zeroized and
+`s_ctx->token_len` reset to 0, since GPTNiX itself never reads the
+module-owned token again after that call (no auth retry, no reconnect, no
+second setup). The third-party library's own internal copy of the appended
+Authorization header value remains until `esp_websocket_client_destroy()`,
+per the residual limitation documented below. Every pre-start `connect()`
+failure — auth-value formatting, WebSocket client init, header append, or
+event registration — clears all remaining module-owned session material
+before the module transitions to the terminal `ERROR` state; a client that
+was already created on that attempt is destroyed first, then the remaining
+session material is cleared.
 
 ## Third-party header-copy residual RAM limitation
 

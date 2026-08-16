@@ -152,6 +152,22 @@ static void s_sensitive_cjson_free_string(char **value)
     *value = NULL;
 }
 
+/* Terminal pre-running-client failure cleanup for connect(). Callable only
+ * when ws_client is already NULL -- either because a client was never
+ * created on this attempt, or because the caller already destroyed a
+ * partially-set-up client and set ws_client to NULL immediately before
+ * calling this. Never destroys a client itself; that responsibility stays
+ * with the caller so every destroy call site remains visible in connect(). */
+static app_gptnix_watcher_voice_result_t s_fail_before_running_client(
+    struct app_gptnix_watcher_voice *ctx,
+    app_gptnix_watcher_voice_result_t result)
+{
+    s_clear_session_material(ctx);
+    ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
+    ctx->last_result = result;
+    return result;
+}
+
 esp_err_t app_gptnix_watcher_voice_init(void)
 {
     if (s_ctx != NULL) {
@@ -192,6 +208,13 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
     size_t session_len)
 {
     if (s_ctx == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+    /* Single-client lifecycle: a session may only be prepared from IDLE with
+     * no existing client handle. M2 has no reset/reuse API -- a caller must
+     * disconnect()/deinit()/init() before preparing another session. This
+     * check runs before any parsing/allocation and never mutates state. */
+    if (s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_IDLE || s_ctx->ws_client != NULL) {
         return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
     }
     if (session_json == NULL || session_len == 0) {
@@ -423,7 +446,11 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_connect(void)
     if (s_ctx == NULL) {
         return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
     }
-    if (s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_SESSION_READY) {
+    /* Single-client lifecycle: connect() is only accepted from SESSION_READY
+     * with no existing client handle -- prevents a second live client from
+     * ever overwriting s_ctx->ws_client. No mutation on rejection. */
+    if (s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_SESSION_READY
+        || s_ctx->ws_client != NULL) {
         return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
     }
 
@@ -431,9 +458,7 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_connect(void)
     int written = snprintf(auth_value, sizeof(auth_value), "Token %s", s_ctx->token);
     if (written < 0 || (size_t)written >= sizeof(auth_value)) {
         mbedtls_platform_zeroize(auth_value, sizeof(auth_value));
-        s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
-        s_ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED;
-        return s_ctx->last_result;
+        return s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED);
     }
 
     esp_websocket_client_config_t config;
@@ -448,21 +473,23 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_connect(void)
     s_ctx->ws_client = esp_websocket_client_init(&config);
     if (s_ctx->ws_client == NULL) {
         mbedtls_platform_zeroize(auth_value, sizeof(auth_value));
-        s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
-        s_ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED;
-        return s_ctx->last_result;
+        return s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED);
     }
 
     esp_err_t header_err = esp_websocket_client_append_header(s_ctx->ws_client, "Authorization", auth_value);
     /* The library copies this value into its own heap-owned header state
-     * during append -- safe to zeroize our temporary copy immediately. */
+     * during append -- safe to zeroize our temporary copy immediately.
+     * GPTNiX itself never needs the module-owned token again after this
+     * point (no auth retry, no reconnect, no second setup/header
+     * construction) -- scrub it now at point of last use rather than
+     * waiting for terminal/disconnect cleanup. */
     mbedtls_platform_zeroize(auth_value, sizeof(auth_value));
+    mbedtls_platform_zeroize(s_ctx->token, sizeof(s_ctx->token));
+    s_ctx->token_len = 0;
     if (header_err != ESP_OK) {
         esp_websocket_client_destroy(s_ctx->ws_client);
         s_ctx->ws_client = NULL;
-        s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
-        s_ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED;
-        return s_ctx->last_result;
+        return s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED);
     }
 
     esp_err_t reg_err = esp_websocket_register_events(
@@ -470,9 +497,7 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_connect(void)
     if (reg_err != ESP_OK) {
         esp_websocket_client_destroy(s_ctx->ws_client);
         s_ctx->ws_client = NULL;
-        s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
-        s_ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED;
-        return s_ctx->last_result;
+        return s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED);
     }
 
     s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_CONNECTING;
@@ -481,10 +506,7 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_connect(void)
     if (start_err != ESP_OK) {
         esp_websocket_client_destroy(s_ctx->ws_client);
         s_ctx->ws_client = NULL;
-        s_clear_session_material(s_ctx);
-        s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
-        s_ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_START_FAILED;
-        return s_ctx->last_result;
+        return s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_START_FAILED);
     }
 
     return GPTNIX_WATCHER_VOICE_RESULT_OK;

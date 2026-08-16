@@ -564,7 +564,143 @@ def _c54():
     return not missing, "missing: %s" % missing
 
 
-FITNESS_CHECK_COUNT = 54
+# 55. prepare_session requires IDLE and no existing ws_client before parsing
+@check("55. prepare_session requires IDLE and no existing ws_client before parsing")
+def _c55():
+    text = _read(APP_C)
+    func_start = text.find("app_gptnix_watcher_voice_prepare_session(\n    const char *session_json")
+    if func_start < 0:
+        return False, "prepare_session definition not found"
+    malloc_idx = text.find("heap_caps_malloc(session_len + 1", func_start)
+    if malloc_idx < 0:
+        return False, "heap_caps_malloc(session_len + 1 not found after function start"
+    region = text[func_start:malloc_idx]
+    has_state_guard = "s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_IDLE" in region
+    has_ws_guard = "s_ctx->ws_client != NULL" in region
+    return has_state_guard and has_ws_guard, "state_guard=%s ws_guard=%s" % (has_state_guard, has_ws_guard)
+
+
+# 56. connect requires SESSION_READY and no existing ws_client
+@check("56. connect requires SESSION_READY and no existing ws_client")
+def _c56():
+    text = _read(APP_C)
+    func_start = text.find("app_gptnix_watcher_voice_connect(void)\n{")
+    if func_start < 0:
+        return False, "connect() definition not found"
+    init_idx = text.find("esp_websocket_client_init(&config)", func_start)
+    if init_idx < 0:
+        return False, "esp_websocket_client_init(&config) not found after function start"
+    region = text[func_start:init_idx]
+    has_state_guard = "s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_SESSION_READY" in region
+    has_ws_guard = "s_ctx->ws_client != NULL" in region
+    return has_state_guard and has_ws_guard, "state_guard=%s ws_guard=%s" % (has_state_guard, has_ws_guard)
+
+
+def _connect_function_region(text):
+    func_start = text.find("app_gptnix_watcher_voice_connect(void)\n{")
+    func_end = text.find("\napp_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_disconnect", func_start)
+    if func_start < 0 or func_end < 0:
+        return None
+    return text[func_start:func_end]
+
+
+# 57. auth-format and websocket-init failures clear session material
+@check("57. auth-format and websocket-init failures clear session material")
+def _c57():
+    text = _read(APP_C)
+    region = _connect_function_region(text)
+    if region is None:
+        return False, "connect() region not found"
+    helper_defined = (
+        "static app_gptnix_watcher_voice_result_t s_fail_before_running_client" in text
+        and "s_clear_session_material(ctx)" in text
+    )
+    auth_fail_idx = region.find("if (written < 0 || (size_t)written >= sizeof(auth_value))")
+    ws_init_fail_idx = region.find("if (s_ctx->ws_client == NULL) {")
+    if auth_fail_idx < 0 or ws_init_fail_idx < 0:
+        return False, "auth_fail_idx=%d ws_init_fail_idx=%d" % (auth_fail_idx, ws_init_fail_idx)
+    auth_block = region[auth_fail_idx:auth_fail_idx + 400]
+    ws_init_block = region[ws_init_fail_idx:ws_init_fail_idx + 400]
+    call = "s_fail_before_running_client(s_ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_INIT_FAILED)"
+    auth_ok = call in auth_block
+    ws_init_ok = call in ws_init_block
+    return (helper_defined and auth_ok and ws_init_ok), \
+        "helper_defined=%s auth_ok=%s ws_init_ok=%s" % (helper_defined, auth_ok, ws_init_ok)
+
+
+# 58. append-header and event-registration failures destroy client then clear session
+@check("58. append-header and event-registration failures destroy client then clear session")
+def _c58():
+    text = _read(APP_C)
+    region = _connect_function_region(text)
+    if region is None:
+        return False, "connect() region not found"
+    header_fail_idx = region.find("if (header_err != ESP_OK) {")
+    reg_fail_idx = region.find("if (reg_err != ESP_OK) {")
+    if header_fail_idx < 0 or reg_fail_idx < 0:
+        return False, "header_fail_idx=%d reg_fail_idx=%d" % (header_fail_idx, reg_fail_idx)
+    header_block = region[header_fail_idx:header_fail_idx + 400]
+    reg_block = region[reg_fail_idx:reg_fail_idx + 400]
+
+    def destroy_before_clear(block):
+        destroy_idx = block.find("esp_websocket_client_destroy(s_ctx->ws_client)")
+        null_idx = block.find("s_ctx->ws_client = NULL;")
+        clear_idx = block.find("s_fail_before_running_client(")
+        if destroy_idx < 0 or null_idx < 0 or clear_idx < 0:
+            return False
+        return destroy_idx < null_idx < clear_idx
+
+    header_ok = destroy_before_clear(header_block)
+    reg_ok = destroy_before_clear(reg_block)
+    return header_ok and reg_ok, "header_ok=%s reg_ok=%s" % (header_ok, reg_ok)
+
+
+# 59. module-owned token is zeroized immediately after append_header and token_len reset
+@check("59. module-owned token is zeroized immediately after append_header and token_len reset")
+def _c59():
+    text = _read(APP_C)
+    region = _connect_function_region(text)
+    if region is None:
+        return False, "connect() region not found"
+    append_idx = region.find('esp_websocket_client_append_header(s_ctx->ws_client, "Authorization", auth_value)')
+    if append_idx < 0:
+        return False, "append_header call not found"
+    after_append = region[append_idx:]
+    auth_zero_idx = after_append.find("mbedtls_platform_zeroize(auth_value, sizeof(auth_value))")
+    token_zero_idx = after_append.find("mbedtls_platform_zeroize(s_ctx->token, sizeof(s_ctx->token))")
+    token_len_idx = after_append.find("s_ctx->token_len = 0;")
+    order_ok = (
+        auth_zero_idx >= 0 and token_zero_idx >= 0 and token_len_idx >= 0
+        and auth_zero_idx < token_zero_idx < token_len_idx
+    )
+    if not order_ok:
+        return False, "auth_zero_idx=%d token_zero_idx=%d token_len_idx=%d" % (
+            auth_zero_idx, token_zero_idx, token_len_idx)
+    after_reset = after_append[token_len_idx + len("s_ctx->token_len = 0;"):]
+    token_reads = re.findall(r"s_ctx->token\b", after_reset)
+    return len(token_reads) == 0, "token_reads_after_reset=%s" % (token_reads,)
+
+
+# 60. firmware contract locks one-client lifecycle and explicit M2 reinitialization before a new session
+@check("60. firmware contract locks one-client lifecycle and explicit M2 reinitialization before a new session")
+def _c60():
+    text = _read(CONTRACT_MD)
+    required = [
+        "Single-client session lifecycle",
+        "state==IDLE",
+        "ws_client==NULL",
+        "state==SESSION_READY",
+        "no reset/reuse API",
+        "before preparing another M2 session",
+    ]
+    missing = [s for s in required if s not in text]
+    lowered = text.lower()
+    forbidden = ["auto-reuse", "automatically reuse", "auto reset", "auto-reconnect the session"]
+    forbidden_hits = [s for s in forbidden if s in lowered]
+    return (not missing) and (not forbidden_hits), "missing=%s forbidden_hits=%s" % (missing, forbidden_hits)
+
+
+FITNESS_CHECK_COUNT = 60
 
 
 def main():

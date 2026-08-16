@@ -508,6 +508,65 @@ def _c50():
     return not missing, "missing: %s" % missing
 
 
+# 51. raw session DTO copy is zeroized before free
+@check("51. raw session DTO copy is zeroized before free")
+def _c51():
+    text = _read(APP_C)
+    zeroize_idx = text.find("mbedtls_platform_zeroize(dto_copy, session_len + 1)")
+    free_idx = text.find("free(dto_copy)")
+    if zeroize_idx < 0 or free_idx < 0:
+        return False, "zeroize_idx=%d free_idx=%d" % (zeroize_idx, free_idx)
+    return zeroize_idx < free_idx, "zeroize_idx=%d free_idx=%d" % (zeroize_idx, free_idx)
+
+
+# 52. parsed session cJSON valuestrings are zeroized before cJSON_Delete
+@check("52. parsed session cJSON valuestrings are zeroized before cJSON_Delete")
+def _c52():
+    text = _read(APP_C)
+    required = [
+        "s_zeroize_cjson_valuestrings",
+        "s_sensitive_cjson_delete",
+        "s_sensitive_cjson_delete(&root)",
+    ]
+    missing = [s for s in required if s not in text]
+    raw_delete_hits = re.findall(r"\bcJSON_Delete\(root\)", text)
+    return (not missing) and not raw_delete_hits, "missing=%s raw_delete_hits=%s" % (missing, raw_delete_hits)
+
+
+# 53. cJSON printed setup string is zeroized before cJSON_free on every path
+@check("53. cJSON printed setup string is zeroized before cJSON_free on every path")
+def _c53():
+    text = _read(APP_C)
+    required = [
+        "s_sensitive_cjson_free_string",
+        "mbedtls_platform_zeroize(*value, len + 1)",
+    ]
+    missing = [s for s in required if s not in text]
+    # The helper's own body owns the one legitimate direct cJSON_free(*value)
+    # call; every other call site must go through s_sensitive_cjson_free_string.
+    direct_printed_free = len(re.findall(r"\bcJSON_free\(printed\)", text))
+    helper_owns_free = "cJSON_free(*value)" in text
+    ok = (not missing) and direct_printed_free == 0 and helper_owns_free
+    return ok, "missing=%s direct_printed_free=%d helper_owns_free=%s" % (missing, direct_printed_free, helper_owns_free)
+
+
+# 54. setupComplete requires an empty object before READY
+@check("54. setupComplete requires an empty object before READY")
+def _c54():
+    text = _read(APP_C)
+    required = [
+        'strcmp(child->string, "setupComplete") == 0',
+        "cJSON_IsObject(child)",
+        "child->child == NULL",
+        "key_count == 1",
+    ]
+    missing = [s for s in required if s not in text]
+    return not missing, "missing: %s" % missing
+
+
+FITNESS_CHECK_COUNT = 54
+
+
 def main():
     print("=== GPTNiX Watcher voice foundation fitness test (M2) ===")
     print("FACTORY_DIR=%s" % FACTORY_DIR)

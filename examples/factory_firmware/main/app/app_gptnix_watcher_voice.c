@@ -104,6 +104,54 @@ static void s_clear_session_material(struct app_gptnix_watcher_voice *ctx)
     ctx->rx_payload_len = 0;
 }
 
+/* Recursively zeroizes every non-NULL valuestring reachable from `item`
+ * (siblings via ->next, children via ->child), without freeing or altering
+ * cJSON tree structure. cJSON_Delete() already performs an equivalent
+ * recursive traversal to free nodes; this walks the same shape first to
+ * scrub secret-bearing string content before that memory is released.
+ * Accepts NULL safely. Never logs, never allocates. */
+static void s_zeroize_cjson_valuestrings(cJSON *item)
+{
+    while (item != NULL) {
+        if (item->valuestring != NULL) {
+            mbedtls_platform_zeroize(item->valuestring, strlen(item->valuestring) + 1);
+        }
+        if (item->child != NULL) {
+            s_zeroize_cjson_valuestrings(item->child);
+        }
+        item = item->next;
+    }
+}
+
+/* Zeroizes every secret-bearing string in the parsed tree before releasing
+ * it -- cJSON_Delete() frees but does not zero string memory first. Use for
+ * the parsed session DTO root, which may carry client.auth.token. */
+static void s_sensitive_cjson_delete(cJSON **item)
+{
+    if (item == NULL || *item == NULL) {
+        return;
+    }
+    s_zeroize_cjson_valuestrings(*item);
+    cJSON_Delete(*item);
+    *item = NULL;
+}
+
+/* Zeroizes a cJSON-allocated string (e.g. from cJSON_PrintUnformatted)
+ * before releasing it via cJSON_free(). Use for the printed setup JSON,
+ * which is the exact wire message firmware will send and therefore is not
+ * itself a secret, but is treated with the same deterministic cleanup path
+ * as the rest of this module's session material per its own contract. */
+static void s_sensitive_cjson_free_string(char **value)
+{
+    if (value == NULL || *value == NULL) {
+        return;
+    }
+    size_t len = strlen(*value);
+    mbedtls_platform_zeroize(*value, len + 1);
+    cJSON_free(*value);
+    *value = NULL;
+}
+
 esp_err_t app_gptnix_watcher_voice_init(void)
 {
     if (s_ctx != NULL) {
@@ -173,6 +221,9 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
     const char *parse_end = NULL;
     cJSON *root = cJSON_ParseWithLengthOpts(dto_copy, session_len + 1, &parse_end, 1);
     bool full_consumption = (root != NULL) && (parse_end == dto_copy + session_len);
+    /* dto_copy may carry the full raw DTO, including the ephemeral token
+     * text, verbatim -- zeroize before free, not after. */
+    mbedtls_platform_zeroize(dto_copy, session_len + 1);
     free(dto_copy);
     dto_copy = NULL;
 
@@ -261,7 +312,7 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
                 char *printed = cJSON_PrintUnformatted(setup_item);
                 if (printed == NULL) break;
                 size_t printed_len = strlen(printed);
-                if (printed_len == 0 || printed_len > 32767) { cJSON_free(printed); break; }
+                if (printed_len == 0 || printed_len > 32767) { s_sensitive_cjson_free_string(&printed); break; }
 
                 /* Require exactly one top-level key, named "setup". */
                 {
@@ -274,32 +325,32 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
                             has_setup_key = true;
                         }
                     }
-                    if (key_count != 1 || !has_setup_key) { cJSON_free(printed); break; }
+                    if (key_count != 1 || !has_setup_key) { s_sensitive_cjson_free_string(&printed); break; }
                 }
 
                 cJSON *inner_setup = cJSON_GetObjectItemCaseSensitive(setup_item, "setup");
-                if (!cJSON_IsObject(inner_setup)) { cJSON_free(printed); break; }
+                if (!cJSON_IsObject(inner_setup)) { s_sensitive_cjson_free_string(&printed); break; }
 
                 /* Consistency validation only: setup.setup.model must equal
                  * "models/" + top-level model. Firmware never generates or
                  * chooses this value -- it only proves the backend's own DTO
                  * is internally consistent before trusting it. */
                 cJSON *inner_model = cJSON_GetObjectItemCaseSensitive(inner_setup, "model");
-                if (!cJSON_IsString(inner_model) || inner_model->valuestring == NULL) { cJSON_free(printed); break; }
+                if (!cJSON_IsString(inner_model) || inner_model->valuestring == NULL) { s_sensitive_cjson_free_string(&printed); break; }
                 {
                     size_t expected_len = strlen("models/") + model_len;
                     if (strlen(inner_model->valuestring) != expected_len
                         || strncmp(inner_model->valuestring, "models/", 7) != 0
                         || strcmp(inner_model->valuestring + 7, model_item->valuestring) != 0) {
-                        cJSON_free(printed);
+                        s_sensitive_cjson_free_string(&printed);
                         break;
                     }
                 }
 
                 cJSON *gen_config = cJSON_GetObjectItemCaseSensitive(inner_setup, "generationConfig");
-                if (!cJSON_IsObject(gen_config)) { cJSON_free(printed); break; }
+                if (!cJSON_IsObject(gen_config)) { s_sensitive_cjson_free_string(&printed); break; }
                 cJSON *modalities = cJSON_GetObjectItemCaseSensitive(gen_config, "responseModalities");
-                if (!cJSON_IsArray(modalities)) { cJSON_free(printed); break; }
+                if (!cJSON_IsArray(modalities)) { s_sensitive_cjson_free_string(&printed); break; }
                 {
                     int audio_count = 0;
                     cJSON *m = NULL;
@@ -309,14 +360,14 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
                             audio_count++;
                         }
                     }
-                    if (audio_count != 1) { cJSON_free(printed); break; }
+                    if (audio_count != 1) { s_sensitive_cjson_free_string(&printed); break; }
                 }
 
                 if (endpoint_len >= sizeof(local_endpoint)
                     || token_len >= sizeof(local_token)
                     || printed_len >= GPTNIX_WATCHER_VOICE_SETUP_JSON_MAX_BYTES) {
                     /* Defensive: unreachable given the bound checks above. */
-                    cJSON_free(printed);
+                    s_sensitive_cjson_free_string(&printed);
                     break;
                 }
 
@@ -330,18 +381,18 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
 
                 local_setup_json = (char *)heap_caps_malloc(printed_len + 1, MALLOC_CAP_SPIRAM);
                 if (local_setup_json == NULL) {
-                    cJSON_free(printed);
+                    s_sensitive_cjson_free_string(&printed);
                     result = GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
                     break;
                 }
                 memcpy(local_setup_json, printed, printed_len + 1);
                 local_setup_json_len = printed_len;
-                cJSON_free(printed);
+                s_sensitive_cjson_free_string(&printed);
 
                 result = GPTNIX_WATCHER_VOICE_RESULT_OK;
             } while (0);
         }
-        cJSON_Delete(root);
+        s_sensitive_cjson_delete(&root);
     }
 
     if (result == GPTNIX_WATCHER_VOICE_RESULT_OK) {
@@ -583,7 +634,12 @@ static void s_ws_event_handler(void *handler_args,
                 cJSON_ArrayForEach(child, reply) {
                     key_count++;
                     if (child->string != NULL && strcmp(child->string, "setupComplete") == 0
-                        && cJSON_IsObject(child)) {
+                        && cJSON_IsObject(child) && child->child == NULL) {
+                        /* Locked contract accepts ONLY {"setupComplete":{}} --
+                         * cJSON_IsObject rejects arrays/null/scalars, and
+                         * child->child == NULL proves the object has zero
+                         * members (an object with any key has a non-NULL
+                         * ->child pointing at its first member). */
                         has_setup_complete_key = true;
                     }
                 }

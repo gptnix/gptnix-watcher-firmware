@@ -41,7 +41,6 @@ void app_gptnix_qr_pair_payload_clear(gptnix_qr_pair_payload_t *payload)
 #include "cJSON.h"
 #include "esp_jpeg_dec.h"
 #include "quirc.h"
-#include "isp.h"
 
 #define GPTNIX_QR_IMAGE_WIDTH       (240)
 #define GPTNIX_QR_IMAGE_HEIGHT      (240)
@@ -54,6 +53,45 @@ static bool s_initialized = false;
 static struct quirc *s_quirc = NULL;
 static uint8_t *s_jpeg_buf = NULL;   /* GPTNIX_QR_JPEG_MAX_BYTES, decoded (base64->binary) JPEG bytes */
 static uint8_t *s_rgb565_buf = NULL; /* GPTNIX_QR_RGB565_BYTES, 16-byte aligned JPEG decode output */
+
+/* RGB565(BE)->grayscale lookup tables and conversion, values copied from
+ * examples/qrcode_reader/main/isp.c::rgb565_to_gray(). That file belongs to
+ * a separate, unwired example project (not reachable from factory_firmware's
+ * build), so its proven algorithm is reproduced here as a PRIVATE helper
+ * rather than introducing a second public ISP owner/module. This
+ * specialization is fixed to this foundation's one proven format: a square
+ * dim x dim buffer, ROTATION_UP, mirror=true -- the general
+ * rotation/non-square/no-mirror cases of the original are intentionally not
+ * reproduced, since this foundation never needs them. */
+static const uint8_t s_rgb565_to_rgb888_table5[] = {
+    0, 8, 16, 25, 33, 41, 49, 58, 66, 74, 82, 90, 99, 107, 115, 123,
+    132, 140, 148, 156, 165, 173, 181, 189, 197, 206, 214, 222, 230, 239, 247, 255
+};
+
+static const uint8_t s_rgb565_to_rgb888_table6[] = {
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 45, 49, 53, 57, 61,
+    65, 69, 73, 77, 81, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121, 125,
+    130, 134, 138, 142, 146, 150, 154, 158, 162, 166, 170, 174, 178, 182, 186, 190,
+    194, 198, 202, 206, 210, 215, 219, 223, 227, 231, 235, 239, 243, 247, 251, 255
+};
+
+static void s_rgb565_to_gray(uint8_t *pdst, const uint8_t *psrc, int dim)
+{
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < dim; j++) {
+            uint32_t index = (uint32_t)i * (uint32_t)dim + (uint32_t)j;
+
+            uint8_t r = s_rgb565_to_rgb888_table5[(psrc[index * 2] & 0xF8) >> 3];
+            uint8_t g = s_rgb565_to_rgb888_table6[((psrc[index * 2] & 0x07) << 3) | ((psrc[index * 2 + 1] & 0xE0) >> 5)];
+            uint8_t b = s_rgb565_to_rgb888_table5[psrc[index * 2 + 1] & 0x1F];
+
+            /* mirror=true; rotation=ROTATION_UP applies no transform of its own. */
+            uint32_t out_index = (uint32_t)(dim - 1 - (int)(index / (uint32_t)dim)) * (uint32_t)dim + (index % (uint32_t)dim);
+
+            pdst[out_index] = (uint8_t)(((uint32_t)r * 299 + (uint32_t)g * 587 + (uint32_t)b * 114) / 1000);
+        }
+    }
+}
 
 /* Unwinds exactly the resources already acquired at the point of a partial
  * init failure; never touches a resource that was never acquired. */
@@ -214,10 +252,7 @@ gptnix_qr_pair_result_t app_gptnix_qr_pair_decode_base64_jpeg(
     }
 
     /* Same orientation behavior as the proven examples/qrcode_reader path. */
-    rgb565_to_gray(qbuf, s_rgb565_buf,
-                    GPTNIX_QR_IMAGE_HEIGHT, GPTNIX_QR_IMAGE_WIDTH,
-                    GPTNIX_QR_IMAGE_HEIGHT, GPTNIX_QR_IMAGE_WIDTH,
-                    ROTATION_UP, true);
+    s_rgb565_to_gray(qbuf, s_rgb565_buf, GPTNIX_QR_IMAGE_WIDTH);
 
     quirc_end(s_quirc);
 

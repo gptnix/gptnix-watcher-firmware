@@ -4,13 +4,27 @@ fitness test (M2). Python standard library only, no pip dependency.
 
 This is a STATIC SOURCE proof, not a runtime/physical proof: it never
 builds, flashes, or executes firmware. It exits non-zero if any invariant
-below is violated. It combines semantic source checks with git-diff-based
-checks against BASE_SHA to prove protected files are genuinely unchanged
+below is violated. It combines semantic source checks with Git blob-identity
+checks against immutable, Phase-A-proven blob IDs to prove protected files
+are genuinely byte-identical to DEVELOPMENT_BASE_SHA a27210a8dd738f2c9241234820dce69a8a8de480
 (not merely unmentioned in comments).
+
+CI portability note: the CI checkout for this repo intentionally uses
+`fetch-depth: 1` (see .github/workflows/gptnix-firmware-build.yml), so the
+base commit object is NOT reachable in that runner. Protected-file checks
+therefore must never dereference BASE_SHA through any git command (no
+`git diff BASE_SHA`, `git show BASE_SHA`, `git cat-file BASE_SHA`,
+`git rev-parse BASE_SHA`) at runtime. Instead they compare the Git blob
+identity of the current on-disk file bytes (computed locally, requiring no
+history) against an immutable blob ID captured once, out-of-band, from the
+canonical base and embedded below as a constant. This principle mirrors the
+same shallow-clone-safe policy already used by test_qr_pairing_fitness.py's
+structural-presence checks -- this file previously violated that policy for
+checks #42-46 and was corrected to fix it.
 """
+import hashlib
 import os
 import re
-import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,16 +68,60 @@ def check(name):
     return decorator
 
 
-def _git_diff_empty(path_rel):
-    """True if `path_rel` (repo-root-relative) is byte-identical to BASE_SHA."""
+# Immutable Git blob IDs of the exact protected files at DEVELOPMENT_BASE_SHA
+# a27210a8dd738f2c9241234820dce69a8a8de480, captured out-of-band via:
+#   git rev-parse "$BASE_SHA:<relative-path>"
+# and independently cross-checked against the current worktree via:
+#   git hash-object --no-filters "<relative-path>"
+# before being embedded here. They intentionally avoid parent/base history
+# at runtime because CI uses fetch-depth:1.
+PROTECTED_BASE_BLOBS = {
+    "examples/factory_firmware/main/main.c":
+        "788018ee6c9fc875f12794b8a4daef8e59ad956f",
+    "examples/factory_firmware/main/CMakeLists.txt":
+        "6663576a37eb11b5ae0ef8494fa6cd4238bdd590",
+    "examples/factory_firmware/main/app/app_audio_recorder.c":
+        "8cfb5065e89248e6ed9d9fce3f5fcd4ec58257f3",
+    "examples/factory_firmware/main/app/app_audio_recorder.h":
+        "9a209cb303e02fdb0828a8050d8cbb018af60052",
+    "examples/factory_firmware/main/app/app_audio_player.c":
+        "bb0bc1bb478de19b625326226c548504d06a20c2",
+    "examples/factory_firmware/main/app/app_audio_player.h":
+        "8a0b8485a102aa0ec98f3b1634a03ae3c0491eb1",
+    "examples/factory_firmware/main/app/app_voice_interaction.c":
+        "7869b7d1257135c6d38e41a77f0f92c6b6d36e49",
+}
+
+
+def _working_tree_git_blob_sha(path_rel):
+    """Git blob SHA-1 of the current on-disk file, computed locally from its
+    bytes using the Git blob object formula (sha1("blob " + len + "\\0" +
+    data)) -- requires no git invocation, no network, and no repository
+    history of any depth. Returns None (fail closed) if the file is missing
+    or unreadable, never an exception that a caller could misclassify."""
+    abs_path = os.path.join(REPO_ROOT, path_rel)
     try:
-        out = subprocess.run(
-            ["git", "diff", "--quiet", BASE_SHA, "--", path_rel],
-            cwd=REPO_ROOT, check=False,
-        )
-        return out.returncode == 0
-    except Exception:
+        with open(abs_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    header = b"blob " + str(len(data)).encode("ascii") + b"\0"
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _protected_file_matches_base(path_rel):
+    """True only if the current working-tree file's Git blob identity
+    matches the immutable base blob ID captured in PROTECTED_BASE_BLOBS. A
+    missing/unreadable file or a hash mismatch both fail closed to False --
+    there is no exception path that could be silently misread as "changed"
+    versus an infrastructure error, because there is no infrastructure
+    dependency (no subprocess, no git, no BASE_SHA dereference) left here at
+    all."""
+    expected = PROTECTED_BASE_BLOBS.get(path_rel)
+    if expected is None:
         return False
+    actual = _working_tree_git_blob_sha(path_rel)
+    return actual == expected
 
 
 # 1. header + source files exist
@@ -378,37 +436,38 @@ def _c41():
     return not hits, "found: %s" % hits
 
 
-# 42-46. protected files unchanged (git diff against BASE_SHA)
+# 42-46. protected files byte-identical to their immutable base blob IDs
+# (shallow-clone-safe: no BASE_SHA dereference, no subprocess, no git call)
 @check("42. main.c untouched/no runtime call site to new module")
 def _c42():
-    diff_clean = _git_diff_empty("examples/factory_firmware/main/main.c")
+    blob_match = _protected_file_matches_base("examples/factory_firmware/main/main.c")
     text = _read(MAIN_C) if os.path.isfile(MAIN_C) else ""
     no_callsite = "app_gptnix_watcher_voice" not in text
-    return diff_clean and no_callsite, "diff_clean=%s no_callsite=%s" % (diff_clean, no_callsite)
+    return blob_match and no_callsite, "blob_match=%s no_callsite=%s" % (blob_match, no_callsite)
 
 
 @check("43. CMakeLists.txt untouched")
 def _c43():
-    return _git_diff_empty("examples/factory_firmware/main/CMakeLists.txt"), ""
+    return _protected_file_matches_base("examples/factory_firmware/main/CMakeLists.txt"), ""
 
 
 @check("44. app_audio_recorder.c/.h untouched")
 def _c44():
-    a = _git_diff_empty("examples/factory_firmware/main/app/app_audio_recorder.c")
-    b = _git_diff_empty("examples/factory_firmware/main/app/app_audio_recorder.h")
+    a = _protected_file_matches_base("examples/factory_firmware/main/app/app_audio_recorder.c")
+    b = _protected_file_matches_base("examples/factory_firmware/main/app/app_audio_recorder.h")
     return a and b, "c=%s h=%s" % (a, b)
 
 
 @check("45. app_audio_player.c/.h untouched")
 def _c45():
-    a = _git_diff_empty("examples/factory_firmware/main/app/app_audio_player.c")
-    b = _git_diff_empty("examples/factory_firmware/main/app/app_audio_player.h")
+    a = _protected_file_matches_base("examples/factory_firmware/main/app/app_audio_player.c")
+    b = _protected_file_matches_base("examples/factory_firmware/main/app/app_audio_player.h")
     return a and b, "c=%s h=%s" % (a, b)
 
 
 @check("46. app_voice_interaction.c untouched")
 def _c46():
-    return _git_diff_empty("examples/factory_firmware/main/app/app_voice_interaction.c"), ""
+    return _protected_file_matches_base("examples/factory_firmware/main/app/app_voice_interaction.c"), ""
 
 
 # 47. feature OFF public path returns DISABLED deterministically

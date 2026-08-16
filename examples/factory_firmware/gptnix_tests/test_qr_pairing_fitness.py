@@ -257,6 +257,105 @@ def _c24():
     return "esp_err_t sscma_client_register_callback" in text, ""
 
 
+def _disabled_impl_region(text):
+    m = re.search(
+        r"#else\s*/\*\s*!CONFIG_GPTNIX_QR_PAIRING\s*\*/(.*?)#endif\s*/\*\s*CONFIG_GPTNIX_QR_PAIRING\s*\*/",
+        text, re.DOTALL,
+    )
+    return m.group(1) if m else ""
+
+
+# 25. disabled implementation clears non-NULL out_payload
+@check("25. compile-time-disabled decode clears non-NULL out_payload before returning DISABLED")
+def _c25():
+    region = _disabled_impl_region(_read(APP_C))
+    has_clear_call = "app_gptnix_qr_pair_payload_clear(out_payload)" in region
+    has_disabled_return = "GPTNIX_QR_PAIR_RESULT_DISABLED" in region
+    clear_idx = region.find("app_gptnix_qr_pair_payload_clear(out_payload)")
+    disabled_idx = region.find("return GPTNIX_QR_PAIR_RESULT_DISABLED")
+    ordered = has_clear_call and has_disabled_return and 0 <= clear_idx < disabled_idx
+    return ordered, "clear_present=%s disabled_present=%s order_ok=%s" % (has_clear_call, has_disabled_return, ordered)
+
+
+# 26. embedded-NUL rejection before JSON parse
+@check("26. embedded-NUL in data.payload is rejected before cJSON parsing")
+def _c26():
+    text = _read(APP_C)
+    memchr_idx = text.find("memchr(data.payload")
+    parse_idx = text.find("cJSON_ParseWithLengthOpts(")
+    if memchr_idx == -1 or parse_idx == -1:
+        return False, "memchr_idx=%d parse_idx=%d" % (memchr_idx, parse_idx)
+    return memchr_idx < parse_idx, "memchr@%d < parse@%d" % (memchr_idx, parse_idx)
+
+
+# 27. cJSON_ParseWithLengthOpts used for the pairing envelope
+@check("27. cJSON_ParseWithLengthOpts is used for the pairing envelope")
+def _c27():
+    return "cJSON_ParseWithLengthOpts(qr_text" in _read(APP_C), ""
+
+
+# 28. plain cJSON_Parse(qr_text) no longer used
+@check("28. plain cJSON_Parse(qr_text) is no longer used")
+def _c28():
+    return "cJSON_Parse(qr_text)" not in _read(APP_C), ""
+
+
+# 29. module-owned JPEG scratch is zeroized
+@check("29. module-owned JPEG scratch (s_jpeg_buf) is zeroized")
+def _c29():
+    return "mbedtls_platform_zeroize(s_jpeg_buf" in _read(APP_C), ""
+
+
+# 30. module-owned RGB565 scratch is zeroized
+@check("30. module-owned RGB565 scratch (s_rgb565_buf) is zeroized")
+def _c30():
+    return "mbedtls_platform_zeroize(s_rgb565_buf" in _read(APP_C), ""
+
+
+# 31. quirc grayscale frame scratch is zeroized
+@check("31. quirc grayscale frame scratch (qbuf) is zeroized")
+def _c31():
+    return "mbedtls_platform_zeroize(qbuf," in _read(APP_C), ""
+
+
+# 32. deinit/unwind zeroizes image scratch before free
+@check("32. s_unwind_partial_init zeroizes JPEG/RGB565 scratch before freeing each")
+def _c32():
+    text = _read(APP_C)
+    m = re.search(
+        r"static void s_unwind_partial_init\(.*?\n\}\n", text, re.DOTALL,
+    )
+    if not m:
+        return False, "s_unwind_partial_init body not found"
+    body = m.group(0)
+    rgb_zero_idx = body.find("mbedtls_platform_zeroize(s_rgb565_buf")
+    rgb_free_idx = body.find("free(s_rgb565_buf)")
+    jpeg_zero_idx = body.find("mbedtls_platform_zeroize(s_jpeg_buf")
+    jpeg_free_idx = body.find("free(s_jpeg_buf)")
+    ok = (
+        rgb_zero_idx != -1 and rgb_free_idx != -1 and rgb_zero_idx < rgb_free_idx
+        and jpeg_zero_idx != -1 and jpeg_free_idx != -1 and jpeg_zero_idx < jpeg_free_idx
+    )
+    return ok, "rgb_zero@%d<free@%d jpeg_zero@%d<free@%d" % (rgb_zero_idx, rgb_free_idx, jpeg_zero_idx, jpeg_free_idx)
+
+
+# 33. no additional SSCMA/camera/network/NVS owner appeared (re-verify post-correction)
+@check("33. no new SSCMA/camera/network/NVS owner introduced by the correction")
+def _c33():
+    text = _read(APP_C)
+    hits = []
+    for s in (
+        "sscma_client_register_callback", "bsp_sscma_client_init",
+        "sscma_client_sample", "sscma_client_invoke", "sscma_client_set_sensor",
+        "esp_http_client", "storage_write", "storage_read", "nvs_",
+    ):
+        if s in text:
+            hits.append(s)
+    if any(s in text.lower() for s in ("ble_gap", "ble_gatt", "esp_ble", "nimble")):
+        hits.append("ble-api")
+    return not hits, "found: %s" % hits
+
+
 def main():
     print("=== GPTNiX QR pairing foundation fitness test ===")
     print("FACTORY_DIR=%s" % FACTORY_DIR)

@@ -50,4 +50,8 @@ menu "Factory Firmware Example Configuration"
         default n
         help
             Enable wake-up word and VAD detection functions, SR is still an experimental feature .
+
+    config GPTNIX_WATCHER_VOICE
+        bool "Enable GPTNiX Watcher realtime voice transport foundation"
+        default n
 endmenu

@@ -1,6 +1,7 @@
 ## IDF Component Manager Manifest File
 dependencies:
   idf: ">=5.0"
+  espressif/esp_websocket_client: "1.7.0"
   sscma_client:
     override_path: "../../../components/sscma_client"
   sensecap-watcher:

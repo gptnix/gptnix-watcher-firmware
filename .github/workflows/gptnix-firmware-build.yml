@@ -11,6 +11,10 @@ permissions:
 jobs:
   factory-firmware-build:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        voice_mode: ['off', 'on']
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -20,13 +24,29 @@ jobs:
 
       - name: Print build metadata
         run: |
-          echo "CI_BASELINE_EXPECTED=a7c0dfb3c9ed1d74addec41c9fae1a52e0c57dd7"
+          echo "CI_PHYSICAL_SOURCE_BASE=a7c0dfb3c9ed1d74addec41c9fae1a52e0c57dd7"
+          echo "CI_BASE_BRANCH=baseline/fw-v1.1.7"
           echo "CI_TARGET=esp32s3"
           echo "CI_IDF_VERSION=v5.2.1"
+          echo "CI_VOICE_MODE=${{ matrix.voice_mode }}"
 
-      - name: Build factory firmware (ESP-IDF v5.2.1, esp32s3)
+      - name: Run GPTNiX Watcher voice fitness test
+        run: python3 examples/factory_firmware/gptnix_tests/test_watcher_voice_fitness.py
+
+      - name: Build factory firmware (voice OFF)
+        if: matrix.voice_mode == 'off'
         uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
         with:
           esp_idf_version: v5.2.1
           target: esp32s3
           path: examples/factory_firmware
+          command: 'idf.py -B build-gptnix-voice-off build && grep -qx "# CONFIG_GPTNIX_WATCHER_VOICE is not set" sdkconfig'
+
+      - name: Build factory firmware (voice ON)
+        if: matrix.voice_mode == 'on'
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
+        with:
+          esp_idf_version: v5.2.1
+          target: esp32s3
+          path: examples/factory_firmware
+          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\n" > /tmp/gptnix_watcher_voice_on.defaults && idf.py -B build-gptnix-voice-on -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_voice_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig'

@@ -50,4 +50,10 @@ menu "Factory Firmware Example Configuration"
         default n
         help
             Enable wake-up word and VAD detection functions, SR is still an experimental feature .
+
+    config GPTNIX_QR_PAIRING
+        bool "Enable GPTNiX QR pairing foundation"
+        default n
+        help
+            Development/canary-only QR pairing decoder foundation. Runtime camera/backend wiring is separate.
 endmenu

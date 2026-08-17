@@ -155,6 +155,99 @@ def _extract_c_function(text, signature_marker, next_marker=None):
     return text[start:] if end == -1 else text[start:end]
 
 
+def _strip_ps1_comments(text):
+    """Single-pass scanner: strips PowerShell # line comments and <# ... #> block comments while correctly
+    skipping over '...' / "..." string literals (so a '#' inside a string is never mistaken for a comment
+    start) and @'...'@ / @"..."@ here-strings (so the embedded C# Add-Type source block is never partially
+    stripped). Needed because this file's own explanatory PROSE comments legitimately name the exact APIs
+    (Stream.BeginRead, AsyncWaitHandle, ReadAsync) that "must be absent from real code" checks search for --
+    a naive substring search over raw text would false-positive on that documentation."""
+    out = []
+    i, n = 0, len(text)
+    state = None  # None | 'line_comment' | 'block_comment' | 'sq_string' | 'dq_string' | 'here_sq' | 'here_dq'
+    while i < n:
+        c = text[i]
+        c2 = text[i + 1] if i + 1 < n else ""
+        if state == "line_comment":
+            if c == "\n":
+                state = None
+                out.append(c)
+            i += 1
+            continue
+        if state == "block_comment":
+            if c == "#" and c2 == ">":
+                state = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if state == "sq_string":
+            out.append(c)
+            if c == "'":
+                if c2 == "'":
+                    out.append(c2)
+                    i += 2
+                    continue
+                state = None
+            i += 1
+            continue
+        if state == "dq_string":
+            out.append(c)
+            if c == "`" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                state = None
+            i += 1
+            continue
+        if state in ("here_sq", "here_dq"):
+            out.append(c)
+            if c == "\n":
+                closer = "'@" if state == "here_sq" else '"@'
+                if text[i + 1:i + 1 + len(closer)] == closer:
+                    out.append(closer)
+                    i += 1 + len(closer)
+                    state = None
+                    continue
+            i += 1
+            continue
+        # not inside any special state
+        if c == "<" and c2 == "#":
+            state = "block_comment"
+            i += 2
+            continue
+        if c == "#":
+            state = "line_comment"
+            i += 1
+            continue
+        if c == "'":
+            state = "sq_string"
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            state = "dq_string"
+            out.append(c)
+            i += 1
+            continue
+        if c == "@" and c2 == "'":
+            state = "here_sq"
+            out.append(c)
+            out.append(c2)
+            i += 2
+            continue
+        if c == "@" and c2 == '"':
+            state = "here_dq"
+            out.append(c)
+            out.append(c2)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 PROVISION_C_RAW = _read(PROVISION_C) if os.path.isfile(PROVISION_C) else ""
 PROVISION_C_CODE = _strip_c_comments(PROVISION_C_RAW)
 PROVISION_H_RAW = _read(PROVISION_H) if os.path.isfile(PROVISION_H) else ""
@@ -165,6 +258,7 @@ MAIN_C_RAW = _read(MAIN_C)
 MAIN_C_CODE = _strip_c_comments(MAIN_C_RAW)
 KCONFIG_RAW = _read(KCONFIG)
 BRIDGE_PS1_RAW = _read(BRIDGE_PS1) if os.path.isfile(BRIDGE_PS1) else ""
+BRIDGE_PS1_CODE = _strip_ps1_comments(BRIDGE_PS1_RAW)
 WORKFLOW_RAW = _read(WORKFLOW_YML) if os.path.isfile(WORKFLOW_YML) else ""
 
 
@@ -1032,6 +1126,237 @@ def _c125():
     idx_return = body.find("return result;")
     return (idx_cycle != -1 and idx_log != -1 and idx_flush != -1 and idx_return != -1
         and idx_cycle < idx_log < idx_flush < idx_return), ""
+
+
+# ===========================================================================
+# M3A.3B Correction #2 (Windows PowerShell 5.1 hard-bounded process stdout read) -- 126-160
+# ===========================================================================
+
+BOUNDED_READ_TYPE_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "public static class GptnixWatcherBoundedProcessRead", "function New-GwFrame")
+READ_HELPER_FN_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Read-GwStreamExactBounded", "function Test-GwFrameHeader")
+LIVE_BRIDGE_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+SELFTEST_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwSelfTest")
+
+
+@check("126. bridge contains zero .BeginRead( call sites (comment-stripped source)")
+def _c126():
+    n = len(re.findall(r"\.BeginRead\(", BRIDGE_PS1_CODE))
+    return n == 0, "found %d" % n
+
+
+@check("127. bridge contains zero .EndRead( call sites (comment-stripped source)")
+def _c127():
+    n = len(re.findall(r"\.EndRead\(", BRIDGE_PS1_CODE))
+    return n == 0, "found %d" % n
+
+
+@check("128. bounded owner does not use AsyncWaitHandle (comment-stripped source)")
+def _c128():
+    return "AsyncWaitHandle" not in BRIDGE_PS1_CODE, ""
+
+
+@check("129. bounded owner does not use ReadAsync( as its cancellation mechanism (comment-stripped source)")
+def _c129():
+    return "ReadAsync(" not in BRIDGE_PS1_CODE, ""
+
+
+@check("130. exactly one GptnixWatcherBoundedProcessRead type definition")
+def _c130():
+    n = len(re.findall(r"public static class GptnixWatcherBoundedProcessRead", BRIDGE_PS1_RAW))
+    return n == 1, "found %d" % n
+
+
+@check("131. Add-Type is guarded so the type cannot be defined twice in the same process")
+def _c131():
+    return "PSTypeName" in BRIDGE_PS1_RAW and "GptnixWatcherBoundedProcessRead" in BRIDGE_PS1_RAW and "Add-Type -TypeDefinition" in BRIDGE_PS1_RAW, ""
+
+
+@check("132. helper uses a dedicated System.Threading.Thread worker")
+def _c132():
+    return "new Thread(" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("133. helper worker executes a synchronous stream.Read call")
+def _c133():
+    return "stream.Read(buffer, offset, count)" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("134. helper obtains the worker's real Windows thread ID (GetCurrentThreadId)")
+def _c134():
+    return "GetCurrentThreadId()" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("135. helper opens a real worker thread handle (OpenThread) before cancellation")
+def _c135():
+    return "OpenThread(THREAD_TERMINATE" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("136. helper calls CancelSynchronousIo on the real worker thread handle on timeout")
+def _c136():
+    return "CancelSynchronousIo(threadHandle)" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("137. helper closes the real thread handle on every path (CloseHandle in finally)")
+def _c137():
+    idx_open = BOUNDED_READ_TYPE_SOURCE.find("threadHandle = OpenThread(")
+    body_after = BOUNDED_READ_TYPE_SOURCE[idx_open:] if idx_open != -1 else ""
+    return idx_open != -1 and "CloseHandle(threadHandle)" in body_after, ""
+
+
+@check("138. timeout path terminates the backend Process (process.Kill())")
+def _c138():
+    return "process.Kill();" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("139. timeout path closes the backend stdout Stream (stream.Close())")
+def _c139():
+    return "stream.Close();" in BOUNDED_READ_TYPE_SOURCE, ""
+
+
+@check("140. explicit GW_READ_CANCEL_GRACE_MS=2000 constant exists and is passed to the helper")
+def _c140():
+    const_ok = bool(re.search(r"GwReadCancelGraceMs\s*=\s*2000", BRIDGE_PS1_RAW))
+    passed_ok = "-BudgetMs $Script:GwReadCancelGraceMs".replace("-BudgetMs ", "") in BRIDGE_PS1_RAW or "$Script:GwReadCancelGraceMs" in READ_HELPER_FN_SOURCE
+    return const_ok and passed_ok, "const_ok=%s passed_ok=%s" % (const_ok, passed_ok)
+
+
+@check("141. the unquiesced-worker path calls exactly one fixed Environment.FailFast")
+def _c141():
+    n = len(re.findall(r"Environment\.FailFast\(", BOUNDED_READ_TYPE_SOURCE))
+    return n == 1, "found %d" % n
+
+
+@check("142. Environment.FailFast message is a fixed literal with no interpolation/exception object")
+def _c142():
+    m = re.search(r'Environment\.FailFast\("([^"]*)"\)', BOUNDED_READ_TYPE_SOURCE)
+    return bool(m) and "+" not in BOUNDED_READ_TYPE_SOURCE[BOUNDED_READ_TYPE_SOURCE.find("Environment.FailFast") - 40:BOUNDED_READ_TYPE_SOURCE.find("Environment.FailFast")], "match=%s" % bool(m)
+
+
+@check("143. no buffer clear occurs before the worker-quiescence decision in the timeout branch")
+def _c143():
+    idx_cancel = BOUNDED_READ_TYPE_SOURCE.find("CancelSynchronousIo(threadHandle)")
+    idx_quiesced_decision = BOUNDED_READ_TYPE_SOURCE.find("quiesced = completed;")
+    idx_failfast = BOUNDED_READ_TYPE_SOURCE.find("Environment.FailFast(")
+    # PowerShell-side Array.Clear on the OWNED buffer must never appear inside the C# type at all -- the C#
+    # layer never touches the PowerShell-owned byte[] beyond passing it to stream.Read(); clearing is the
+    # PowerShell caller's job, and only after ReadOnceBounded() has already returned (i.e. after quiescence).
+    no_clear_in_csharp = "Array.Clear" not in BOUNDED_READ_TYPE_SOURCE
+    ordering_ok = idx_cancel != -1 and idx_quiesced_decision != -1 and idx_failfast != -1 and idx_cancel < idx_quiesced_decision < idx_failfast
+    return no_clear_in_csharp and ordering_ok, "no_clear_in_csharp=%s ordering_ok=%s" % (no_clear_in_csharp, ordering_ok)
+
+
+@check("144. Read-GwStreamExactBounded accepts a mandatory Process parameter")
+def _c144():
+    return bool(re.search(r"\[Parameter\(Mandatory = \$true\)\]\[System\.Diagnostics\.Process\]\$Process", READ_HELPER_FN_SOURCE)), ""
+
+
+@check("145. live TOKEN_FRAME reads pass the same $proc into the bounded helper")
+def _c145():
+    n = len(re.findall(r"Read-GwStreamExactBounded -Stream \$outStream -Process \$proc", LIVE_BRIDGE_SOURCE))
+    return n == 2, "found %d (expect header-read closure + decision-read closure)" % n
+
+
+@check("146. TOKEN_FRAME header and payload still share exactly one Stopwatch")
+def _c146():
+    n = len(re.findall(r"\$tokenFrameStopwatch = \[System\.Diagnostics\.Stopwatch\]::StartNew\(\)", LIVE_BRIDGE_SOURCE))
+    return n == 1, "found %d" % n
+
+
+@check("147. the post-staged decision read still uses its own fresh Stopwatch")
+def _c147():
+    idx_staged = LIVE_BRIDGE_SOURCE.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    idx_decision_sw = LIVE_BRIDGE_SOURCE.find("$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
+    return idx_staged != -1 and idx_decision_sw != -1 and idx_staged < idx_decision_sw, ""
+
+
+@check("148. no bridge-originated PROVISION_ABORT after TOKEN_STAGED (unaffected by this correction)")
+def _c148():
+    idx_forward = LIVE_BRIDGE_SOURCE.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    after = LIVE_BRIDGE_SOURCE[idx_forward:] if idx_forward != -1 else LIVE_BRIDGE_SOURCE
+    return "New-GwFrame -Type $Script:GwMsgProvisionAbort" not in after, ""
+
+
+@check("149. serial TOKEN_FRAME write remains reachable only after a complete successful read")
+def _c149():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Receive-GwTokenFrameAndForward", "function Confirm-GwDeviceTokenStaged")
+    idx_header_check = body.find("if (-not $parsed.Ok")
+    idx_payload_check = body.find("if ($null -eq $payload)")
+    idx_write = body.find("& $WriteBytes $frame")
+    return (idx_header_check != -1 and idx_payload_check != -1 and idx_write != -1
+        and idx_header_check < idx_write and idx_payload_check < idx_write), ""
+
+
+@check("150. SelfTest includes a real local redirected Process stdout TIMEOUT fixture (J2)")
+def _c150():
+    return "process_stdout_timeout_not_classified" in SELFTEST_SOURCE and "New-GwSelfTestChildProcess" in SELFTEST_SOURCE, ""
+
+
+@check("151. SelfTest includes a real local redirected Process stdout PARTIAL fixture (J3)")
+def _c151():
+    return "process_stdout_partial_not_classified_failure" in SELFTEST_SOURCE, ""
+
+
+@check("152. SelfTest includes a real local redirected Process stdout SUCCESS fixture (J4)")
+def _c152():
+    return "process_stdout_success_fixture_failed" in SELFTEST_SOURCE, ""
+
+
+@check("153. SelfTest includes a real local redirected Process SHARED-DEADLINE fixture (J5)")
+def _c153():
+    return "process_stdout_shared_deadline_not_classified_failure" in SELFTEST_SOURCE, ""
+
+
+@check("154. SelfTest's local fixture process is powershell.exe, never the SSH client")
+def _c154():
+    has_powershell = "FileName = 'powershell.exe'" in _extract_c_function(BRIDGE_PS1_RAW, "function New-GwSelfTestChildProcess")
+    hits = [s for s in ("ssh.exe",) if s in SELFTEST_SOURCE]
+    return has_powershell and not hits, "has_powershell=%s hits=%s" % (has_powershell, hits)
+
+
+@check("155. SelfTest still contains no SerialPort.Open path")
+def _c155():
+    hits = [s for s in ("SerialPort", ".Open()") if s in SELFTEST_SOURCE]
+    return not hits, "found: %s" % hits
+
+
+@check("156. SelfTest still contains no network client/API")
+def _c156():
+    hits = [s for s in ("Invoke-WebRequest", "Invoke-RestMethod", "System.Net.Sockets", "WebClient", "HttpClient") if s in SELFTEST_SOURCE]
+    return not hits, "found: %s" % hits
+
+
+@check("157. token/string/log secret-hygiene invariants remain (unaffected by this correction)")
+def _c157():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Receive-GwTokenFrameAndForward", "function Confirm-GwDeviceTokenStaged")
+    return "[Array]::Clear($frame" in body and "[Array]::Clear($payload" in body, ""
+
+
+@check("158. one session HTTP POST / one M2 prepare / one M2 connect call site remain (unaffected, backend/firmware untouched)")
+def _c158():
+    perform_count = len(re.findall(r"esp_http_client_perform\(", PROVISION_C_CODE))
+    prepare_count = len(re.findall(r"app_gptnix_watcher_voice_prepare_session\(", PROVISION_C_CODE))
+    connect_count = len(re.findall(r"app_gptnix_watcher_voice_connect\(\)", PROVISION_C_CODE))
+    return perform_count == 1 and prepare_count == 1 and connect_count == 1, "perform=%d prepare=%d connect=%d" % (perform_count, prepare_count, connect_count)
+
+
+@check("159. app_gptnix_watcher_voice.c/.h AND app_wifi.c/.h blob invariants remain untouched")
+def _c159():
+    paths = [
+        "examples/factory_firmware/main/app/app_gptnix_watcher_voice.c",
+        "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h",
+        "examples/factory_firmware/main/app/app_wifi.c",
+        "examples/factory_firmware/main/app/app_wifi.h",
+    ]
+    bad = [p for p in paths if not _protected_matches(p)]
+    return not bad, "mismatched: %s" % bad
+
+
+@check("160. workflow remains pinned to IDF 5.2.1 / esp32s3 / Windows selftest (READ ONLY in this correction)")
+def _c160():
+    idf_ok = len(re.findall(r"esp_idf_version:\s*v5\.2\.1", WORKFLOW_RAW)) >= 3
+    target_ok = len(re.findall(r"target:\s*esp32s3", WORKFLOW_RAW)) >= 3
+    windows_ok = "m3a-bridge-selftest" in WORKFLOW_RAW and "windows-2022" in WORKFLOW_RAW
+    return idf_ok and target_ok and windows_ok, "idf_ok=%s target_ok=%s windows_ok=%s" % (idf_ok, target_ok, windows_ok)
 
 
 if __name__ == "__main__":

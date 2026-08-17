@@ -89,6 +89,230 @@ $Script:GwMsgTokenStaged     = [byte]0x03
 $Script:GwMsgProvisionCommit = [byte]0x04
 $Script:GwMsgProvisionAbort  = [byte]0x05
 
+# Cleanup grace AFTER a protocol deadline has already expired -- not additional protocol time. No protocol
+# byte may be accepted and no serial write may occur during this window; it exists solely to give a cancelled
+# read worker a bounded chance to actually quiesce before this process either continues or fail-closed exits.
+$Script:GwReadCancelGraceMs = 2000
+
+# -----------------------------------------------------------------------------
+# GptnixWatcherBoundedProcessRead -- hard-bounded synchronous Process-stdout read.
+#
+# WHY THIS EXISTS (primary-source justification, not blog/StackOverflow-derived):
+#   - .NET's Process class redirects StandardOutput using the Win32 CreatePipe() anonymous-pipe API (see
+#     dotnet/runtime Process.Windows.cs). CreatePipe()'s signature has no FILE_FLAG_OVERLAPPED-equivalent
+#     parameter at all -- unlike CreateNamedPipe() -- so a pipe handle it returns can never be opened for
+#     overlapped/asynchronous I/O.
+#   - dotnet/runtime's Process stream-construction helper builds the FileStream as
+#     `new FileStream(handle, access, StreamBufferSize, handle.IsAsync)` -- i.e. isAsync tracks the handle's
+#     own capability, which for a CreatePipe() handle is always false.
+#   - Per Microsoft's own Stream.BeginRead documentation (learn.microsoft.com/en-us/dotnet/api/
+#     system.io.stream.beginread, Remarks): "The default implementation of BeginRead on a stream calls the
+#     Read method synchronously, which means that Read might block on some streams. However, instances of
+#     classes such as FileStream ... fully support asynchronous operations IF THE INSTANCES HAVE BEEN OPENED
+#     ASYNCHRONOUSLY. ... EndRead must be called once for every call to BeginRead."
+#   A Process-redirected StandardOutput FileStream is therefore NOT guaranteed to have been opened
+#   asynchronously, so Stream.BeginRead() on it can silently fall back to a call that itself blocks
+#   synchronously -- meaning `AsyncWaitHandle.WaitOne(remainingMs)` can never even be reached in time. This
+#   bridge must not depend on that assumption for a security-relevant deadline.
+#
+# The fix: isolate the actual (possibly blocking) Stream.Read() call onto one dedicated worker thread per
+# read attempt; the calling thread only ever waits, bounded, for that worker to signal completion. On
+# timeout, the worker's pending synchronous I/O is cancelled via the real Win32 CancelSynchronousIo() API
+# (learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelsynchronousio: "marks pending
+# synchronous I/O operations that are issued by the specified thread as canceled" -- takes a THREAD handle
+# with THREAD_TERMINATE access, does not itself wait for completion), the backend process/stream are torn
+# down as a second cancellation vector, and this method does not return -- and therefore this bridge never
+# clears/reuses the owned buffer or continues to serial/REPL -- until the worker is PROVEN to have quiesced.
+# If quiescence cannot be proven within a small bounded grace period, the entire bridge process is terminated
+# fail-closed via a single Environment.FailFast() call site rather than ever risking a live worker thread
+# that could still mutate a cleared/reused buffer or be mistaken for a clean state.
+#
+# This type knows nothing about the GNX3 protocol, TOKEN_FRAME/TOKEN_STAGED/COMMIT/ABORT, Firebase, Gemini,
+# or serial -- its only responsibility is a hard-bounded read from an arbitrary Process-backed Stream.
+# -----------------------------------------------------------------------------
+if (-not ([System.Management.Automation.PSTypeName]'GptnixWatcherBoundedProcessRead').Type) {
+    $Script:GwBoundedProcessReadSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public class GptnixWatcherBoundedReadResult
+{
+    public string Status;
+    public int BytesRead;
+}
+
+public static class GptnixWatcherBoundedProcessRead
+{
+    private const uint THREAD_TERMINATE = 0x0001;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CancelSynchronousIo(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    // Reads at most `count` bytes once, hard-bounded by timeoutMs. Never returns while the dedicated read
+    // worker could still be mutating `buffer` -- either the worker is proven quiesced first, or this process
+    // is terminated via FailFast and never returns at all.
+    public static GptnixWatcherBoundedReadResult ReadOnceBounded(Stream stream, Process process, byte[] buffer, int offset, int count, int timeoutMs, int cancelGraceMs)
+    {
+        object gate = new object();
+        bool threadIdReady = false;
+        uint workerThreadId = 0;
+        bool completed = false;
+        int bytesRead = 0;
+        bool ioError = false;
+
+        Thread worker = new Thread(delegate()
+        {
+            lock (gate)
+            {
+                workerThreadId = GetCurrentThreadId();
+                threadIdReady = true;
+                Monitor.PulseAll(gate);
+            }
+            int n = 0;
+            bool failed = false;
+            try
+            {
+                n = stream.Read(buffer, offset, count);
+            }
+            catch
+            {
+                failed = true;
+            }
+            lock (gate)
+            {
+                bytesRead = n;
+                ioError = failed;
+                completed = true;
+                Monitor.PulseAll(gate);
+            }
+        });
+        worker.IsBackground = true;
+        worker.Start();
+
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        lock (gate)
+        {
+            while (!completed)
+            {
+                double remaining = (deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remaining <= 0) break;
+                Monitor.Wait(gate, (int)remaining);
+            }
+            if (completed)
+            {
+                if (ioError)
+                {
+                    GptnixWatcherBoundedReadResult failResult = new GptnixWatcherBoundedReadResult();
+                    failResult.Status = "io_failure";
+                    failResult.BytesRead = 0;
+                    return failResult;
+                }
+                GptnixWatcherBoundedReadResult okResult = new GptnixWatcherBoundedReadResult();
+                if (bytesRead <= 0)
+                {
+                    okResult.Status = "eof";
+                    okResult.BytesRead = 0;
+                }
+                else
+                {
+                    okResult.Status = "success";
+                    okResult.BytesRead = bytesRead;
+                }
+                return okResult;
+            }
+        }
+
+        // Timed out with the worker still (as far as we know) running: cancel its pending synchronous I/O,
+        // terminate the backend process, close the stream, then wait bounded for it to actually quiesce.
+        bool haveThreadId;
+        uint capturedThreadId;
+        lock (gate)
+        {
+            haveThreadId = threadIdReady;
+            capturedThreadId = workerThreadId;
+        }
+        IntPtr threadHandle = IntPtr.Zero;
+        if (haveThreadId)
+        {
+            threadHandle = OpenThread(THREAD_TERMINATE, false, capturedThreadId);
+        }
+        try
+        {
+            if (threadHandle != IntPtr.Zero)
+            {
+                // Best-effort: a false/ERROR_NOT_FOUND result here (documented by Microsoft as a normal
+                // outcome when no matching pending request is found, e.g. a benign completion race) is not
+                // itself fatal -- quiescence is proven below by actually waiting for the worker, not by this
+                // return value.
+                CancelSynchronousIo(threadHandle);
+            }
+        }
+        finally
+        {
+            if (threadHandle != IntPtr.Zero)
+            {
+                CloseHandle(threadHandle);
+            }
+        }
+
+        try
+        {
+            if (process != null && !process.HasExited)
+            {
+                process.Kill();
+            }
+        }
+        catch { }
+
+        try
+        {
+            stream.Close();
+        }
+        catch { }
+
+        DateTime graceDeadline = DateTime.UtcNow.AddMilliseconds(cancelGraceMs);
+        bool quiesced;
+        lock (gate)
+        {
+            while (!completed)
+            {
+                double remaining = (graceDeadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remaining <= 0) break;
+                Monitor.Wait(gate, (int)remaining);
+            }
+            quiesced = completed;
+        }
+
+        if (!quiesced)
+        {
+            // Security kill-switch, exactly one call site: an I/O state we cannot prove clean must never be
+            // allowed to continue toward a buffer clear, a serial write, or REPL orchestration. Fixed,
+            // non-secret message -- no exception object, no interpolation, no buffer content.
+            Environment.FailFast("gptnix_bounded_read_worker_not_quiesced");
+        }
+
+        GptnixWatcherBoundedReadResult timeoutResult = new GptnixWatcherBoundedReadResult();
+        timeoutResult.Status = "timeout";
+        timeoutResult.BytesRead = 0;
+        return timeoutResult;
+    }
+}
+'@
+    Add-Type -TypeDefinition $Script:GwBoundedProcessReadSource -Language CSharp
+}
+
 function New-GwFrame {
     <# Builds one protocol frame as a byte[]. Payload is always byte[] --
        never a .NET string -- so a caller can never accidentally re-encode a
@@ -228,16 +452,18 @@ function Read-GwStreamExactBounded {
     <# The ONE canonical bounded backend-stream read primitive. Reads exactly $Count bytes from $Stream,
        governed by a single deadline ($Stopwatch elapsed vs $BudgetMs) that the CALLER owns and may share
        across multiple invocations (e.g. one TOKEN_FRAME header read followed by one payload read sharing the
-       SAME deadline -- see D3). Uses BeginRead/EndRead + AsyncWaitHandle.WaitOne(remaining) because a
-       redirected child-process StandardOutput pipe stream does not support Stream.ReadTimeout. Classifies
-       timeout/EOF/success without ever including read bytes in the returned failure. On timeout, this
-       function itself never calls EndRead() on the abandoned IAsyncResult and never exposes the local
-       (possibly partially-filled) buffer to the caller -- it is scrubbed and left to be garbage collected. A
-       timed-out read can therefore never later hand bytes to any code that would forward them; the CALLER is
-       still responsible for disposing/closing the underlying stream/process so no abandoned async operation
-       remains outstanding against a transport this bridge still trusts. #>
+       SAME deadline -- see Phase F). Each chunk is read via
+       GptnixWatcherBoundedProcessRead.ReadOnceBounded(), which performs the potentially-blocking
+       Stream.Read() call on a dedicated worker thread and hard-cancels it with the real Win32
+       CancelSynchronousIo() API if the deadline expires -- this never depends on Stream.BeginRead()/
+       EndRead()/ReadAsync() being genuinely non-blocking, which primary Microsoft documentation does NOT
+       guarantee for a Process-redirected stdout pipe stream (see the C# source comment above for the exact
+       citations). ReadOnceBounded() never returns until the read worker is PROVEN quiesced -- or the whole
+       bridge process is terminated fail-closed if it cannot be -- so by the time this function scrubs its
+       owned buffer and returns, no other thread can still be mutating it. #>
     param(
         [Parameter(Mandatory = $true)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
         [Parameter(Mandatory = $true)][int]$Count,
         [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$Stopwatch,
         [Parameter(Mandatory = $true)][int]$BudgetMs
@@ -250,18 +476,20 @@ function Read-GwStreamExactBounded {
             [Array]::Clear($buf, 0, $buf.Length)
             return @{ Ok = $false; Reason = 'timeout' }
         }
-        $asyncResult = $Stream.BeginRead($buf, $got, $Count - $got, $null, $null)
-        $signaled = $asyncResult.AsyncWaitHandle.WaitOne($remainingMs)
-        if (-not $signaled) {
+        $result = [GptnixWatcherBoundedProcessRead]::ReadOnceBounded($Stream, $Process, $buf, $got, $Count - $got, $remainingMs, $Script:GwReadCancelGraceMs)
+        if ($result.Status -eq 'timeout') {
             [Array]::Clear($buf, 0, $buf.Length)
             return @{ Ok = $false; Reason = 'timeout' }
         }
-        $n = $Stream.EndRead($asyncResult)
-        if ($n -le 0) {
+        if ($result.Status -eq 'eof') {
             [Array]::Clear($buf, 0, $buf.Length)
             return @{ Ok = $false; Reason = 'eof' }
         }
-        $got += $n
+        if ($result.Status -eq 'io_failure') {
+            [Array]::Clear($buf, 0, $buf.Length)
+            return @{ Ok = $false; Reason = 'io' }
+        }
+        $got += $result.BytesRead
     }
     return @{ Ok = $true; Bytes = $buf }
 }
@@ -286,6 +514,22 @@ function Start-GwBackendProcess {
     $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
 
+    return [System.Diagnostics.Process]::Start($psi)
+}
+
+function New-GwSelfTestChildProcess {
+    <# SelfTest-only fixture starter: a LOCAL powershell.exe child (never the SSH client, never a network endpoint)
+       with redirected binary stdout, used ONLY to prove Read-GwStreamExactBounded against the ACTUAL
+       System.Diagnostics.Process.StandardOutput.BaseStream transport primitive -- not merely a synthetic
+       AnonymousPipeClientStream. The child writes only fixed, non-secret synthetic bytes supplied by
+       $ChildCommand; this helper itself never touches network/serial. #>
+    param([Parameter(Mandatory = $true)][string]$ChildCommand)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -NonInteractive -Command `"$ChildCommand`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
     return [System.Diagnostics.Process]::Start($psi)
 }
 
@@ -340,7 +584,7 @@ function Invoke-GwLiveBridge {
         $tokenFrameBudgetMs = $ProtocolTimeoutSeconds * 1000
         $readBackendExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
+            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()
@@ -394,7 +638,7 @@ function Invoke-GwLiveBridge {
         $decisionBudgetMs = $ProtocolTimeoutSeconds * 1000
         $readBackendDecisionExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
+            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()
@@ -580,7 +824,7 @@ function Invoke-GwSelfTest {
     $pipeClientA = New-Object System.IO.Pipes.AnonymousPipeClientStream([System.IO.Pipes.PipeDirection]::In, $pipeServerA.ClientSafePipeHandle)
     try {
         $swA = [System.Diagnostics.Stopwatch]::StartNew()
-        $resultA = Read-GwStreamExactBounded -Stream $pipeClientA -Count $Script:GwHeaderBytes -Stopwatch $swA -BudgetMs 300
+        $resultA = Read-GwStreamExactBounded -Stream $pipeClientA -Process $null -Count $Script:GwHeaderBytes -Stopwatch $swA -BudgetMs 300
         if ($resultA.Ok) {
             $failures.Add('bounded_read_timeout_not_classified')
         } elseif ($resultA.Reason -ne 'timeout') {
@@ -604,7 +848,7 @@ function Invoke-GwSelfTest {
         $budgetB = 300
         $readPartialExact = {
             param($count)
-            $r = Read-GwStreamExactBounded -Stream $pipeClientB -Count $count -Stopwatch $swB -BudgetMs $budgetB
+            $r = Read-GwStreamExactBounded -Stream $pipeClientB -Process $null -Count $count -Stopwatch $swB -BudgetMs $budgetB
             if (-not $r.Ok) { return $null }
             return $r.Bytes
         }.GetNewClosure()
@@ -623,6 +867,134 @@ function Invoke-GwSelfTest {
     } finally {
         $pipeClientB.Dispose()
         $pipeServerB.Dispose()
+    }
+
+    # J1-J6: the authoritative Windows fixtures -- a REAL local System.Diagnostics.Process with
+    # RedirectStandardOutput=true, never merely an AnonymousPipeClientStream. The child is always
+    # powershell.exe (never the SSH client), writes only fixed synthetic non-secret bytes, and this SelfTest never
+    # opens a COM port, starts SSH, or makes a network call anywhere in this section.
+
+    # J1. actual stream type proof -- diagnostic only, never dumps stream data.
+    $childJ1 = New-GwSelfTestChildProcess -ChildCommand 'Start-Sleep -Milliseconds 50'
+    try {
+        $streamTypeName = $childJ1.StandardOutput.BaseStream.GetType().FullName
+        if ([string]::IsNullOrEmpty($streamTypeName)) { $failures.Add('process_stdout_stream_type_unavailable') }
+    } finally {
+        try { if (-not $childJ1.HasExited) { $childJ1.Kill() } } catch { }
+        $childJ1.WaitForExit(2000) | Out-Null
+        $childJ1.Dispose()
+    }
+
+    # J2. hard timeout fixture: child writes zero bytes and sleeps well beyond the protocol budget.
+    $childJ2 = New-GwSelfTestChildProcess -ChildCommand 'Start-Sleep -Milliseconds 3000'
+    try {
+        $swJ2 = [System.Diagnostics.Stopwatch]::StartNew()
+        $resultJ2 = Read-GwStreamExactBounded -Stream $childJ2.StandardOutput.BaseStream -Process $childJ2 -Count $Script:GwHeaderBytes -Stopwatch $swJ2 -BudgetMs 300
+        if ($resultJ2.Ok) {
+            $failures.Add('process_stdout_timeout_not_classified')
+        } elseif ($resultJ2.Reason -ne 'timeout') {
+            $failures.Add('process_stdout_timeout_wrong_reason')
+        }
+        if ($swJ2.ElapsedMilliseconds -ge 2000) { $failures.Add('process_stdout_timeout_exceeded_conservative_ceiling') }
+        $childJ2.WaitForExit(2000) | Out-Null
+        if (-not $childJ2.HasExited) { $failures.Add('process_stdout_timeout_child_not_terminated') }
+    } finally {
+        try { if (-not $childJ2.HasExited) { $childJ2.Kill() } } catch { }
+        $childJ2.Dispose()
+    }
+
+    # J3. partial process-stdout fixture: child writes 4 synthetic bytes then sleeps beyond budget; 8 bytes
+    # requested. Must fail closed, never invoke the serial-write callback, and terminate the child.
+    $childJ3 = New-GwSelfTestChildProcess -ChildCommand '$s = [Console]::OpenStandardOutput(); $b = [byte[]](0x47,0x4E,0x58,0x33); $s.Write($b, 0, $b.Length); $s.Flush(); Start-Sleep -Milliseconds 3000'
+    try {
+        $swJ3 = [System.Diagnostics.Stopwatch]::StartNew()
+        $budgetJ3 = 300
+        $readJ3Exact = {
+            param($count)
+            $r = Read-GwStreamExactBounded -Stream $childJ3.StandardOutput.BaseStream -Process $childJ3 -Count $count -Stopwatch $swJ3 -BudgetMs $budgetJ3
+            if (-not $r.Ok) { return $null }
+            return $r.Bytes
+        }.GetNewClosure()
+        $script:GwSelfTestJ3WriteInvoked = $false
+        $captureJ3 = { param($bytes) $script:GwSelfTestJ3WriteInvoked = $true }
+        $failedJ3 = $false
+        try {
+            Receive-GwTokenFrameAndForward -ReadBytesExact $readJ3Exact -WriteBytes $captureJ3
+        } catch {
+            $failedJ3 = $true
+        }
+        if (-not $failedJ3) { $failures.Add('process_stdout_partial_not_classified_failure') }
+        if ($script:GwSelfTestJ3WriteInvoked) { $failures.Add('process_stdout_partial_invoked_serial_write') }
+        $childJ3.WaitForExit(2000) | Out-Null
+        if (-not $childJ3.HasExited) { $failures.Add('process_stdout_partial_child_not_terminated') }
+    } finally {
+        try { if (-not $childJ3.HasExited) { $childJ3.Kill() } } catch { }
+        $childJ3.Dispose()
+    }
+
+    # J4. successful process-stdout fixture: child writes exactly a valid synthetic 8-byte zero-payload
+    # BRIDGE_READY header and exits.
+    $childJ4 = New-GwSelfTestChildProcess -ChildCommand '$s = [Console]::OpenStandardOutput(); $b = [byte[]](0x47,0x4E,0x58,0x33,0x01,0x01,0x00,0x00); $s.Write($b, 0, $b.Length); $s.Flush()'
+    try {
+        $swJ4 = [System.Diagnostics.Stopwatch]::StartNew()
+        $resultJ4 = Read-GwStreamExactBounded -Stream $childJ4.StandardOutput.BaseStream -Process $childJ4 -Count $Script:GwHeaderBytes -Stopwatch $swJ4 -BudgetMs 3000
+        if (-not $resultJ4.Ok) {
+            $failures.Add('process_stdout_success_fixture_failed')
+        } else {
+            $parsedJ4 = Test-GwFrameHeader -Header $resultJ4.Bytes
+            if (-not $parsedJ4.Ok -or $parsedJ4.Type -ne $Script:GwMsgBridgeReady -or $parsedJ4.Length -ne 0) {
+                $failures.Add('process_stdout_success_fixture_wrong_bytes')
+            }
+        }
+    } finally {
+        try { if (-not $childJ4.HasExited) { $childJ4.Kill() } } catch { }
+        $childJ4.WaitForExit(2000) | Out-Null
+        $childJ4.Dispose()
+    }
+
+    # J5. shared TOKEN_FRAME budget fixture: child writes a synthetic TOKEN_FRAME header (type=TOKEN_FRAME,
+    # length=1) within budget, then delays the 1-byte payload beyond the SAME total budget. Proves the header
+    # and payload reads do not each receive a separate full timeout window.
+    $childJ5 = New-GwSelfTestChildProcess -ChildCommand '$s = [Console]::OpenStandardOutput(); $h = [byte[]](0x47,0x4E,0x58,0x33,0x01,0x02,0x00,0x01); $s.Write($h, 0, $h.Length); $s.Flush(); Start-Sleep -Milliseconds 3000; $p = [byte[]](0x41); $s.Write($p, 0, $p.Length); $s.Flush()'
+    try {
+        $swJ5 = [System.Diagnostics.Stopwatch]::StartNew()
+        $budgetJ5 = 300
+        $readJ5Exact = {
+            param($count)
+            $r = Read-GwStreamExactBounded -Stream $childJ5.StandardOutput.BaseStream -Process $childJ5 -Count $count -Stopwatch $swJ5 -BudgetMs $budgetJ5
+            if (-not $r.Ok) { return $null }
+            return $r.Bytes
+        }.GetNewClosure()
+        $script:GwSelfTestJ5WriteInvoked = $false
+        $captureJ5 = { param($bytes) $script:GwSelfTestJ5WriteInvoked = $true }
+        $failedJ5 = $false
+        try {
+            Receive-GwTokenFrameAndForward -ReadBytesExact $readJ5Exact -WriteBytes $captureJ5
+        } catch {
+            $failedJ5 = $true
+        }
+        if (-not $failedJ5) { $failures.Add('process_stdout_shared_deadline_not_classified_failure') }
+        if ($script:GwSelfTestJ5WriteInvoked) { $failures.Add('process_stdout_shared_deadline_invoked_serial_write') }
+    } finally {
+        try { if (-not $childJ5.HasExited) { $childJ5.Kill() } } catch { }
+        $childJ5.WaitForExit(2000) | Out-Null
+        $childJ5.Dispose()
+    }
+
+    # J6. post-staged decision-read timeout, using a REAL process fixture: proves the decision read itself
+    # fails closed via the same hard-bounded mechanism against an actual Process.StandardOutput.BaseStream.
+    # The structural absence of any New-GwFrame -Type ...ProvisionAbort call site inside Invoke-GwLiveBridge
+    # (proven separately, unaffected by this correction) is what guarantees no bridge-originated ABORT results
+    # from this failure.
+    $childJ6 = New-GwSelfTestChildProcess -ChildCommand 'Start-Sleep -Milliseconds 3000'
+    try {
+        $swJ6 = [System.Diagnostics.Stopwatch]::StartNew()
+        $resultJ6 = Read-GwStreamExactBounded -Stream $childJ6.StandardOutput.BaseStream -Process $childJ6 -Count $Script:GwHeaderBytes -Stopwatch $swJ6 -BudgetMs 300
+        if ($resultJ6.Ok) { $failures.Add('process_stdout_decision_timeout_not_classified') }
+    } finally {
+        try { if (-not $childJ6.HasExited) { $childJ6.Kill() } } catch { }
+        $childJ6.WaitForExit(2000) | Out-Null
+        $childJ6.Dispose()
     }
 
     # 11. -ProtocolTimeoutSeconds validation: in range accepted, out of range rejected -- real structural

@@ -54,4 +54,30 @@ menu "Factory Firmware Example Configuration"
     config GPTNIX_WATCHER_VOICE
         bool "Enable GPTNiX Watcher realtime voice transport foundation"
         default n
+
+    config GPTNIX_WATCHER_PROVISION
+        bool "Enable GPTNiX Watcher M3A host provisioning canary"
+        depends on GPTNIX_WATCHER_VOICE
+        default n
+        help
+            Enables the M3A host-controlled provisioning canary: a pre-REPL raw
+            UART handoff that stages a short-lived Firebase device ID token in
+            RAM only (never NVS), waits for an explicit host commit, then calls
+            the GPTNiX backend session endpoint and hands the response to the
+            existing M2 voice transport. Diagnostic transport-only canary -- no
+            microphone/speaker streaming. Requires a controlled,
+            developer-attended provisioning session; not a production
+            onboarding flow.
+
+    config GPTNIX_WATCHER_SESSION_URL
+        string "GPTNiX Watcher V2 realtime session HTTPS URL"
+        depends on GPTNIX_WATCHER_PROVISION
+        default ""
+        help
+            Non-secret HTTPS URL of the GPTNiX backend's
+            /v2/watcher/realtime/session endpoint. Must start with https:// and
+            end with the canonical path /v2/watcher/realtime/session. Carries
+            no credential of its own -- the bearer token is supplied
+            separately at runtime via the M3A provisioning handoff, never
+            embedded in this URL or in firmware source.
 endmenu

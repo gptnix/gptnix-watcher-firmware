@@ -76,8 +76,6 @@ def check(name):
 # before being embedded here. They intentionally avoid parent/base history
 # at runtime because CI uses fetch-depth:1.
 PROTECTED_BASE_BLOBS = {
-    "examples/factory_firmware/main/main.c":
-        "788018ee6c9fc875f12794b8a4daef8e59ad956f",
     "examples/factory_firmware/main/CMakeLists.txt":
         "6663576a37eb11b5ae0ef8494fa6cd4238bdd590",
     "examples/factory_firmware/main/app/app_audio_recorder.c":
@@ -436,14 +434,17 @@ def _c41():
     return not hits, "found: %s" % hits
 
 
-# 42-46. protected files byte-identical to their immutable base blob IDs
-# (shallow-clone-safe: no BASE_SHA dereference, no subprocess, no git call)
-@check("42. main.c untouched/no runtime call site to new module")
+# 42. main.c: M3A-aware supersession of the original "main.c untouched" invariant. M3A (M3A.3B) legitimately
+# gives main.c its own compile-gated runtime integration call site -- a byte-identical-to-base check would
+# now produce a false failure on a real, authorized architecture milestone. The invariant this check actually
+# protects -- "main.c never calls the M2 realtime-voice transport API directly" -- still holds and is proven
+# here directly against current source (main.c's own runtime integration is app_gptnix_watcher_provision_run,
+# which is the sole authorized caller of that API; see test_watcher_m3a_provision_fitness.py checks #23-26 for
+# the compile-gating/single-call-site proof). main.c's blob identity is intentionally no longer pinned here.
+@check("42. main.c has zero direct calls into the M2 realtime-voice transport API")
 def _c42():
-    blob_match = _protected_file_matches_base("examples/factory_firmware/main/main.c")
     text = _read(MAIN_C) if os.path.isfile(MAIN_C) else ""
-    no_callsite = "app_gptnix_watcher_voice" not in text
-    return blob_match and no_callsite, "blob_match=%s no_callsite=%s" % (blob_match, no_callsite)
+    return "app_gptnix_watcher_voice" not in text, ""
 
 
 @check("43. CMakeLists.txt untouched")

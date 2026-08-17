@@ -22,6 +22,7 @@
 #include "app_ble.h"
 #include "app_time.h"
 #include "app_cmd.h"
+#include "app_gptnix_watcher_provision.h"
 #include "at_cmd.h"
 #include "app_sensecraft.h"
 #include "app_rgb.h"
@@ -179,7 +180,19 @@ void app_init(void)
     app_time_init();
     app_at_cmd_init();
     app_ble_init();
+#if CONFIG_GPTNIX_WATCHER_PROVISION
+    // M3A provisioning canary: raw pre-REPL UART handoff runs strictly between prepare and start, in the
+    // window before esp_console_start_repl() has woken the REPL/linenoise task (see app_cmd.c). The
+    // provisioning module logs its own non-secret classified terminal result internally -- graceful
+    // diagnostic failure: the REPL always starts afterward regardless of outcome, no reboot, no automatic
+    // retry. This is the ONLY runtime call site into the provisioning module; main.c itself never calls the
+    // M2 realtime-voice transport API directly -- the provisioning module is the sole runtime caller of it.
+    app_cmd_prepare_repl();
+    app_gptnix_watcher_provision_run();
+    app_cmd_start_repl();
+#else
     app_cmd_init();
+#endif
     app_sensor_init();
 }
 

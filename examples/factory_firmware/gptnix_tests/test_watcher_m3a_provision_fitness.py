@@ -1359,5 +1359,110 @@ def _c160():
     return idf_ok and target_ok and windows_ok, "idf_ok=%s target_ok=%s windows_ok=%s" % (idf_ok, target_ok, windows_ok)
 
 
+# --- Correction #3: retire the obsolete null-Process SelfTest fixtures ------------------------------------
+
+@check("161. zero executable -Process $null call sites anywhere in the bridge (comment-stripped source)")
+def _c161():
+    n = len(re.findall(r"-Process \$null\b", BRIDGE_PS1_CODE))
+    return n == 0, "found %d" % n
+
+
+@check("162. Read-GwStreamExactBounded still declares a mandatory, typed, non-null Process parameter")
+def _c162():
+    ok = bool(re.search(r"\[Parameter\(Mandatory = \$true\)\]\[System\.Diagnostics\.Process\]\$Process", READ_HELPER_FN_SOURCE))
+    return ok, ""
+
+
+@check("163. no [AllowNull()] is attached to the Process parameter (or anywhere in the bridge)")
+def _c163():
+    n = len(re.findall(r"AllowNull", BRIDGE_PS1_CODE))
+    return n == 0, "found %d" % n
+
+
+@check("164. live TOKEN_FRAME bounded read still passes -Process $proc on the shared TOKEN_FRAME Stopwatch")
+def _c164():
+    ok = bool(re.search(r"-Process \$proc -Count \$count -Stopwatch \$tokenFrameStopwatch", LIVE_BRIDGE_SOURCE))
+    return ok, ""
+
+
+@check("165. live post-staged decision bounded read still passes -Process $proc on the fresh decision Stopwatch")
+def _c165():
+    ok = bool(re.search(r"-Process \$proc -Count \$count -Stopwatch \$decisionStopwatch", LIVE_BRIDGE_SOURCE))
+    return ok, ""
+
+
+@check("166. real redirected-Process J2 hard-timeout fixture still exists against a real child Process")
+def _c166():
+    ok = ("process_stdout_timeout_not_classified" in SELFTEST_SOURCE
+          and "childJ2.StandardOutput.BaseStream" in SELFTEST_SOURCE
+          and "-Process $childJ2" in SELFTEST_SOURCE)
+    return ok, ""
+
+
+@check("167. real redirected-Process J3 partial-timeout fixture still exists against a real child Process")
+def _c167():
+    ok = ("process_stdout_partial_not_classified_failure" in SELFTEST_SOURCE
+          and "childJ3.StandardOutput.BaseStream" in SELFTEST_SOURCE
+          and "-Process $childJ3" in SELFTEST_SOURCE)
+    return ok, ""
+
+
+@check("168. J2 and J3 both read from the actual .StandardOutput.BaseStream transport primitive")
+def _c168():
+    ok = "childJ2.StandardOutput.BaseStream" in SELFTEST_SOURCE and "childJ3.StandardOutput.BaseStream" in SELFTEST_SOURCE
+    return ok, ""
+
+
+@check("169. J2 and J3 both pass a real, non-null child Process object into -Process (never $null)")
+def _c169():
+    ok = "-Process $childJ2" in SELFTEST_SOURCE and "-Process $childJ3" in SELFTEST_SOURCE
+    no_null = "-Process $null" not in SELFTEST_SOURCE
+    return ok and no_null, "ok=%s no_null=%s" % (ok, no_null)
+
+
+@check("170. obsolete AnonymousPipe null-Process timeout/partial fixture symbols are fully absent")
+def _c170():
+    retired_symbols = (
+        "pipeServerA", "pipeClientA", "resultA",
+        "pipeServerB", "pipeClientB", "partialHeader", "readPartialExact",
+        "GwSelfTestPartialWriteInvoked", "captureWritePartial",
+        "bounded_read_timeout_not_classified", "bounded_read_timeout_wrong_reason",
+        "partial_frame_timeout_not_classified_failure", "timeout_read_invoked_serial_write",
+    )
+    present = [s for s in retired_symbols if s in BRIDGE_PS1_RAW]
+    return not present, "still present: %s" % present
+
+
+@check("171. J4 successful real-Process fixture remains")
+def _c171():
+    return "process_stdout_success_fixture_failed" in SELFTEST_SOURCE and "-Process $childJ4" in SELFTEST_SOURCE, ""
+
+
+@check("172. J5 shared-TOKEN_FRAME-deadline real-Process fixture remains")
+def _c172():
+    return "process_stdout_shared_deadline_not_classified_failure" in SELFTEST_SOURCE and "-Process $childJ5" in SELFTEST_SOURCE, ""
+
+
+@check("173. J6 post-staged-decision real-Process fixture remains")
+def _c173():
+    return "process_stdout_decision_timeout_not_classified" in SELFTEST_SOURCE and "-Process $childJ6" in SELFTEST_SOURCE, ""
+
+
+@check("174. Correction #2 bounded-read protections are unweakened by this correction")
+def _c174():
+    beginread_ok = len(re.findall(r"\.BeginRead\(", BRIDGE_PS1_CODE)) == 0
+    endread_ok = len(re.findall(r"\.EndRead\(", BRIDGE_PS1_CODE)) == 0
+    asyncwait_ok = "AsyncWaitHandle" not in BRIDGE_PS1_CODE
+    worker_ok = "new Thread(" in BOUNDED_READ_TYPE_SOURCE
+    cancel_ok = "CancelSynchronousIo(threadHandle)" in BOUNDED_READ_TYPE_SOURCE
+    failfast_ok = len(re.findall(r"Environment\.FailFast\(", BOUNDED_READ_TYPE_SOURCE)) == 1
+    shared_deadline_ok = bool(re.search(r"-Process \$proc -Count \$count -Stopwatch \$tokenFrameStopwatch", LIVE_BRIDGE_SOURCE))
+    fresh_decision_ok = bool(re.search(r"-Process \$proc -Count \$count -Stopwatch \$decisionStopwatch", LIVE_BRIDGE_SOURCE))
+    all_ok = beginread_ok and endread_ok and asyncwait_ok and worker_ok and cancel_ok and failfast_ok and shared_deadline_ok and fresh_decision_ok
+    return all_ok, ("beginread_ok=%s endread_ok=%s asyncwait_ok=%s worker_ok=%s cancel_ok=%s failfast_ok=%s "
+                     "shared_deadline_ok=%s fresh_decision_ok=%s") % (
+        beginread_ok, endread_ok, asyncwait_ok, worker_ok, cancel_ok, failfast_ok, shared_deadline_ok, fresh_decision_ok)
+
+
 if __name__ == "__main__":
     sys.exit(main())

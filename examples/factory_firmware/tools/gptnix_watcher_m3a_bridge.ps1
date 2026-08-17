@@ -816,58 +816,14 @@ function Invoke-GwSelfTest {
     }
     if (-not $acceptedReal) { $failures.Add('token_staged_guard_rejected_real_frame') }
 
-    # 9. Read-GwStreamExactBounded: an expired/zero-remaining deadline against a stream that never delivers
-    # any bytes returns a classified timeout failure -- never blocks past its budget. Uses an in-process
-    # anonymous pipe (no COM port, no SSH, no network socket) whose server side never writes, so the client
-    # side's read genuinely has to wait, proving real bounded behavior rather than a synthetic short-circuit.
-    $pipeServerA = New-Object System.IO.Pipes.AnonymousPipeServerStream([System.IO.Pipes.PipeDirection]::Out)
-    $pipeClientA = New-Object System.IO.Pipes.AnonymousPipeClientStream([System.IO.Pipes.PipeDirection]::In, $pipeServerA.ClientSafePipeHandle)
-    try {
-        $swA = [System.Diagnostics.Stopwatch]::StartNew()
-        $resultA = Read-GwStreamExactBounded -Stream $pipeClientA -Process $null -Count $Script:GwHeaderBytes -Stopwatch $swA -BudgetMs 300
-        if ($resultA.Ok) {
-            $failures.Add('bounded_read_timeout_not_classified')
-        } elseif ($resultA.Reason -ne 'timeout') {
-            $failures.Add('bounded_read_timeout_wrong_reason')
-        }
-    } finally {
-        $pipeClientA.Dispose()
-        $pipeServerA.Dispose()
-    }
-
-    # 10. partial backend frame (fewer bytes than a full header) + expired deadline: still a classified
-    # failure, and Receive-GwTokenFrameAndForward must never invoke the serial-write callback on this path.
-    $pipeServerB = New-Object System.IO.Pipes.AnonymousPipeServerStream([System.IO.Pipes.PipeDirection]::Out)
-    $pipeClientB = New-Object System.IO.Pipes.AnonymousPipeClientStream([System.IO.Pipes.PipeDirection]::In, $pipeServerB.ClientSafePipeHandle)
-    try {
-        $partialHeader = [byte[]](0x47, 0x4E, 0x58, 0x33) # magic only -- never the rest of the 8-byte header
-        $pipeServerB.Write($partialHeader, 0, $partialHeader.Length)
-        $pipeServerB.Flush()
-
-        $swB = [System.Diagnostics.Stopwatch]::StartNew()
-        $budgetB = 300
-        $readPartialExact = {
-            param($count)
-            $r = Read-GwStreamExactBounded -Stream $pipeClientB -Process $null -Count $count -Stopwatch $swB -BudgetMs $budgetB
-            if (-not $r.Ok) { return $null }
-            return $r.Bytes
-        }.GetNewClosure()
-
-        $script:GwSelfTestPartialWriteInvoked = $false
-        $captureWritePartial = { param($bytes) $script:GwSelfTestPartialWriteInvoked = $true }
-
-        $failedClosed = $false
-        try {
-            Receive-GwTokenFrameAndForward -ReadBytesExact $readPartialExact -WriteBytes $captureWritePartial
-        } catch {
-            $failedClosed = $true
-        }
-        if (-not $failedClosed) { $failures.Add('partial_frame_timeout_not_classified_failure') }
-        if ($script:GwSelfTestPartialWriteInvoked) { $failures.Add('timeout_read_invoked_serial_write') }
-    } finally {
-        $pipeClientB.Dispose()
-        $pipeServerB.Dispose()
-    }
+    # The former "9"/"10" AnonymousPipeClientStream timeout/partial fixtures are retired: they called
+    # Read-GwStreamExactBounded with an explicit null in place of a real backend Process, but that parameter is
+    # a mandatory, non-null part of the canonical cancellation contract (it must be a real backend Process so a
+    # timeout can CancelSynchronousIo/Kill/close it) -- so that call shape is not legitimate and Windows
+    # PowerShell correctly rejects it at the parameter binder before this function body ever runs. The strictly
+    # stronger J2/J3 fixtures below supersede this coverage against a REAL
+    # System.Diagnostics.Process.StandardOutput.BaseStream (exact same timeout/partial-read behavior, but
+    # through the actual live transport primitive instead of an AnonymousPipeClientStream stand-in).
 
     # J1-J6: the authoritative Windows fixtures -- a REAL local System.Diagnostics.Process with
     # RedirectStandardOutput=true, never merely an AnonymousPipeClientStream. The child is always

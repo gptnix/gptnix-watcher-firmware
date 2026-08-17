@@ -609,23 +609,26 @@ static app_gptnix_watcher_provision_result_t s_run_provision_cycle(void)
     // after prepare_session() settles (before connect()/READY-wait) -- see its own header comment.
     result = s_hand_off_to_voice(response_buf, response_len);
 
-    ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] terminal: code=%d", (int)result);
     return result;
 }
 
 /* ---------------------------------------------------------------------------
  * Public entry point. Must be called between app_cmd_prepare_repl() and
- * app_cmd_start_repl() -- see main.c. Unconditionally flushes the console
- * UART's RX buffer before returning, on every outcome: any bytes still
- * sitting in the driver ring at this point are, by construction, either
- * already-consumed protocol framing (never secret -- the staged token is
- * already zeroized well before this point on every path) or unexpected noise,
- * and must never be allowed to leak into the REPL/linenoise session
- * app_cmd_start_repl() is about to wake.
+ * app_cmd_start_repl() -- see main.c. This is the ONE canonical point that
+ * logs a terminal classified result for every active-feature outcome (early
+ * config/transport/commit/Wi-Fi/HTTP/voice failures included, not just the
+ * successful tail) -- s_run_provision_cycle() itself logs no terminal result.
+ * Unconditionally flushes the console UART's RX buffer before returning, on
+ * every outcome: any bytes still sitting in the driver ring at this point
+ * are, by construction, either already-consumed protocol framing (never
+ * secret -- the staged token is already zeroized well before this point on
+ * every path) or unexpected noise, and must never be allowed to leak into
+ * the REPL/linenoise session app_cmd_start_repl() is about to wake.
  * ------------------------------------------------------------------------- */
 app_gptnix_watcher_provision_result_t app_gptnix_watcher_provision_run(void)
 {
     app_gptnix_watcher_provision_result_t result = s_run_provision_cycle();
+    ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] terminal: code=%d", (int)result);
     uart_flush_input(CONFIG_ESP_CONSOLE_UART_NUM);
     return result;
 }

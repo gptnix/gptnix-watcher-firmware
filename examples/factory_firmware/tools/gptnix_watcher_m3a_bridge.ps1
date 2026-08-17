@@ -137,6 +137,13 @@ function Test-GwFrameHeader {
     return @{ Ok = $true; Type = $type; Length = $len }
 }
 
+function Test-GwProtocolTimeoutSecondsValid {
+    <# Pure, directly testable: -ProtocolTimeoutSeconds must stay well below the firmware's own
+       GW_TOKEN_FRAME_WAIT_MS=60000 window. Used by both the script entry point and the self-test. #>
+    param([int]$Seconds)
+    return ($Seconds -ge 1 -and $Seconds -le 15)
+}
+
 function Test-GwByteArrayEqual {
     param([byte[]]$A, [byte[]]$B)
     if ($A.Length -ne $B.Length) { return $false }
@@ -217,6 +224,48 @@ function Confirm-GwDeviceTokenStaged {
     return $true
 }
 
+function Read-GwStreamExactBounded {
+    <# The ONE canonical bounded backend-stream read primitive. Reads exactly $Count bytes from $Stream,
+       governed by a single deadline ($Stopwatch elapsed vs $BudgetMs) that the CALLER owns and may share
+       across multiple invocations (e.g. one TOKEN_FRAME header read followed by one payload read sharing the
+       SAME deadline -- see D3). Uses BeginRead/EndRead + AsyncWaitHandle.WaitOne(remaining) because a
+       redirected child-process StandardOutput pipe stream does not support Stream.ReadTimeout. Classifies
+       timeout/EOF/success without ever including read bytes in the returned failure. On timeout, this
+       function itself never calls EndRead() on the abandoned IAsyncResult and never exposes the local
+       (possibly partially-filled) buffer to the caller -- it is scrubbed and left to be garbage collected. A
+       timed-out read can therefore never later hand bytes to any code that would forward them; the CALLER is
+       still responsible for disposing/closing the underlying stream/process so no abandoned async operation
+       remains outstanding against a transport this bridge still trusts. #>
+    param(
+        [Parameter(Mandatory = $true)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$Stopwatch,
+        [Parameter(Mandatory = $true)][int]$BudgetMs
+    )
+    $buf = New-Object byte[] $Count
+    $got = 0
+    while ($got -lt $Count) {
+        $remainingMs = $BudgetMs - [int]$Stopwatch.ElapsedMilliseconds
+        if ($remainingMs -le 0) {
+            [Array]::Clear($buf, 0, $buf.Length)
+            return @{ Ok = $false; Reason = 'timeout' }
+        }
+        $asyncResult = $Stream.BeginRead($buf, $got, $Count - $got, $null, $null)
+        $signaled = $asyncResult.AsyncWaitHandle.WaitOne($remainingMs)
+        if (-not $signaled) {
+            [Array]::Clear($buf, 0, $buf.Length)
+            return @{ Ok = $false; Reason = 'timeout' }
+        }
+        $n = $Stream.EndRead($asyncResult)
+        if ($n -le 0) {
+            [Array]::Clear($buf, 0, $buf.Length)
+            return @{ Ok = $false; Reason = 'eof' }
+        }
+        $got += $n
+    }
+    return @{ Ok = $true; Bytes = $buf }
+}
+
 function Start-GwBackendProcess {
     <# Starts the canonical backend M3A provisioning launcher over a non-PTY
        SSH session. StandardOutput.BaseStream is the clean binary fd3 protocol
@@ -280,23 +329,36 @@ function Invoke-GwLiveBridge {
         $inStream.Write($readyFrame, 0, $readyFrame.Length)
         $inStream.Flush()
 
+        # D3: the TOKEN_FRAME header and its payload share ONE deadline -- this Stopwatch is created once,
+        # before the header read, and both the header-read and payload-read invocations of $readBackendExact
+        # (inside Receive-GwTokenFrameAndForward) consume the SAME remaining budget. A late backend byte that
+        # arrives after this budget expires can never be handed to the serial-write callback:
+        # Receive-GwTokenFrameAndForward already throws before calling $WriteBytes on any $null read (see its
+        # own header_length/payload_read_failed checks), and Read-GwStreamExactBounded never exposes a timed-
+        # out read's buffer to this closure in the first place.
+        $tokenFrameStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $tokenFrameBudgetMs = $ProtocolTimeoutSeconds * 1000
         $readBackendExact = {
             param($count)
-            $buf = New-Object byte[] $count
-            $got = 0
-            while ($got -lt $count) {
-                $n = $outStream.Read($buf, $got, $count - $got)
-                if ($n -le 0) { return $null }
-                $got += $n
-            }
-            return $buf
+            $result = Read-GwStreamExactBounded -Stream $outStream -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
+            if (-not $result.Ok) { return $null }
+            return $result.Bytes
         }.GetNewClosure()
 
         $writeSerialBytes = {
             param($bytes) $port.Write($bytes, 0, $bytes.Length)
         }.GetNewClosure()
 
-        Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact -WriteBytes $writeSerialBytes
+        try {
+            Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact -WriteBytes $writeSerialBytes
+        } catch {
+            # Bounded backend read failed (timeout/EOF) or the frame was malformed -- no serial write occurred
+            # (see the comment above). Terminate the backend transport now so no abandoned async read can ever
+            # later deliver a late TOKEN_FRAME while the device may already have left its raw provisioning
+            # window; the outer finally also tears this down defensively.
+            Write-Error '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'
+            return 2
+        }
 
         $readSerialExact = {
             param($count)
@@ -323,7 +385,21 @@ function Invoke-GwLiveBridge {
         # ---- Past this point the bridge MUST NOT originate its own PROVISION_ABORT. It may only forward
         # whatever decision frame it actually receives from the backend, byte-for-byte, never reconstructed. ----
 
-        $decisionHeader = & $readBackendExact $Script:GwHeaderBytes
+        # D6: a FRESH bounded deadline for the post-staged backend decision (COMMIT/ABORT), separate from the
+        # TOKEN_FRAME deadline above. On timeout/EOF here the classification below already falls through to
+        # "malformed" (Test-GwFrameHeader on a $null header) -- no control frame is ever sent to the device on
+        # that path, and the bridge still never fabricates/originates its own ABORT. The device's own COMMIT
+        # timeout remains the canonical cleanup mechanism for this case.
+        $decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $decisionBudgetMs = $ProtocolTimeoutSeconds * 1000
+        $readBackendDecisionExact = {
+            param($count)
+            $result = Read-GwStreamExactBounded -Stream $outStream -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
+            if (-not $result.Ok) { return $null }
+            return $result.Bytes
+        }.GetNewClosure()
+
+        $decisionHeader = & $readBackendDecisionExact $Script:GwHeaderBytes
         $decisionParsed = Test-GwFrameHeader -Header $decisionHeader
         $isCommit = $decisionParsed.Ok -and $decisionParsed.Length -eq 0 -and $decisionParsed.Type -eq $Script:GwMsgProvisionCommit
         $isAbort = $decisionParsed.Ok -and $decisionParsed.Length -eq 0 -and $decisionParsed.Type -eq $Script:GwMsgProvisionAbort
@@ -366,10 +442,20 @@ function Invoke-GwLiveBridge {
         }
         return 0
     } finally {
-        if ($null -ne $proc -and -not $proc.HasExited) {
-            try { $proc.Kill() } catch { }
+        # D7: single teardown path -- process (and its redirected streams), then serial. Every step is
+        # individually best-effort/swallowed so one failure never blocks the next, and no exception here ever
+        # carries secret material (none of these calls touch token/frame content).
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) { $proc.Kill() }
+            } catch { }
+            try { $proc.StandardInput.Close() } catch { }
+            try { $proc.StandardOutput.Close() } catch { }
+            try { $proc.Dispose() } catch { }
         }
-        if ($port.IsOpen) { $port.Close() }
+        if ($null -ne $port -and $port.IsOpen) {
+            try { $port.Close() } catch { }
+        }
     }
 }
 
@@ -412,25 +498,33 @@ function Invoke-GwSelfTest {
     $noiseFixture.AddRange([byte[]](0x0D, 0x0A, 0x41, 0x42, 0x43)) # arbitrary non-protocol log noise
     $noiseFixture.AddRange([byte[]]$bridgeReadyFrame)
     $fixtureArray = $noiseFixture.ToArray()
-    $fixtureIndex = 0
+    # Deterministic mutable state owner: a captured scalar ($x = 0; $x++ inside a GetNewClosure() callback)
+    # is not a reliable way to persist mutation across repeated invocations of the SAME closure instance on
+    # Windows PowerShell -- mutating a PROPERTY on a captured reference-type object is unambiguous instead.
+    $fixtureState = [pscustomobject]@{ Index = 0 }
     $fixtureReadByte = {
-        if ($fixtureIndex -ge $fixtureArray.Length) { return $null }
-        $b = $fixtureArray[$fixtureIndex]
-        $fixtureIndex++
+        if ($fixtureState.Index -ge $fixtureArray.Length) { return $null }
+        $b = $fixtureArray[$fixtureState.Index]
+        $fixtureState.Index++
         return $b
     }.GetNewClosure()
     if (-not (Wait-GwBridgeReady -ReadByte $fixtureReadByte -TimeoutSeconds 5)) { $failures.Add('noise_scan_bridge_ready_not_found') }
+
+    # 6b. deterministic closure-state advancement: the fixture's shared state object must have consumed
+    # every byte the moment the real BRIDGE_READY frame was matched (proves the mutation is visible across
+    # every invocation of the SAME closure instance, not just some of them).
+    if ($fixtureState.Index -ne $fixtureArray.Length) { $failures.Add('fixture_state_did_not_advance_deterministically') }
 
     # 7. TOKEN_FRAME forwarding buffer cleanup, via a synthetic fixture -- proves the byte[] the write
     # delegate saw is zeroized after the call, not merely that the source claims it (same object reference).
     $tokenPayload = [System.Text.Encoding]::ASCII.GetBytes('sentinel-selftest-token-fixture')
     $tokenFrame = New-GwFrame -Type $Script:GwMsgTokenFrame -Payload $tokenPayload
-    $rxIndex = 0
+    $rxState = [pscustomobject]@{ Index = 0 }
     $readTokenExact = {
         param($count)
-        if ($rxIndex + $count -gt $tokenFrame.Length) { return $null }
-        $slice = $tokenFrame[$rxIndex..($rxIndex + $count - 1)]
-        $rxIndex += $count
+        if ($rxState.Index + $count -gt $tokenFrame.Length) { return $null }
+        $slice = $tokenFrame[$rxState.Index..($rxState.Index + $count - 1)]
+        $rxState.Index += $count
         return $slice
     }.GetNewClosure()
     $script:GwSelfTestCapturedFrame = $null
@@ -445,12 +539,12 @@ function Invoke-GwSelfTest {
     # 8. state guard: TOKEN_STAGED cannot be confirmed from anything other than a real device TOKEN_STAGED
     # fixture -- the bridge never fabricates it.
     $wrongFrame = New-GwFrame -Type $Script:GwMsgProvisionAbort -Payload @()
-    $wrongIndex = 0
+    $wrongState = [pscustomobject]@{ Index = 0 }
     $readWrong = {
         param($count)
-        if ($wrongIndex + $count -gt $wrongFrame.Length) { return $null }
-        $slice = $wrongFrame[$wrongIndex..($wrongIndex + $count - 1)]
-        $wrongIndex += $count
+        if ($wrongState.Index + $count -gt $wrongFrame.Length) { return $null }
+        $slice = $wrongFrame[$wrongState.Index..($wrongState.Index + $count - 1)]
+        $wrongState.Index += $count
         return $slice
     }.GetNewClosure()
     $rejectedWrong = $false
@@ -462,12 +556,12 @@ function Invoke-GwSelfTest {
     if (-not $rejectedWrong) { $failures.Add('token_staged_guard_accepted_wrong_frame') }
 
     $realStagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged -Payload @()
-    $realIndex = 0
+    $realState = [pscustomobject]@{ Index = 0 }
     $readReal = {
         param($count)
-        if ($realIndex + $count -gt $realStagedFrame.Length) { return $null }
-        $slice = $realStagedFrame[$realIndex..($realIndex + $count - 1)]
-        $realIndex += $count
+        if ($realState.Index + $count -gt $realStagedFrame.Length) { return $null }
+        $slice = $realStagedFrame[$realState.Index..($realState.Index + $count - 1)]
+        $realState.Index += $count
         return $slice
     }.GetNewClosure()
     $acceptedReal = $false
@@ -477,6 +571,67 @@ function Invoke-GwSelfTest {
         $acceptedReal = $false
     }
     if (-not $acceptedReal) { $failures.Add('token_staged_guard_rejected_real_frame') }
+
+    # 9. Read-GwStreamExactBounded: an expired/zero-remaining deadline against a stream that never delivers
+    # any bytes returns a classified timeout failure -- never blocks past its budget. Uses an in-process
+    # anonymous pipe (no COM port, no SSH, no network socket) whose server side never writes, so the client
+    # side's read genuinely has to wait, proving real bounded behavior rather than a synthetic short-circuit.
+    $pipeServerA = New-Object System.IO.Pipes.AnonymousPipeServerStream([System.IO.Pipes.PipeDirection]::Out)
+    $pipeClientA = New-Object System.IO.Pipes.AnonymousPipeClientStream([System.IO.Pipes.PipeDirection]::In, $pipeServerA.ClientSafePipeHandle)
+    try {
+        $swA = [System.Diagnostics.Stopwatch]::StartNew()
+        $resultA = Read-GwStreamExactBounded -Stream $pipeClientA -Count $Script:GwHeaderBytes -Stopwatch $swA -BudgetMs 300
+        if ($resultA.Ok) {
+            $failures.Add('bounded_read_timeout_not_classified')
+        } elseif ($resultA.Reason -ne 'timeout') {
+            $failures.Add('bounded_read_timeout_wrong_reason')
+        }
+    } finally {
+        $pipeClientA.Dispose()
+        $pipeServerA.Dispose()
+    }
+
+    # 10. partial backend frame (fewer bytes than a full header) + expired deadline: still a classified
+    # failure, and Receive-GwTokenFrameAndForward must never invoke the serial-write callback on this path.
+    $pipeServerB = New-Object System.IO.Pipes.AnonymousPipeServerStream([System.IO.Pipes.PipeDirection]::Out)
+    $pipeClientB = New-Object System.IO.Pipes.AnonymousPipeClientStream([System.IO.Pipes.PipeDirection]::In, $pipeServerB.ClientSafePipeHandle)
+    try {
+        $partialHeader = [byte[]](0x47, 0x4E, 0x58, 0x33) # magic only -- never the rest of the 8-byte header
+        $pipeServerB.Write($partialHeader, 0, $partialHeader.Length)
+        $pipeServerB.Flush()
+
+        $swB = [System.Diagnostics.Stopwatch]::StartNew()
+        $budgetB = 300
+        $readPartialExact = {
+            param($count)
+            $r = Read-GwStreamExactBounded -Stream $pipeClientB -Count $count -Stopwatch $swB -BudgetMs $budgetB
+            if (-not $r.Ok) { return $null }
+            return $r.Bytes
+        }.GetNewClosure()
+
+        $script:GwSelfTestPartialWriteInvoked = $false
+        $captureWritePartial = { param($bytes) $script:GwSelfTestPartialWriteInvoked = $true }
+
+        $failedClosed = $false
+        try {
+            Receive-GwTokenFrameAndForward -ReadBytesExact $readPartialExact -WriteBytes $captureWritePartial
+        } catch {
+            $failedClosed = $true
+        }
+        if (-not $failedClosed) { $failures.Add('partial_frame_timeout_not_classified_failure') }
+        if ($script:GwSelfTestPartialWriteInvoked) { $failures.Add('timeout_read_invoked_serial_write') }
+    } finally {
+        $pipeClientB.Dispose()
+        $pipeServerB.Dispose()
+    }
+
+    # 11. -ProtocolTimeoutSeconds validation: in range accepted, out of range rejected -- real structural
+    # ordering (>15 and <1 both rejected; the firmware-safety-margin boundary itself accepted).
+    if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds 15)) { $failures.Add('protocol_timeout_boundary_15_rejected') }
+    if (Test-GwProtocolTimeoutSecondsValid -Seconds 16) { $failures.Add('protocol_timeout_16_accepted') }
+    if (Test-GwProtocolTimeoutSecondsValid -Seconds 999) { $failures.Add('protocol_timeout_999_accepted') }
+    if (Test-GwProtocolTimeoutSecondsValid -Seconds 0) { $failures.Add('protocol_timeout_0_accepted') }
+    if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds 1)) { $failures.Add('protocol_timeout_boundary_1_rejected') }
 
     return $failures.ToArray()
 }
@@ -512,6 +667,10 @@ if ($ComPort -notmatch '^COM[0-9]{1,3}$') {
 }
 if ($SshTarget -notmatch '^[A-Za-z0-9_.@:-]{1,255}$') {
     Write-Error '[M3A_BRIDGE] -SshTarget has an unexpected shape'
+    exit 2
+}
+if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) {
+    Write-Error '[M3A_BRIDGE] -ProtocolTimeoutSeconds must be between 1 and 15'
     exit 2
 }
 

@@ -43,7 +43,7 @@ jobs:
           esp_idf_version: v5.2.1
           target: esp32s3
           path: examples/factory_firmware
-          command: 'idf.py -B build-gptnix-off build && grep -qx "# CONFIG_GPTNIX_WATCHER_VOICE is not set" sdkconfig && grep -qx "# CONFIG_GPTNIX_WATCHER_PROVISION is not set" sdkconfig'
+          command: 'idf.py -B build-gptnix-off build && ! grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig && ! grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig'
 
       - name: Build factory firmware (mode=voice)
         if: matrix.mode == 'voice'
@@ -52,7 +52,7 @@ jobs:
           esp_idf_version: v5.2.1
           target: esp32s3
           path: examples/factory_firmware
-          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\n" > /tmp/gptnix_watcher_voice_on.defaults && idf.py -B build-gptnix-voice -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_voice_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig && grep -qx "# CONFIG_GPTNIX_WATCHER_PROVISION is not set" sdkconfig'
+          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\n" > /tmp/gptnix_watcher_voice_on.defaults && idf.py -B build-gptnix-voice -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_voice_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig && ! grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig'
 
       - name: Build factory firmware (mode=m3a)
         if: matrix.mode == 'm3a'

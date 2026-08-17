@@ -805,14 +805,23 @@ def _c93():
     return n >= 2, "found %d" % n
 
 
-@check("94. OFF build step exists")
+def _workflow_command_for_mode(mode_marker):
+    m = re.search(r"mode=%s\).*?command:\s*'([^']*)'" % re.escape(mode_marker), WORKFLOW_RAW, re.DOTALL)
+    return m.group(1) if m else ""
+
+
+OFF_BUILD_COMMAND = _workflow_command_for_mode("off")
+VOICE_BUILD_COMMAND = _workflow_command_for_mode("voice")
+
+
+@check("94. OFF build step exists and actually builds (real idf.py invocation, not skipped/no-op)")
 def _c94():
-    return "matrix.mode == 'off'" in WORKFLOW_RAW and "CONFIG_GPTNIX_WATCHER_VOICE is not set" in WORKFLOW_RAW, ""
+    return "matrix.mode == 'off'" in WORKFLOW_RAW and "idf.py -B build-gptnix-off build" in OFF_BUILD_COMMAND, ""
 
 
-@check("95. voice-only build step exists")
+@check("95. voice-only build step exists and actually builds (real idf.py invocation, not skipped/no-op)")
 def _c95():
-    return "matrix.mode == 'voice'" in WORKFLOW_RAW and "CONFIG_GPTNIX_WATCHER_VOICE=y" in WORKFLOW_RAW, ""
+    return "matrix.mode == 'voice'" in WORKFLOW_RAW and "idf.py -B build-gptnix-voice" in VOICE_BUILD_COMMAND, ""
 
 
 @check("96. M3A build step sets both voice and provision ON")
@@ -841,6 +850,188 @@ def _c99():
 def _c100():
     hits = [ln for ln in WORKFLOW_RAW.splitlines() if re.search(r"\b(flash|upload)\b", ln, re.IGNORECASE)]
     return not hits, "lines: %s" % hits
+
+
+# ===========================================================================
+# M3A.3B correction (CI + bridge safety) -- 101-...
+# ===========================================================================
+
+M3A_BUILD_COMMAND = _workflow_command_for_mode("m3a")
+
+# ---- Workflow: RC1 fix (OFF/voice sdkconfig assertions valid for a Kconfig symbol hidden by depends-on) ----
+
+@check("101. OFF assertion does not require the dependent PROVISION '# ... is not set' literal")
+def _c101():
+    return '# CONFIG_GPTNIX_WATCHER_PROVISION is not set' not in OFF_BUILD_COMMAND, ""
+
+
+@check("102. OFF semantically proves CONFIG_GPTNIX_WATCHER_VOICE=y is absent")
+def _c102():
+    return '! grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig' in OFF_BUILD_COMMAND, ""
+
+
+@check("103. OFF semantically proves CONFIG_GPTNIX_WATCHER_PROVISION=y is absent")
+def _c103():
+    return '! grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig' in OFF_BUILD_COMMAND, ""
+
+
+@check("104. voice mode semantically proves CONFIG_GPTNIX_WATCHER_VOICE=y")
+def _c104():
+    return bool(re.search(r'(?<!! )grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig', VOICE_BUILD_COMMAND)), ""
+
+
+@check("105. voice mode semantically proves CONFIG_GPTNIX_WATCHER_PROVISION=y is absent")
+def _c105():
+    return '! grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig' in VOICE_BUILD_COMMAND, ""
+
+
+@check("106. m3a mode exact three-flag assertion is unchanged by this correction")
+def _c106():
+    required = [
+        'grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig',
+        'grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig',
+        'grep -qx "CONFIG_GPTNIX_WATCHER_SESSION_URL=\\"https://example.invalid/v2/watcher/realtime/session\\"" sdkconfig',
+    ]
+    missing = [r for r in required if r not in M3A_BUILD_COMMAND]
+    return not missing, "missing: %s" % missing
+
+
+@check("107. no '|| true' weakening in any build-mode assertion command")
+def _c107():
+    hits = [cmd for cmd in (OFF_BUILD_COMMAND, VOICE_BUILD_COMMAND, M3A_BUILD_COMMAND) if '|| true' in cmd]
+    return not hits, "found in %d command(s)" % len(hits)
+
+
+# ---- Bridge timeout (RC3 fix: bounded backend reads) ----
+
+@check("108. -ProtocolTimeoutSeconds default is 15")
+def _c108():
+    return "[int]$ProtocolTimeoutSeconds = 15" in BRIDGE_PS1_RAW, ""
+
+
+@check("109. protocol timeout validation rejects values below 1")
+def _c109():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwProtocolTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-ge 1" in body, ""
+
+
+@check("110. protocol timeout validation rejects values above 15")
+def _c110():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwProtocolTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-le 15" in body, ""
+
+
+@check("111. canonical bounded stream-read helper exists")
+def _c111():
+    return "function Read-GwStreamExactBounded" in BRIDGE_PS1_RAW, ""
+
+
+@check("112. monotonic deadline source (Stopwatch) is used, not wall-clock Get-Date, for the bounded read")
+def _c112():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Read-GwStreamExactBounded", "function Start-GwBackendProcess")
+    return "System.Diagnostics.Stopwatch" in body and "ElapsedMilliseconds" in body, ""
+
+
+@check("113. live backend TOKEN_FRAME read is wired through the bounded helper")
+def _c113():
+    live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+    idx_bind = live_body.find("$readBackendExact = {")
+    idx_forward = live_body.find("Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact")
+    bound_between = "Read-GwStreamExactBounded" in live_body[idx_bind:idx_forward] if idx_bind != -1 and idx_forward != -1 else False
+    return idx_bind != -1 and idx_forward != -1 and bound_between, ""
+
+
+@check("114. no old naked unbounded backend stream read remains anywhere in the file")
+def _c114():
+    return "$outStream.Read(" not in BRIDGE_PS1_RAW, ""
+
+
+@check("115. TOKEN_FRAME header and payload share exactly one deadline (one Stopwatch, created once, before the forwarding call)")
+def _c115():
+    live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+    n_created = len(re.findall(r"\$tokenFrameStopwatch = \[System\.Diagnostics\.Stopwatch\]::StartNew\(\)", live_body))
+    idx_created = live_body.find("$tokenFrameStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
+    idx_forward = live_body.find("Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact")
+    return n_created == 1 and idx_created != -1 and idx_forward != -1 and idx_created < idx_forward, "created=%d" % n_created
+
+
+@check("116. a failed/timed-out header read cannot reach the serial-write callback (structural: null-check precedes the write)")
+def _c116():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Receive-GwTokenFrameAndForward", "function Confirm-GwDeviceTokenStaged")
+    idx_header_check = body.find("if (-not $parsed.Ok")
+    idx_write = body.find("& $WriteBytes $frame")
+    return idx_header_check != -1 and idx_write != -1 and idx_header_check < idx_write, ""
+
+
+@check("117. a failed/timed-out (including partial) payload read cannot reach the serial-write callback")
+def _c117():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Receive-GwTokenFrameAndForward", "function Confirm-GwDeviceTokenStaged")
+    idx_payload_check = body.find("if ($null -eq $payload)")
+    idx_write = body.find("& $WriteBytes $frame")
+    return idx_payload_check != -1 and idx_write != -1 and idx_payload_check < idx_write, ""
+
+
+@check("118. the post-staged backend decision read uses its OWN fresh deadline, separate from the TOKEN_FRAME deadline")
+def _c118():
+    live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+    has_decision_sw = "$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()" in live_body
+    idx_staged_write = live_body.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    idx_decision_sw = live_body.find("$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
+    distinct_from_token_frame_sw = "$decisionStopwatch" != "$tokenFrameStopwatch"
+    return (has_decision_sw and idx_staged_write != -1 and idx_decision_sw != -1
+        and idx_staged_write < idx_decision_sw and distinct_from_token_frame_sw), ""
+
+
+# ---- Bridge state (RC2 fix: deterministic SelfTest closure state) ----
+
+@check("119. mutable SelfTest callback indexes use deterministic [pscustomobject] state objects")
+def _c119():
+    n = len(re.findall(r"\[pscustomobject\]@\{\s*Index\s*=\s*0\s*\}", BRIDGE_PS1_RAW))
+    return n >= 4, "found %d" % n
+
+
+@check("120. the historical bare-scalar closure-mutation pattern is fully absent")
+def _c120():
+    hits = [s for s in ("$fixtureIndex", "$rxIndex", "$wrongIndex", "$realIndex") if s in BRIDGE_PS1_RAW]
+    return not hits, "found: %s" % hits
+
+
+@check("121. SelfTest's new bounded-read fixtures still open no serial/SSH/network resource")
+def _c121():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwSelfTest")
+    hits = [s for s in ("SerialPort", "Process]::Start", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod", "ssh.exe") if s in body]
+    return not hits, "found: %s" % hits
+
+
+# ---- Firmware observability (RC4 fix) ----
+
+@check("122. exactly one active terminal classified log per run")
+def _c122():
+    n = len(re.findall(r'"\[V2_WATCHER_PROVISION\] terminal: code=%d"', PROVISION_C_CODE))
+    return n == 1, "found %d" % n
+
+
+@check("123. the terminal log lives in the public app_gptnix_watcher_provision_run wrapper")
+def _c123():
+    body = _extract_c_function(PROVISION_C_CODE, "app_gptnix_watcher_provision_result_t app_gptnix_watcher_provision_run(void)\n{", "#else")
+    return 'terminal: code=%d' in body, ""
+
+
+@check("124. s_run_provision_cycle contains zero terminal logs")
+def _c124():
+    body = _extract_c_function(PROVISION_C_CODE, "static app_gptnix_watcher_provision_result_t s_run_provision_cycle(void)", "app_gptnix_watcher_provision_result_t app_gptnix_watcher_provision_run(void)")
+    return 'terminal: code=' not in body, ""
+
+
+@check("125. UART flush occurs after the terminal log and before the return, in the public wrapper")
+def _c125():
+    body = _extract_c_function(PROVISION_C_CODE, "app_gptnix_watcher_provision_result_t app_gptnix_watcher_provision_run(void)\n{", "#else")
+    idx_cycle = body.find("s_run_provision_cycle()")
+    idx_log = body.find("terminal: code=%d")
+    idx_flush = body.find("uart_flush_input(CONFIG_ESP_CONSOLE_UART_NUM)")
+    idx_return = body.find("return result;")
+    return (idx_cycle != -1 and idx_log != -1 and idx_flush != -1 and idx_return != -1
+        and idx_cycle < idx_log < idx_flush < idx_return), ""
 
 
 if __name__ == "__main__":

@@ -885,13 +885,29 @@ static void register_cmd_rgb(void)
 
 
 /************* cmd register **************/
-int app_cmd_init(void)
+
+// Single console/REPL owner, split into a prepare phase (command registration + REPL/driver creation, no
+// blocking read) and a start phase (esp_console_start_repl -- the call that actually wakes the REPL task and
+// begins linenoise/history). This split exists so a caller (main.c, gated by CONFIG_GPTNIX_WATCHER_PROVISION)
+// can safely read raw bytes off the already-installed console UART BETWEEN prepare and start, during the
+// window before esp_console_start_repl() has woken the REPL task -- see
+// app_gptnix_watcher_provision.c for the consumer of that window. Neither function knows anything about the
+// M3A provisioning protocol/token; this file owns only the console/REPL lifecycle.
+static esp_console_repl_t *s_repl = NULL;
+static bool s_repl_prepared = false;
+static bool s_repl_started = false;
+
+int app_cmd_prepare_repl(void)
 {
+    if (s_repl_prepared) {
+        ESP_LOGE(TAG, "app_cmd_prepare_repl: already prepared -- refusing to re-register commands or install a second driver");
+        return -1;
+    }
+
 #if CONFIG_ENABLE_FACTORY_FW_DEBUG_LOG
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
 #endif
 
-    esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     /* Prompt to be printed before each line.
      * This can be customized, made dynamic, etc.
@@ -914,22 +930,49 @@ int app_cmd_init(void)
 
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &s_repl));
 
 #elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
     esp_console_dev_usb_cdc_config_t hw_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl));
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &s_repl));
 
 #elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
     esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &s_repl));
 
 #else
 #error Unsupported console type
 #endif
-    // Since we have SD card access in console cmd, it might trigger the SPI core-conflict issue
-    // we can't control the core on which the console runs, so 
-    // TODO: narrow the SD card access code into another task which runs on Core 1.
-    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+    s_repl_prepared = true;
     return 0;
+}
+
+int app_cmd_start_repl(void)
+{
+    if (!s_repl_prepared) {
+        ESP_LOGE(TAG, "app_cmd_start_repl: REPL not prepared -- call app_cmd_prepare_repl() first");
+        return -1;
+    }
+    if (s_repl_started) {
+        ESP_LOGE(TAG, "app_cmd_start_repl: REPL already started -- refusing a second start");
+        return -1;
+    }
+    // Since we have SD card access in console cmd, it might trigger the SPI core-conflict issue
+    // we can't control the core on which the console runs, so
+    // TODO: narrow the SD card access code into another task which runs on Core 1.
+    ESP_ERROR_CHECK(esp_console_start_repl(s_repl));
+    s_repl_started = true;
+    return 0;
+}
+
+// Compatibility wrapper for the normal (CONFIG_GPTNIX_WATCHER_PROVISION unset) boot path: unchanged external
+// behavior -- prepare immediately followed by start, exactly as the original single-phase app_cmd_init() did.
+int app_cmd_init(void)
+{
+    int ret = app_cmd_prepare_repl();
+    if (ret != 0) {
+        return ret;
+    }
+    return app_cmd_start_repl();
 }

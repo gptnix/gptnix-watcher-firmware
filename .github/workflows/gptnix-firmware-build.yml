@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        voice_mode: ['off', 'on']
+        mode: ['off', 'voice', 'm3a']
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -28,25 +28,52 @@ jobs:
           echo "CI_BASE_BRANCH=baseline/fw-v1.1.7"
           echo "CI_TARGET=esp32s3"
           echo "CI_IDF_VERSION=v5.2.1"
-          echo "CI_VOICE_MODE=${{ matrix.voice_mode }}"
+          echo "CI_MODE=${{ matrix.mode }}"
 
       - name: Run GPTNiX Watcher voice fitness test
         run: python3 examples/factory_firmware/gptnix_tests/test_watcher_voice_fitness.py
 
-      - name: Build factory firmware (voice OFF)
-        if: matrix.voice_mode == 'off'
-        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
-        with:
-          esp_idf_version: v5.2.1
-          target: esp32s3
-          path: examples/factory_firmware
-          command: 'idf.py -B build-gptnix-voice-off build && grep -qx "# CONFIG_GPTNIX_WATCHER_VOICE is not set" sdkconfig'
+      - name: Run GPTNiX Watcher M3A provision fitness test
+        run: python3 examples/factory_firmware/gptnix_tests/test_watcher_m3a_provision_fitness.py
 
-      - name: Build factory firmware (voice ON)
-        if: matrix.voice_mode == 'on'
+      - name: Build factory firmware (mode=off)
+        if: matrix.mode == 'off'
         uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
         with:
           esp_idf_version: v5.2.1
           target: esp32s3
           path: examples/factory_firmware
-          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\n" > /tmp/gptnix_watcher_voice_on.defaults && idf.py -B build-gptnix-voice-on -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_voice_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig'
+          command: 'idf.py -B build-gptnix-off build && grep -qx "# CONFIG_GPTNIX_WATCHER_VOICE is not set" sdkconfig && grep -qx "# CONFIG_GPTNIX_WATCHER_PROVISION is not set" sdkconfig'
+
+      - name: Build factory firmware (mode=voice)
+        if: matrix.mode == 'voice'
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
+        with:
+          esp_idf_version: v5.2.1
+          target: esp32s3
+          path: examples/factory_firmware
+          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\n" > /tmp/gptnix_watcher_voice_on.defaults && idf.py -B build-gptnix-voice -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_voice_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig && grep -qx "# CONFIG_GPTNIX_WATCHER_PROVISION is not set" sdkconfig'
+
+      - name: Build factory firmware (mode=m3a)
+        if: matrix.mode == 'm3a'
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
+        with:
+          esp_idf_version: v5.2.1
+          target: esp32s3
+          path: examples/factory_firmware
+          command: 'printf "CONFIG_GPTNIX_WATCHER_VOICE=y\nCONFIG_GPTNIX_WATCHER_PROVISION=y\nCONFIG_GPTNIX_WATCHER_SESSION_URL=\"https://example.invalid/v2/watcher/realtime/session\"\n" > /tmp/gptnix_watcher_m3a_on.defaults && idf.py -B build-gptnix-m3a -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/gptnix_watcher_m3a_on.defaults" build && grep -qx "CONFIG_GPTNIX_WATCHER_VOICE=y" sdkconfig && grep -qx "CONFIG_GPTNIX_WATCHER_PROVISION=y" sdkconfig && grep -qx "CONFIG_GPTNIX_WATCHER_SESSION_URL=\"https://example.invalid/v2/watcher/realtime/session\"" sdkconfig'
+
+  m3a-bridge-selftest:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Run M3A Windows bridge self-test
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File .\examples\factory_firmware\tools\gptnix_watcher_m3a_bridge.ps1 `
+            -SelfTest

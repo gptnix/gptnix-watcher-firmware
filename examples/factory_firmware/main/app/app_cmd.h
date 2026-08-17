@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+int app_cmd_prepare_repl(void);
+int app_cmd_start_repl(void);
 int app_cmd_init(void);
 
 #ifdef __cplusplus

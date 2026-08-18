@@ -1464,5 +1464,69 @@ def _c174():
         beginread_ok, endread_ok, asyncwait_ok, worker_ok, cancel_ok, failfast_ok, shared_deadline_ok, fresh_decision_ok)
 
 
+# ===========================================================================
+# M3A TOKEN_STAGED serial resynchronization fix (175-182)
+# ===========================================================================
+
+RESYNC_FN_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Read-GwFrameHeaderResynchronized", "function Receive-GwTokenFrameAndForward")
+CONFIRM_STAGED_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Confirm-GwDeviceTokenStaged", "function Read-GwStreamExactBounded")
+
+
+@check("175. resync scanner never fabricates a success -- Ok is only ever assigned from Test-GwFrameHeader's own result")
+def _c175():
+    hardcoded_true = len(re.findall(r"Ok\s*=\s*\$true", RESYNC_FN_SOURCE)) > 0
+    from_parsed = "Ok = $parsed.Ok" in RESYNC_FN_SOURCE
+    return (not hardcoded_true) and from_parsed, "hardcoded_true=%s from_parsed=%s" % (hardcoded_true, from_parsed)
+
+
+@check("176. resync scanner never stringifies or prints scanned noise/header bytes")
+def _c176():
+    string_hits = [s for s in ("[string]$b", "[string]$window", "[string]$rest", "[string]$header", "GetString(") if s in RESYNC_FN_SOURCE]
+    print_hits = [s for s in re.findall(r"Write-(?:Host|Output)\s+\$\w+", RESYNC_FN_SOURCE)]
+    return not string_hits and not print_hits, "string_hits=%s print_hits=%s" % (string_hits, print_hits)
+
+
+@check("177. resync scanner is bounded -- only one while-loop condition tests the caller-owned deadline, plus one fixed noise-count bound")
+def _c177():
+    deadline_loops = len(re.findall(r"while\s*\(\(Get-Date\)\s*-lt\s*\$Deadline\)|while\s*\(\(Get-Date\)\s*-ge\s*\$Deadline\)", RESYNC_FN_SOURCE))
+    has_scan_limit = "scanned -gt $MaxNoiseBytes" in RESYNC_FN_SOURCE
+    return deadline_loops >= 1 and has_scan_limit, "deadline_loops=%d has_scan_limit=%s" % (deadline_loops, has_scan_limit)
+
+
+@check("178. Confirm-GwDeviceTokenStaged uses the resync-based -ReadByte/-Deadline signature, not the retired -ReadBytesExact positional reader")
+def _c178():
+    sig_ok = "[scriptblock]$ReadByte" in CONFIRM_STAGED_SOURCE and "[datetime]$Deadline" in CONFIRM_STAGED_SOURCE
+    old_gone = "ReadBytesExact" not in CONFIRM_STAGED_SOURCE
+    calls_resync = "Read-GwFrameHeaderResynchronized -ReadByte $ReadByte -Deadline $Deadline" in CONFIRM_STAGED_SOURCE
+    return sig_ok and old_gone and calls_resync, "sig_ok=%s old_gone=%s calls_resync=%s" % (sig_ok, old_gone, calls_resync)
+
+
+@check("179. Confirm-GwDeviceTokenStaged still throws (never returns falsy) on any non-OK/wrong-type/nonzero-payload result")
+def _c179():
+    return bool(re.search(r'if\s*\(-not \$parsed\.Ok -or \$parsed\.Type -ne \$Script:GwMsgTokenStaged -or \$parsed\.Length -ne 0\)\s*\{\s*throw', CONFIRM_STAGED_SOURCE)), ""
+
+
+@check("180. Invoke-GwLiveBridge's TOKEN_STAGED call site reuses the single existing device-byte reader -- no second reader/owner introduced")
+def _c180():
+    reader_uses = len(re.findall(r"\$readDeviceByte\b", LIVE_BRIDGE_SOURCE))
+    confirm_call = "Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline" in LIVE_BRIDGE_SOURCE
+    no_old_exact_reader = "$readSerialExact" not in LIVE_BRIDGE_SOURCE
+    return reader_uses >= 2 and confirm_call and no_old_exact_reader, "reader_uses=%d confirm_call=%s no_old_exact_reader=%s" % (reader_uses, confirm_call, no_old_exact_reader)
+
+
+@check("181. TOKEN_STAGED deadline is a single fresh budget derived from -ProtocolTimeoutSeconds, matching the retired reader's own budget concept")
+def _c181():
+    return "$tokenStagedDeadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)" in LIVE_BRIDGE_SOURCE, ""
+
+
+@check("182. GwMaxResyncNoiseBytes is a fixed, bounded, positive constant")
+def _c182():
+    m = re.search(r"\$Script:GwMaxResyncNoiseBytes\s*=\s*(\d+)", BRIDGE_PS1_RAW)
+    if not m:
+        return False, "constant not found"
+    value = int(m.group(1))
+    return 0 < value <= 65536, "value=%d" % value
+
+
 if __name__ == "__main__":
     sys.exit(main())

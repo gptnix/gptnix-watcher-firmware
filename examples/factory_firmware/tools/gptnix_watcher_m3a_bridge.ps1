@@ -94,6 +94,12 @@ $Script:GwMsgProvisionAbort  = [byte]0x05
 # read worker a bounded chance to actually quiesce before this process either continues or fail-closed exits.
 $Script:GwReadCancelGraceMs = 2000
 
+# Bounded noise-tolerance ceiling for device-frame resynchronization (see Read-GwFrameHeaderResynchronized).
+# Large enough to skip a realistic firmware console/log line sharing the same UART (e.g.
+# "[V2_WATCHER_PROVISION] bridge: ready\n" is ~37 bytes) with generous margin for several such lines; small
+# enough to still fail closed quickly on genuine garbage rather than scanning indefinitely.
+$Script:GwMaxResyncNoiseBytes = 512
+
 # -----------------------------------------------------------------------------
 # GptnixWatcherBoundedProcessRead -- hard-bounded synchronous Process-stdout read.
 #
@@ -404,6 +410,61 @@ function Wait-GwBridgeReady {
     return $false
 }
 
+function Read-GwFrameHeaderResynchronized {
+    <# Bounded, noise-tolerant frame-header scanner for control frames arriving on a UART also used for
+       firmware console/log output -- generalizes Wait-GwBridgeReady's proven magic-scan technique into a
+       reusable primitive that returns the parsed header instead of a bare boolean, without changing
+       Wait-GwBridgeReady's own behavior/signature/call site at all. $ReadByte is a scriptblock returning one
+       byte (0-255) or $null on a bounded per-call timeout/no-data, exactly like Wait-GwBridgeReady's own
+       contract. $Deadline is ONE caller-owned wall-clock deadline shared across both the magic scan and the
+       remaining-header read -- never a fresh deadline per phase. Once a 4-byte magic alignment is found, this
+       function COMMITS to it: it reads the remaining 4 header bytes and returns whatever Test-GwFrameHeader
+       says (even a structurally-valid-but-wrong-type/version/payload rejection) -- it never resumes scanning
+       past an aligned magic, which would otherwise risk silently skipping a genuine protocol-ordering
+       violation. Never stringifies/logs/stores scanned noise bytes -- only counts them against a fixed bound.
+       Returns @{Ok;Type;Length;Reason;Header} on a fully read+parsed header, or @{Ok=$false;Reason=<classified
+       string>} on scan_limit/timeout/header_timeout -- the same classified-string discipline as
+       Test-GwFrameHeader itself. #>
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ReadByte,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [int]$MaxNoiseBytes = $Script:GwMaxResyncNoiseBytes
+    )
+    $window = New-Object System.Collections.Generic.Queue[byte]
+    $scanned = 0
+    while ((Get-Date) -lt $Deadline) {
+        if ($scanned -gt $MaxNoiseBytes) {
+            return @{ Ok = $false; Reason = 'scan_limit' }
+        }
+        $b = & $ReadByte
+        if ($null -eq $b) { continue }
+        $window.Enqueue([byte]$b)
+        while ($window.Count -gt 4) { [void]$window.Dequeue() }
+        $scanned += 1
+        if ($window.Count -eq 4 -and (Test-GwByteArrayEqual -A $window.ToArray() -B $Script:GwMagic)) {
+            # Magic aligned -- committed. Read exactly the remaining 4 header bytes within the SAME deadline;
+            # never resume scanning after this point regardless of what the remaining bytes turn out to be.
+            $rest = New-Object byte[] 4
+            $got = 0
+            while ($got -lt 4) {
+                if ((Get-Date) -ge $Deadline) {
+                    return @{ Ok = $false; Reason = 'header_timeout' }
+                }
+                $rb = & $ReadByte
+                if ($null -eq $rb) { continue }
+                $rest[$got] = [byte]$rb
+                $got += 1
+            }
+            $header = New-Object byte[] $Script:GwHeaderBytes
+            [Array]::Copy($window.ToArray(), 0, $header, 0, 4)
+            [Array]::Copy($rest, 0, $header, 4, 4)
+            $parsed = Test-GwFrameHeader -Header $header
+            return @{ Ok = $parsed.Ok; Type = $parsed.Type; Length = $parsed.Length; Reason = $parsed.Reason; Header = $header }
+        }
+    }
+    return @{ Ok = $false; Reason = 'timeout' }
+}
+
 function Receive-GwTokenFrameAndForward {
     <# Reads exactly one TOKEN_FRAME via $ReadBytesExact (backend fd3 stream),
        forwards the exact raw frame bytes to $WriteBytes (serial) unmodified,
@@ -438,10 +499,20 @@ function Confirm-GwDeviceTokenStaged {
        valid zero-payload TOKEN_STAGED. The bridge never fabricates this frame
        itself -- it only ever forwards one actually received from the device
        (see F5/F6). Throws on anything else -- never returns a fabricated
-       success. #>
-    param([Parameter(Mandatory = $true)][scriptblock]$ReadBytesExact)
-    $header = & $ReadBytesExact $Script:GwHeaderBytes
-    $parsed = Test-GwFrameHeader -Header $header
+       success.
+
+       Resynchronizing (M3A TOKEN_STAGED serial-resync fix): the device UART also carries firmware
+       console/log output, so a real TOKEN_STAGED frame can legitimately be preceded by non-protocol bytes
+       (e.g. the firmware's own "[V2_WATCHER_PROVISION] bridge: ready" log line, or another background
+       task's asynchronous log output) -- see Read-GwFrameHeaderResynchronized. This reads byte-by-byte via
+       $ReadByte (identical per-call contract to Wait-GwBridgeReady's own reader) within ONE caller-owned
+       $Deadline, exactly like BRIDGE_READY's own proven tolerance, instead of assuming byte 0 of the next
+       exact-count read is already the frame. #>
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ReadByte,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    $parsed = Read-GwFrameHeaderResynchronized -ReadByte $ReadByte -Deadline $Deadline
     if (-not $parsed.Ok -or $parsed.Type -ne $Script:GwMsgTokenStaged -or $parsed.Length -ne 0) {
         throw "gw_token_staged_not_confirmed: $($parsed.Reason)"
     }
@@ -604,24 +675,12 @@ function Invoke-GwLiveBridge {
             return 2
         }
 
-        $readSerialExact = {
-            param($count)
-            $buf = New-Object byte[] $count
-            $got = 0
-            $deadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)
-            while ($got -lt $count) {
-                if ((Get-Date) -ge $deadline) { return $null }
-                try {
-                    $n = $port.Read($buf, $got, $count - $got)
-                } catch [System.TimeoutException] {
-                    $n = 0
-                }
-                $got += $n
-            }
-            return $buf
-        }.GetNewClosure()
-
-        Confirm-GwDeviceTokenStaged -ReadBytesExact $readSerialExact | Out-Null
+        # M3A TOKEN_STAGED serial-resync fix: reuse the SAME per-byte device reader already proven for
+        # BRIDGE_READY ($readDeviceByte, defined above) -- one serial owner, one read contract -- under one
+        # fresh wall-clock deadline for this exchange (same $ProtocolTimeoutSeconds budget concept the prior
+        # exact-count reader used, now shared across both the magic scan and the remaining-header read).
+        $tokenStagedDeadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)
+        Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline | Out-Null
 
         $stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged -Payload @()
         $inStream.Write($stagedFrame, 0, $stagedFrame.Length)
@@ -781,19 +840,19 @@ function Invoke-GwSelfTest {
     }
 
     # 8. state guard: TOKEN_STAGED cannot be confirmed from anything other than a real device TOKEN_STAGED
-    # fixture -- the bridge never fabricates it.
+    # fixture -- the bridge never fabricates it. Uses the new byte-by-byte -ReadByte/-Deadline signature
+    # (M3A TOKEN_STAGED serial-resync fix) instead of the retired -ReadBytesExact positional reader.
     $wrongFrame = New-GwFrame -Type $Script:GwMsgProvisionAbort -Payload @()
     $wrongState = [pscustomobject]@{ Index = 0 }
     $readWrong = {
-        param($count)
-        if ($wrongState.Index + $count -gt $wrongFrame.Length) { return $null }
-        $slice = $wrongFrame[$wrongState.Index..($wrongState.Index + $count - 1)]
-        $wrongState.Index += $count
-        return $slice
+        if ($wrongState.Index -ge $wrongFrame.Length) { return $null }
+        $b = $wrongFrame[$wrongState.Index]
+        $wrongState.Index++
+        return $b
     }.GetNewClosure()
     $rejectedWrong = $false
     try {
-        Confirm-GwDeviceTokenStaged -ReadBytesExact $readWrong | Out-Null
+        Confirm-GwDeviceTokenStaged -ReadByte $readWrong -Deadline ((Get-Date).AddSeconds(2)) | Out-Null
     } catch {
         $rejectedWrong = $true
     }
@@ -802,19 +861,160 @@ function Invoke-GwSelfTest {
     $realStagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged -Payload @()
     $realState = [pscustomobject]@{ Index = 0 }
     $readReal = {
-        param($count)
-        if ($realState.Index + $count -gt $realStagedFrame.Length) { return $null }
-        $slice = $realStagedFrame[$realState.Index..($realState.Index + $count - 1)]
-        $realState.Index += $count
-        return $slice
+        if ($realState.Index -ge $realStagedFrame.Length) { return $null }
+        $b = $realStagedFrame[$realState.Index]
+        $realState.Index++
+        return $b
     }.GetNewClosure()
     $acceptedReal = $false
     try {
-        $acceptedReal = Confirm-GwDeviceTokenStaged -ReadBytesExact $readReal
+        $acceptedReal = Confirm-GwDeviceTokenStaged -ReadByte $readReal -Deadline ((Get-Date).AddSeconds(2))
     } catch {
         $acceptedReal = $false
     }
     if (-not $acceptedReal) { $failures.Add('token_staged_guard_rejected_real_frame') }
+
+    # 8b. text noise (a realistic firmware console/log line sharing the UART) preceding a real TOKEN_STAGED
+    # frame is tolerated, and the returned header is the EXACT device bytes -- never a reconstruction.
+    $textNoise = [System.Text.Encoding]::ASCII.GetBytes("[V2_WATCHER_PROVISION] bridge: ready`n")
+    $noisyRealFixture = New-Object System.Collections.Generic.List[byte]
+    $noisyRealFixture.AddRange([byte[]]$textNoise)
+    $noisyRealFixture.AddRange([byte[]]$realStagedFrame)
+    $noisyRealArray = $noisyRealFixture.ToArray()
+    $noisyRealState = [pscustomobject]@{ Index = 0 }
+    $readNoisyReal = {
+        if ($noisyRealState.Index -ge $noisyRealArray.Length) { return $null }
+        $b = $noisyRealArray[$noisyRealState.Index]
+        $noisyRealState.Index++
+        return $b
+    }.GetNewClosure()
+    $noisyRealResult = Read-GwFrameHeaderResynchronized -ReadByte $readNoisyReal -Deadline ((Get-Date).AddSeconds(2))
+    if (-not $noisyRealResult.Ok -or $noisyRealResult.Type -ne $Script:GwMsgTokenStaged -or $noisyRealResult.Length -ne 0) {
+        $failures.Add('resync_text_noise_not_tolerated')
+    }
+    if (-not (Test-GwByteArrayEqual -A $noisyRealResult.Header -B $realStagedFrame)) {
+        $failures.Add('resync_returned_header_not_exact_device_bytes')
+    }
+
+    # 8c. arbitrary binary non-GNX3 noise preceding a real TOKEN_STAGED frame is tolerated.
+    $binNoise = [byte[]](0x00, 0xFF, 0x10, 0x20, 0x7A, 0x99)
+    $binNoisyFixture = New-Object System.Collections.Generic.List[byte]
+    $binNoisyFixture.AddRange($binNoise)
+    $binNoisyFixture.AddRange([byte[]]$realStagedFrame)
+    $binNoisyArray = $binNoisyFixture.ToArray()
+    $binNoisyState = [pscustomobject]@{ Index = 0 }
+    $readBinNoisy = {
+        if ($binNoisyState.Index -ge $binNoisyArray.Length) { return $null }
+        $b = $binNoisyArray[$binNoisyState.Index]
+        $binNoisyState.Index++
+        return $b
+    }.GetNewClosure()
+    $binNoisyResult = Read-GwFrameHeaderResynchronized -ReadByte $readBinNoisy -Deadline ((Get-Date).AddSeconds(2))
+    if (-not $binNoisyResult.Ok -or $binNoisyResult.Type -ne $Script:GwMsgTokenStaged) {
+        $failures.Add('resync_binary_noise_not_tolerated')
+    }
+
+    # 8d. reads split byte-by-byte with a $null "no data yet" gap before every byte (matching a real
+    # per-call device-port read timeout), PLUS a genuine partial-magic false start ("G","N" then a byte
+    # that breaks the match) before the real magic -- the rolling window must not falsely trigger on the
+    # false start and must still resynchronize correctly across the interleaved gaps.
+    $falseStartPrefix = [byte[]](0x47, 0x4E, 0x00, 0x41, 0x42)
+    $splitFixtureBytes = New-Object System.Collections.Generic.List[byte]
+    $splitFixtureBytes.AddRange($falseStartPrefix)
+    $splitFixtureBytes.AddRange([byte[]]$realStagedFrame)
+    $splitArray = $splitFixtureBytes.ToArray()
+    $splitState = [pscustomobject]@{ Index = 0; EmitNull = $true }
+    $readSplit = {
+        if ($splitState.EmitNull) {
+            $splitState.EmitNull = $false
+            return $null
+        }
+        if ($splitState.Index -ge $splitArray.Length) { return $null }
+        $b = $splitArray[$splitState.Index]
+        $splitState.Index++
+        $splitState.EmitNull = $true
+        return $b
+    }.GetNewClosure()
+    $splitResult = Read-GwFrameHeaderResynchronized -ReadByte $readSplit -Deadline ((Get-Date).AddSeconds(2))
+    if (-not $splitResult.Ok -or $splitResult.Type -ne $Script:GwMsgTokenStaged) {
+        $failures.Add('resync_split_reads_or_false_start_not_tolerated')
+    }
+
+    # 8e. bounded scan limit: a stream of pure non-magic noise beyond $Script:GwMaxResyncNoiseBytes fails
+    # closed with a classified reason instead of scanning forever.
+    $overLimitNoise = New-Object byte[] ($Script:GwMaxResyncNoiseBytes + 16)
+    for ($i = 0; $i -lt $overLimitNoise.Length; $i++) { $overLimitNoise[$i] = 0x58 }
+    $overLimitState = [pscustomobject]@{ Index = 0 }
+    $readOverLimit = {
+        if ($overLimitState.Index -ge $overLimitNoise.Length) { return $null }
+        $b = $overLimitNoise[$overLimitState.Index]
+        $overLimitState.Index++
+        return $b
+    }.GetNewClosure()
+    $overLimitResult = Read-GwFrameHeaderResynchronized -ReadByte $readOverLimit -Deadline ((Get-Date).AddSeconds(5))
+    if ($overLimitResult.Ok -or $overLimitResult.Reason -ne 'scan_limit') {
+        $failures.Add('resync_scan_limit_not_enforced')
+    }
+
+    # 8f. deadline expiry before magic is ever found fails closed with a classified reason, never silently.
+    $readNeverMagic = { return [byte]0x58 }
+    $timeoutResult = Read-GwFrameHeaderResynchronized -ReadByte $readNeverMagic -Deadline ((Get-Date).AddMilliseconds(150)) -MaxNoiseBytes 1000000
+    if ($timeoutResult.Ok -or $timeoutResult.Reason -ne 'timeout') {
+        $failures.Add('resync_timeout_not_enforced')
+    }
+
+    # 8g. magic found but the remaining 4 header bytes arrive only partially (then never) before the deadline
+    # -- fails closed with a distinct classified reason, and never returns a fabricated/partial header as Ok.
+    $truncHeaderBytes = New-Object System.Collections.Generic.List[byte]
+    $truncHeaderBytes.AddRange([byte[]]$Script:GwMagic)
+    $truncHeaderBytes.Add([byte]0x01)
+    $truncHeaderArray = $truncHeaderBytes.ToArray()
+    $truncHeaderState = [pscustomobject]@{ Index = 0 }
+    $readTruncHeader = {
+        if ($truncHeaderState.Index -ge $truncHeaderArray.Length) { return $null }
+        $b = $truncHeaderArray[$truncHeaderState.Index]
+        $truncHeaderState.Index++
+        return $b
+    }.GetNewClosure()
+    $truncHeaderResult = Read-GwFrameHeaderResynchronized -ReadByte $readTruncHeader -Deadline ((Get-Date).AddMilliseconds(150))
+    if ($truncHeaderResult.Ok -or $truncHeaderResult.Reason -ne 'header_timeout') {
+        $failures.Add('resync_partial_header_not_classified')
+    }
+
+    # 8h. magic + wrong version fails closed (Test-GwFrameHeader's own classification, unchanged, propagated
+    # through the resync primitive without being reinterpreted or skipped past).
+    $wrongVersionHeader = [byte[]]($Script:GwMagic + [byte[]](0x02, $Script:GwMsgTokenStaged, 0x00, 0x00))
+    $wrongVersionState = [pscustomobject]@{ Index = 0 }
+    $readWrongVersion = {
+        if ($wrongVersionState.Index -ge $wrongVersionHeader.Length) { return $null }
+        $b = $wrongVersionHeader[$wrongVersionState.Index]
+        $wrongVersionState.Index++
+        return $b
+    }.GetNewClosure()
+    $wrongVersionResult = Read-GwFrameHeaderResynchronized -ReadByte $readWrongVersion -Deadline ((Get-Date).AddSeconds(2))
+    if ($wrongVersionResult.Ok -or $wrongVersionResult.Reason -ne 'version') {
+        $failures.Add('resync_wrong_version_not_rejected')
+    }
+
+    # 8i. magic + non-zero payload length on an otherwise-valid TOKEN_STAGED header fails closed -- this
+    # business rule lives in Confirm-GwDeviceTokenStaged itself (Test-GwFrameHeader only rejects an
+    # oversized length, not a non-zero one for a control frame), so this is exercised at that level, mirroring
+    # the existing wrong-type guard above.
+    $nonZeroPayloadHeader = [byte[]]($Script:GwMagic + [byte[]]($Script:GwVersion, $Script:GwMsgTokenStaged, 0x00, 0x01))
+    $nonZeroState = [pscustomobject]@{ Index = 0 }
+    $readNonZeroPayload = {
+        if ($nonZeroState.Index -ge $nonZeroPayloadHeader.Length) { return $null }
+        $b = $nonZeroPayloadHeader[$nonZeroState.Index]
+        $nonZeroState.Index++
+        return $b
+    }.GetNewClosure()
+    $rejectedNonZeroPayload = $false
+    try {
+        Confirm-GwDeviceTokenStaged -ReadByte $readNonZeroPayload -Deadline ((Get-Date).AddSeconds(2)) | Out-Null
+    } catch {
+        $rejectedNonZeroPayload = $true
+    }
+    if (-not $rejectedNonZeroPayload) { $failures.Add('resync_nonzero_payload_not_rejected') }
 
     # The former "9"/"10" AnonymousPipeClientStream timeout/partial fixtures are retired: they called
     # Read-GwStreamExactBounded with an explicit null in place of a real backend Process, but that parameter is

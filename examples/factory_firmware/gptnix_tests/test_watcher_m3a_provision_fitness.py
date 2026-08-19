@@ -1731,5 +1731,103 @@ def _c208():
     return not hits, "hits=%s" % hits
 
 
+# ===========================================================================
+# Live-output / exit-status fix (209-220): the top-level launcher no longer captures
+# Invoke-GwLiveBridge's ENTIRE success/pipeline stream via `exit (Invoke-GwLiveBridge ...)`
+# -- a construction that swallowed every live [M3A_BRIDGE] diagnostic and was physically
+# reproduced to do so. Diagnostics inside Invoke-GwLiveBridge now use Write-Host (a
+# separate, uncapturable stream); the launcher captures only the function's real `return`
+# value and validates it against the function's actual exit contract before `exit`.
+# Checks below use the comment-stripped BRIDGE_PS1_CODE (not the raw/commented source) so
+# that this fix's own explanatory comments -- which necessarily quote the old buggy
+# `exit (Invoke-GwLiveBridge ...)` construction as prose -- can never be mistaken for a
+# structural match, matching the existing BRIDGE_PS1_CODE convention already used by
+# checks in the 140s/1370s range above.
+# ===========================================================================
+
+LIVE_BRIDGE_CODE = _extract_c_function(BRIDGE_PS1_CODE, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+LAUNCHER_CODE = _extract_c_function(BRIDGE_PS1_CODE, "if ($SelfTest)")
+
+
+@check("209. the top-level live invocation no longer captures Invoke-GwLiveBridge's output stream inside exit(...)")
+def _c209():
+    return "exit (Invoke-GwLiveBridge" not in LAUNCHER_CODE, ""
+
+
+@check("210. Invoke-GwLiveBridge's diagnostic stream is Write-Host only -- zero Write-Output calls remain in its body")
+def _c210():
+    n_output = LIVE_BRIDGE_CODE.count("Write-Output")
+    n_host = LIVE_BRIDGE_CODE.count("Write-Host")
+    return n_output == 0 and n_host >= 6, "write_output=%d write_host=%d" % (n_output, n_host)
+
+
+@check("211. the COMMIT diagnostic remains observable")
+def _c211():
+    return "Write-Host '[M3A_BRIDGE] decision: commit'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("212. the ABORT diagnostic remains observable")
+def _c212():
+    return "Write-Host '[M3A_BRIDGE] decision: abort'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("213. the device READY observation diagnostics (true and timeout) remain observable")
+def _c213():
+    n_true = LIVE_BRIDGE_CODE.count("Write-Host '[M3A_BRIDGE] device_ready: true'")
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in LIVE_BRIDGE_CODE
+    # Two true occurrences: the BRIDGE_READY wait, and the later diagnostics-only READY window.
+    return n_true >= 2 and has_timeout, "true_count=%d has_timeout=%s" % (n_true, has_timeout)
+
+
+@check("214. a malformed/non-integer/out-of-contract live result fails closed to a non-zero exit, never a silent exit 0")
+def _c214():
+    has_type_check = "-isnot [int]" in LAUNCHER_CODE
+    has_set_check = "-notcontains $liveBridgeResult" in LAUNCHER_CODE
+    idx_check = LAUNCHER_CODE.find("-notcontains $liveBridgeResult")
+    idx_final_exit = LAUNCHER_CODE.find("exit $liveBridgeResult")
+    between = LAUNCHER_CODE[idx_check:idx_final_exit] if (idx_check != -1 and idx_final_exit != -1) else ""
+    fails_closed = "exit 2" in between
+    ok = has_type_check and has_set_check and idx_check != -1 and idx_final_exit != -1 and idx_check < idx_final_exit and fails_closed
+    return ok, "type_check=%s set_check=%s fails_closed=%s idx_check=%d idx_final=%d" % (
+        has_type_check, has_set_check, fails_closed, idx_check, idx_final_exit)
+
+
+@check("215. the validated live exit-code contract is exactly {0, 2} -- the function's own real return values, never invented")
+def _c215():
+    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in LAUNCHER_CODE, ""
+
+
+@check("216. -SelfTest's own output/exit semantics are untouched by this fix -- still Write-Output, still plain exit 0/1 statements")
+def _c216():
+    has_pass = "Write-Output '[M3A_BRIDGE] selftest: PASS'" in BRIDGE_PS1_CODE
+    has_fail = "[M3A_BRIDGE] selftest: FAIL" in BRIDGE_PS1_CODE
+    return has_pass and has_fail, "has_pass=%s has_fail=%s" % (has_pass, has_fail)
+
+
+@check("217. Invoke-GwLiveBridge's diagnostic success stream is fully eliminated -- redundant confirmation alongside 210")
+def _c217():
+    return LIVE_BRIDGE_CODE.count("Write-Output") == 0, ""
+
+
+@check("218. exact-device TOKEN_STAGED forwarding (PR #5) is unaffected -- still assigned from Confirm-GwDeviceTokenStaged, never a fabricated New-GwFrame in the live path")
+def _c218():
+    assigns = "$stagedFrame = Confirm-GwDeviceTokenStaged" in LIVE_BRIDGE_CODE
+    no_fabricate = "New-GwFrame -Type $Script:GwMsgTokenStaged" not in LIVE_BRIDGE_CODE
+    return assigns and no_fabricate, "assigns=%s no_fabricate=%s" % (assigns, no_fabricate)
+
+
+@check("219. the RX backlog barrier (PR #6) remains the ONE live DiscardInBuffer call site file-wide -- unaffected by this fix")
+def _c219():
+    n = BRIDGE_PS1_CODE.count("$port.DiscardInBuffer()")
+    return n == 1, "count=%d" % n
+
+
+@check("220. the live success/abort/failure exit-status contract is unchanged: exactly 3 failure `return 2` sites and 2 success/abort `return 0` sites")
+def _c220():
+    n2 = len(re.findall(r"\breturn 2\b", LIVE_BRIDGE_CODE))
+    n0 = len(re.findall(r"\breturn 0\b", LIVE_BRIDGE_CODE))
+    return n2 == 3 and n0 == 2, "return_2=%d return_0=%d" % (n2, n0)
+
+
 if __name__ == "__main__":
     sys.exit(main())

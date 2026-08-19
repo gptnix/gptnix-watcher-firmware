@@ -653,13 +653,18 @@ function Invoke-GwLiveBridge {
             try { return [byte]$port.ReadByte() } catch [System.TimeoutException] { return $null }
         }.GetNewClosure()
 
-        Write-Output '[M3A_BRIDGE] waiting for device BRIDGE_READY before starting backend session'
+        # Live diagnostics use Write-Host, never Write-Output: Write-Host writes straight to the console host,
+        # outside the PowerShell success/pipeline stream, so it can never be captured by `exit (FunctionCall)`,
+        # `$var = FunctionCall`, or any other pipeline/capture construct -- it always prints live, regardless
+        # of how this function's own `return` status is later consumed by its caller. See the top-level entry
+        # point below for the matching half of this fix (the exit-status capture).
+        Write-Host '[M3A_BRIDGE] waiting for device BRIDGE_READY before starting backend session'
         $found = Wait-GwBridgeReady -ReadByte $readDeviceByte -TimeoutSeconds $DeviceReadyTimeoutSeconds
         if (-not $found) {
             Write-Error '[M3A_BRIDGE] device_ready: timeout -- refusing to start backend session'
             return 2
         }
-        Write-Output '[M3A_BRIDGE] device_ready: true'
+        Write-Host '[M3A_BRIDGE] device_ready: true'
 
         $proc = Start-GwBackendProcess -SshTarget $SshTarget
         $inStream = $proc.StandardInput.BaseStream
@@ -759,10 +764,10 @@ function Invoke-GwLiveBridge {
         $port.Write($decisionHeader, 0, $decisionHeader.Length)
 
         if ($isAbort) {
-            Write-Output '[M3A_BRIDGE] decision: abort'
+            Write-Host '[M3A_BRIDGE] decision: abort'
             return 0
         }
-        Write-Output '[M3A_BRIDGE] decision: commit'
+        Write-Host '[M3A_BRIDGE] decision: commit'
 
         # F7 -- bounded, diagnostics-only observation window for the device READY marker. Never part of
         # security/commit semantics; never echoes arbitrary device log bytes.
@@ -785,9 +790,9 @@ function Invoke-GwLiveBridge {
             }
         }
         if ($deviceReady) {
-            Write-Output '[M3A_BRIDGE] device_ready: true'
+            Write-Host '[M3A_BRIDGE] device_ready: true'
         } else {
-            Write-Output '[M3A_BRIDGE] device_ready: timeout'
+            Write-Host '[M3A_BRIDGE] device_ready: timeout'
         }
         return 0
     } finally {
@@ -1423,5 +1428,23 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
     exit 2
 }
 
-exit (Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
-    -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds)
+# Live-output / exit-status fix: `exit (Invoke-GwLiveBridge ...)` previously forced PowerShell to fully
+# evaluate the parenthesized call as one subexpression -- capturing the function's ENTIRE success/pipeline
+# stream (every Write-Output call inside it, plus its own `return` value, since `return` and Write-Output
+# share that same stream) into a single in-memory collection before anything was ever streamed live to the
+# console, and before that collection was coerced to an exit code. Physically reproduced: a synthetic
+# `function f { Write-Output 'x'; return 0 }; exit (f)` never prints 'x' at all. Now that every diagnostic
+# inside Invoke-GwLiveBridge uses Write-Host (a separate, uncapturable stream -- see above), its success
+# stream carries only the final `return` value, so capturing it here is safe and the diagnostics still print
+# live regardless. The captured value is still explicitly validated against the function's own real exit
+# contract (0 = success/abort per its documented ABORT/COMMIT/READY paths, 2 = a classified failure) before
+# `exit` ever runs, so a malformed/stale/non-integer/multi-element result can never silently coerce to 0.
+$liveBridgeResult = Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
+    -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds
+
+$Script:GwLiveBridgeExitCodes = @(0, 2)
+if ($liveBridgeResult -isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains $liveBridgeResult)) {
+    Write-Error '[M3A_BRIDGE] live_result_malformed: unexpected non-integer or out-of-contract status'
+    exit 2
+}
+exit $liveBridgeResult

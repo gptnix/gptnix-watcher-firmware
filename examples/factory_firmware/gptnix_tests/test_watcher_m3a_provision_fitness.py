@@ -1719,7 +1719,7 @@ def _c206():
 
 @check("207. the device_rx_barrier failure label is a fixed non-interpolated string literal -- never echoes the caller's raw exception or transport internals")
 def _c207():
-    m = re.search(r"Write-Error\s+('[^'\n]*device_rx_barrier[^'\n]*')", LIVE_BRIDGE_SOURCE)
+    m = re.search(r"Write-GwClassifiedError\s+-Message\s+('[^'\n]*device_rx_barrier[^'\n]*')", LIVE_BRIDGE_SOURCE)
     literal = m.group(1) if m else None
     ok = bool(m) and "$" not in literal
     return ok, "literal=%r" % literal
@@ -1729,6 +1729,401 @@ def _c207():
 def _c208():
     hits = [s for s in ("Out-File", "Set-Content", "[System.IO.File]::Write", "$env:") if s in RECEIVE_TOKEN_FRAME_SOURCE]
     return not hits, "hits=%s" % hits
+
+
+# ===========================================================================
+# Live-output / exit-status fix (209-220): the top-level launcher no longer captures
+# Invoke-GwLiveBridge's ENTIRE success/pipeline stream via `exit (Invoke-GwLiveBridge ...)`
+# -- a construction that swallowed every live [M3A_BRIDGE] diagnostic and was physically
+# reproduced to do so. Diagnostics inside Invoke-GwLiveBridge now use Write-Host (a
+# separate, uncapturable stream); the launcher captures only the function's real `return`
+# value and validates it against the function's actual exit contract before `exit`.
+# Checks below use the comment-stripped BRIDGE_PS1_CODE (not the raw/commented source) so
+# that this fix's own explanatory comments -- which necessarily quote the old buggy
+# `exit (Invoke-GwLiveBridge ...)` construction as prose -- can never be mistaken for a
+# structural match, matching the existing BRIDGE_PS1_CODE convention already used by
+# checks in the 140s/1370s range above.
+# ===========================================================================
+
+LIVE_BRIDGE_CODE = _extract_c_function(BRIDGE_PS1_CODE, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
+LAUNCHER_CODE = _extract_c_function(BRIDGE_PS1_CODE, "if ($SelfTest)")
+RESOLVE_EXIT_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwLiveBridgeExitCode", "function Invoke-GwLiveBridge")
+SELFTEST_BODY_CODE = _extract_c_function(BRIDGE_PS1_CODE, "function Invoke-GwSelfTest", "if ($SelfTest)")
+
+
+@check("209. the top-level live invocation no longer captures Invoke-GwLiveBridge's output stream inside exit(...)")
+def _c209():
+    return "exit (Invoke-GwLiveBridge" not in LAUNCHER_CODE, ""
+
+
+@check("210. Invoke-GwLiveBridge's diagnostic stream is Write-Host only -- zero Write-Output calls remain in its body")
+def _c210():
+    n_output = LIVE_BRIDGE_CODE.count("Write-Output")
+    n_host = LIVE_BRIDGE_CODE.count("Write-Host")
+    return n_output == 0 and n_host >= 6, "write_output=%d write_host=%d" % (n_output, n_host)
+
+
+@check("211. the COMMIT diagnostic remains observable")
+def _c211():
+    return "Write-Host '[M3A_BRIDGE] decision: commit'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("212. the ABORT diagnostic remains observable")
+def _c212():
+    return "Write-Host '[M3A_BRIDGE] decision: abort'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("213. the device READY observation diagnostics (true and timeout) remain observable")
+def _c213():
+    n_true = LIVE_BRIDGE_CODE.count("Write-Host '[M3A_BRIDGE] device_ready: true'")
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in LIVE_BRIDGE_CODE
+    # Two true occurrences: the BRIDGE_READY wait, and the later diagnostics-only READY window.
+    return n_true >= 2 and has_timeout, "true_count=%d has_timeout=%s" % (n_true, has_timeout)
+
+
+@check("214. a malformed/non-integer/out-of-contract live result fails closed to a non-zero exit, never a silent exit 0")
+def _c214():
+    has_type_check = "-isnot [int]" in RESOLVE_EXIT_HELPER_CODE
+    has_set_check = "-notcontains $result" in RESOLVE_EXIT_HELPER_CODE
+    idx_check = RESOLVE_EXIT_HELPER_CODE.find("-notcontains $result")
+    idx_return2 = RESOLVE_EXIT_HELPER_CODE.find("return 2", idx_check) if idx_check != -1 else -1
+    fails_closed = idx_check != -1 and idx_return2 != -1 and idx_check < idx_return2
+    ok = has_type_check and has_set_check and fails_closed
+    return ok, "type_check=%s set_check=%s fails_closed=%s idx_check=%d idx_return2=%d" % (
+        has_type_check, has_set_check, fails_closed, idx_check, idx_return2)
+
+
+@check("215. the validated live exit-code contract is exactly {0, 2} -- the function's own real return values, never invented, and defined exactly once file-wide")
+def _c215():
+    n = BRIDGE_PS1_CODE.count("$Script:GwLiveBridgeExitCodes = @(0, 2)")
+    return n == 1, "count=%d" % n
+
+
+@check("215b. the production top-level launcher calls Resolve-GwLiveBridgeExitCode -- not an inline re-implementation of the validation logic")
+def _c215b():
+    calls_helper = "Resolve-GwLiveBridgeExitCode -Invoke" in LAUNCHER_CODE
+    no_inline_type_check = "-isnot [int]" not in LAUNCHER_CODE
+    return calls_helper and no_inline_type_check, "calls_helper=%s no_inline_type_check=%s" % (calls_helper, no_inline_type_check)
+
+
+@check("215c. the -SelfTest dynamic regression cases call the SAME Resolve-GwLiveBridgeExitCode owner the production launcher calls -- not a copy or parallel validator")
+def _c215c():
+    n = SELFTEST_BODY_CODE.count("Resolve-GwLiveBridgeExitCode -Invoke")
+    return n >= 7, "count=%d" % n
+
+
+@check("215d. no second/duplicate live-result validation logic exists outside Resolve-GwLiveBridgeExitCode")
+def _c215d():
+    # The compound malformed-result predicate (type check AND allowed-set check together) is the actual
+    # validation logic being guarded against duplication -- not the bare `-isnot [int]` operator, which L1/L2
+    # legitimately reuse for unrelated SelfTest stream-observation filtering (separating a merged 6>&1
+    # int-plus-diagnostic collection), not live-result validation.
+    n_compound = BRIDGE_PS1_CODE.count("-isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains")
+    return n_compound == 1, "count=%d" % n_compound
+
+
+@check("216. -SelfTest's own output/exit semantics are untouched by this fix -- still Write-Output, still plain exit 0/1 statements")
+def _c216():
+    has_pass = "Write-Output '[M3A_BRIDGE] selftest: PASS'" in BRIDGE_PS1_CODE
+    has_fail = "[M3A_BRIDGE] selftest: FAIL" in BRIDGE_PS1_CODE
+    return has_pass and has_fail, "has_pass=%s has_fail=%s" % (has_pass, has_fail)
+
+
+@check("217. Invoke-GwLiveBridge's diagnostic success stream is fully eliminated -- redundant confirmation alongside 210")
+def _c217():
+    return LIVE_BRIDGE_CODE.count("Write-Output") == 0, ""
+
+
+@check("218. exact-device TOKEN_STAGED forwarding (PR #5) is unaffected -- still assigned from Confirm-GwDeviceTokenStaged, never a fabricated New-GwFrame in the live path")
+def _c218():
+    assigns = "$stagedFrame = Confirm-GwDeviceTokenStaged" in LIVE_BRIDGE_CODE
+    no_fabricate = "New-GwFrame -Type $Script:GwMsgTokenStaged" not in LIVE_BRIDGE_CODE
+    return assigns and no_fabricate, "assigns=%s no_fabricate=%s" % (assigns, no_fabricate)
+
+
+@check("219. the RX backlog barrier (PR #6) remains the ONE live DiscardInBuffer call site file-wide -- unaffected by this fix")
+def _c219():
+    n = BRIDGE_PS1_CODE.count("$port.DiscardInBuffer()")
+    return n == 1, "count=%d" % n
+
+
+@check("220. the live success/abort/failure exit-status contract is unchanged: exactly 3 failure `return 2` sites and 2 success/abort `return 0` sites")
+def _c220():
+    n2 = len(re.findall(r"\breturn 2\b", LIVE_BRIDGE_CODE))
+    n0 = len(re.findall(r"\breturn 0\b", LIVE_BRIDGE_CODE))
+    return n2 == 3 and n0 == 2, "return_2=%d return_0=%d" % (n2, n0)
+
+
+# ===========================================================================
+# Classified failure exit semantics fix (221-236): $ErrorActionPreference = 'Stop' is set at
+# top scope, so an unqualified Write-Error anywhere in this file is promoted to a terminating
+# error and aborts the current scope before the immediately-following `return 2` / `exit 2`
+# ever executes. Write-GwClassifiedError is now the sole owner of every classified bridge
+# error emission (error stream only, -ErrorAction Continue pinned once), used by both the
+# live-mode failure paths inside Invoke-GwLiveBridge/Resolve-GwLiveBridgeExitCode and the
+# top-level entrypoint argument-validation gate -- and by the new dynamic L8/L9 -SelfTest
+# cases below, which hermetically re-prove on real Windows PowerShell that the classified-
+# error-then-return-2/exit-2 path is actually reachable, not merely structurally present.
+# ===========================================================================
+
+CLASSIFIED_ERROR_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Write-GwClassifiedError", "function Resolve-GwLiveBridgeExitCode")
+CHILD_SCRIPT_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Invoke-GwChildProcessForSelfTest", "function Write-GwClassifiedError")
+
+
+@check("221. Write-GwClassifiedError is defined exactly once file-wide -- the sole owner of every classified bridge error emission")
+def _c221():
+    n = BRIDGE_PS1_CODE.count("function Write-GwClassifiedError")
+    return n == 1, "count=%d" % n
+
+
+@check("222. Write-GwClassifiedError contains exactly one executable Write-Error, with explicit -ErrorAction Continue -- so it can never itself become a terminating error under the file's own $ErrorActionPreference = 'Stop'")
+def _c222():
+    body = CLASSIFIED_ERROR_HELPER_CODE
+    n_write_error = body.count("Write-Error")
+    has_continue = "Write-Error -Message $Message -ErrorAction Continue" in body
+    return n_write_error == 1 and has_continue, "write_error_count=%d has_continue=%s" % (n_write_error, has_continue)
+
+
+@check("223. the global $ErrorActionPreference = 'Stop' default is unchanged by this correction -- still set exactly once, at top scope")
+def _c223():
+    # Comment-stripped BRIDGE_PS1_CODE, not BRIDGE_PS1_RAW: this fix's own explanatory comments necessarily
+    # quote the literal `$ErrorActionPreference = 'Stop'` as prose (explaining WHY the helper exists), which
+    # must never be mistaken for a second real assignment.
+    n = BRIDGE_PS1_CODE.count("$ErrorActionPreference = 'Stop'")
+    return n == 1, "count=%d" % n
+
+
+@check("224. no raw, unqualified Write-Error escapes Write-GwClassifiedError anywhere in the file -- every classified/entrypoint emission goes through the single owner")
+def _c224():
+    n = BRIDGE_PS1_CODE.count("Write-Error")
+    return n == 1, "count=%d (expected exactly 1, inside Write-GwClassifiedError's own body)" % n
+
+
+@check("225. Write-GwClassifiedError is invoked from exactly 12 call sites file-wide -- the 11 real production classified-failure paths plus the L8 SelfTest synthetic invoker")
+def _c225():
+    n = BRIDGE_PS1_CODE.count("Write-GwClassifiedError -Message")
+    n_production = LIVE_BRIDGE_CODE.count("Write-GwClassifiedError -Message") + LAUNCHER_CODE.count(
+        "Write-GwClassifiedError -Message") + RESOLVE_EXIT_HELPER_CODE.count("Write-GwClassifiedError -Message")
+    return n == 12 and n_production == 11, "count=%d n_production=%d" % (n, n_production)
+
+
+@check("226. the device_ready timeout classified failure uses Write-GwClassifiedError")
+def _c226():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] device_ready: timeout" in LIVE_BRIDGE_CODE, ""
+
+
+@check("227. both the RX-barrier and backend TOKEN_FRAME classified failure branches use Write-GwClassifiedError")
+def _c227():
+    has_barrier = "Write-GwClassifiedError -Message '[M3A_BRIDGE] device_rx_barrier: failed'" in LIVE_BRIDGE_CODE
+    has_frame = "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'" in LIVE_BRIDGE_CODE
+    return has_barrier and has_frame, "has_barrier=%s has_frame=%s" % (has_barrier, has_frame)
+
+
+@check("228. the backend_decision malformed classified failure uses Write-GwClassifiedError")
+def _c228():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_decision: malformed'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("229. all six top-level entrypoint argument-validation classified failures use Write-GwClassifiedError")
+def _c229():
+    n = LAUNCHER_CODE.count("Write-GwClassifiedError -Message")
+    return n == 6, "count=%d" % n
+
+
+@check("230. Resolve-GwLiveBridgeExitCode's malformed-result path uses Write-GwClassifiedError, consistent with every other classified call site")
+def _c230():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] live_result_malformed" in RESOLVE_EXIT_HELPER_CODE, ""
+
+
+@check("231. -SelfTest contains a dynamic L8 case proving Write-GwClassifiedError followed by return 2 is actually reachable -- via the SAME Resolve-GwLiveBridgeExitCode production owner, not a copy")
+def _c231():
+    body = SELFTEST_BODY_CODE
+    calls_helper_in_invoke = "Write-GwClassifiedError -Message '[M3A_BRIDGE] selftest_l8_synthetic_classified_error'; return 2" in body
+    via_owner = "Resolve-GwLiveBridgeExitCode -Invoke { Write-GwClassifiedError" in body
+    return calls_helper_in_invoke and via_owner, "calls_helper_in_invoke=%s via_owner=%s" % (calls_helper_in_invoke, via_owner)
+
+
+@check("232. -SelfTest contains a dynamic L9 case that calls the NO-ARGUMENT Invoke-GwChildProcessForSelfTest helper (no -ArgumentList, no live args possible) and asserts a REAL local child process's actual OS exit code is exactly 2, with the expected classified stderr text")
+def _c232():
+    body = SELFTEST_BODY_CODE
+    spawns_child = "$l9 = Invoke-GwChildProcessForSelfTest" in body
+    no_argument_list_call = "Invoke-GwChildProcessForSelfTest -ArgumentList" not in body
+    checks_exit_two = "$l9.ExitCode -ne 2" in body
+    checks_stderr = "$l9.StdErr" in body and "live mode requires -LiveAuthorized" in body
+    return spawns_child and no_argument_list_call and checks_exit_two and checks_stderr, (
+        "spawns_child=%s no_argument_list_call=%s checks_exit_two=%s checks_stderr=%s" % (
+            spawns_child, no_argument_list_call, checks_exit_two, checks_stderr))
+
+
+@check("233. Invoke-GwChildProcessForSelfTest runs the bridge's OWN script file via a $selfPath local captured from $PSCommandPath -- never a hardcoded developer path -- and never itself opens a serial port, starts the real backend SSH process, or makes a network call")
+def _c233():
+    body = CHILD_SCRIPT_HELPER_CODE
+    captures_self_path = "$selfPath = $PSCommandPath" in body
+    uses_self_path_in_arguments = '-File `"$selfPath`"' in body
+    no_hardcoded_path = not re.search(r"[A-Za-z]:\\", body)
+    hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod", "'ssh.exe'") if s in body]
+    return captures_self_path and uses_self_path_in_arguments and no_hardcoded_path and not hits, (
+        "captures_self_path=%s uses_self_path_in_arguments=%s no_hardcoded_path=%s hits=%s" % (
+            captures_self_path, uses_self_path_in_arguments, no_hardcoded_path, hits))
+
+
+@check("234. exact-device TOKEN_STAGED forwarding (PR #5) remains unaffected by this correction -- still assigned from Confirm-GwDeviceTokenStaged, never a fabricated New-GwFrame in the live path")
+def _c234():
+    assigns = "$stagedFrame = Confirm-GwDeviceTokenStaged" in LIVE_BRIDGE_CODE
+    no_fabricate = "New-GwFrame -Type $Script:GwMsgTokenStaged" not in LIVE_BRIDGE_CODE
+    return assigns and no_fabricate, "assigns=%s no_fabricate=%s" % (assigns, no_fabricate)
+
+
+@check("235. the RX backlog barrier (PR #6) remains the ONE live DiscardInBuffer call site file-wide -- unaffected by this correction")
+def _c235():
+    n = BRIDGE_PS1_CODE.count("$port.DiscardInBuffer()")
+    return n == 1, "count=%d" % n
+
+
+@check("236. -SelfTest still never opens a real serial port, starts the real backend SSH process, or makes a real network call, including the new L8/L9 dynamic fixtures")
+def _c236():
+    body = SELFTEST_BODY_CODE
+    hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod") if s in body]
+    return not hits, "found=%s" % hits
+
+
+# ===========================================================================
+# PR #7 Windows PowerShell 5.1 child-process fixture correction (237-248):
+# ProcessStartInfo.ArgumentList is $null on Windows PowerShell 5.1 / .NET Framework (it was only
+# introduced with .NET Core/5+) -- $psi.ArgumentList.Add(...) crashed the real Windows CI runner
+# with "You cannot call a method on a null-valued expression" before Process.Start() was ever
+# reached. Invoke-GwChildProcessForSelfTest is now a strictly no-argument, fixed-invocation-shape
+# helper built on the legacy-compatible ProcessStartInfo.Arguments string instead.
+# ===========================================================================
+
+@check("237. Invoke-GwChildProcessForSelfTest is defined exactly once file-wide")
+def _c237():
+    n = BRIDGE_PS1_CODE.count("function Invoke-GwChildProcessForSelfTest")
+    return n == 1, "count=%d" % n
+
+
+@check("238. Invoke-GwChildProcessForSelfTest contains zero ArgumentList.Add(...) calls and zero .ArgumentList references -- the API proven $null on Windows PowerShell 5.1 / .NET Framework is fully removed from this helper")
+def _c238():
+    body = CHILD_SCRIPT_HELPER_CODE
+    n_add = body.count("ArgumentList.Add(")
+    n_ref = body.count(".ArgumentList")
+    return n_add == 0 and n_ref == 0, "argumentlist_add_count=%d argumentlist_ref_count=%d" % (n_add, n_ref)
+
+
+@check("239. Invoke-GwChildProcessForSelfTest assigns ProcessStartInfo.Arguments (the legacy-compatible string property) exactly once")
+def _c239():
+    body = CHILD_SCRIPT_HELPER_CODE
+    n = body.count("$psi.Arguments = ")
+    return n == 1, "count=%d" % n
+
+
+@check("240. Invoke-GwChildProcessForSelfTest's ProcessStartInfo.FileName remains 'powershell.exe'")
+def _c240():
+    body = CHILD_SCRIPT_HELPER_CODE
+    return "$psi.FileName = 'powershell.exe'" in body, ""
+
+
+@check("241. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -NoProfile")
+def _c241():
+    return "-NoProfile" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("242. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -NonInteractive")
+def _c242():
+    return "-NonInteractive" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("243. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -ExecutionPolicy Bypass")
+def _c243():
+    return "-ExecutionPolicy Bypass" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("244. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -File")
+def _c244():
+    return "-File" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("245. Invoke-GwChildProcessForSelfTest never passes -LiveAuthorized, -ComPort, or -SshTarget to the child -- the whole point of L9 is that the child hits the very first argument-validation gate")
+def _c245():
+    body = CHILD_SCRIPT_HELPER_CODE
+    hits = [s for s in ("-LiveAuthorized", "-ComPort", "-SshTarget") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("246. Invoke-GwChildProcessForSelfTest uses no generic shell-eval/command-runner substitute -- no cmd.exe, Invoke-Expression, or Start-Process -- this is a fixed self-path invocation, not a generic child-process command runner")
+def _c246():
+    body = CHILD_SCRIPT_HELPER_CODE
+    hits = [s for s in ("cmd.exe", "Invoke-Expression", "Start-Process") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("247. Invoke-GwChildProcessForSelfTest fails closed with a fixed, non-secret classification -- never attempting a child launch -- when $PSCommandPath is null or whitespace")
+def _c247():
+    body = CHILD_SCRIPT_HELPER_CODE
+    has_guard = "[string]::IsNullOrWhiteSpace($selfPath)" in body
+    fails_before_launch = body.index("IsNullOrWhiteSpace($selfPath)") < body.index("[System.Diagnostics.Process]::Start($psi)")
+    fixed_message = "selftest_l9_self_path_unavailable" in body
+    return has_guard and fails_before_launch and fixed_message, (
+        "has_guard=%s fails_before_launch=%s fixed_message=%s" % (has_guard, fails_before_launch, fixed_message))
+
+
+@check("248. Invoke-GwChildProcessForSelfTest guards against a $null Process.Start() result (defense-in-depth, not the proven root cause) before ever touching StandardOutput/StandardError, failing closed with a fixed non-secret classification instead of a null dereference")
+def _c248():
+    body = CHILD_SCRIPT_HELPER_CODE
+    guard_idx = body.find("$null -eq $proc")
+    start_idx = body.find("[System.Diagnostics.Process]::Start($psi)")
+    read_idx = body.find(".StandardOutput.ReadToEnd()")
+    ordered = start_idx != -1 and guard_idx != -1 and read_idx != -1 and start_idx < guard_idx < read_idx
+    fixed_message = "selftest_l9_child_process_start_failed" in body
+    return ordered and fixed_message, "ordered=%s fixed_message=%s" % (ordered, fixed_message)
+
+
+# ===========================================================================
+# PR #7 L9 literal stderr assertion correction (249-254): PowerShell -like/-notlike treats a
+# `[...]` run as a wildcard character class, so `-notlike '*[M3A_BRIDGE] ...*'` never matched the
+# literal bracketed `[M3A_BRIDGE]` prefix -- hermetically reproduced (BROKEN_LIKE=False,
+# LITERAL_CONTAINS=True for the identical string). L9 now uses String.Contains(), which has no
+# wildcard/regex semantics, against a local constant byte-identical to the production entrypoint's
+# actual classified message.
+# ===========================================================================
+
+@check("249. L9's expected-classified-message assertion no longer uses -like/-notlike -- the wildcard operator whose `[...]` character-class semantics caused the proven false negative")
+def _c249():
+    body = SELFTEST_BODY_CODE
+    l9_section = body[body.index("$l9 = Invoke-GwChildProcessForSelfTest"):]
+    has_like = "-notlike" in l9_section or " -like " in l9_section
+    return not has_like, "has_like_or_notlike=%s" % has_like
+
+
+@check("250. L9's expected-classified-message assertion uses literal String.Contains() containment")
+def _c250():
+    body = SELFTEST_BODY_CODE
+    return "$l9.StdErr.Contains($l9ExpectedClassifiedMessage)" in body, ""
+
+
+@check("251. L9's expected classified message local constant is byte-identical to the production entrypoint's actual Write-GwClassifiedError -LiveAuthorized message")
+def _c251():
+    l9_literal = "$l9ExpectedClassifiedMessage = '[M3A_BRIDGE] live mode requires -LiveAuthorized'" in SELFTEST_BODY_CODE
+    production_literal = "Write-GwClassifiedError -Message '[M3A_BRIDGE] live mode requires -LiveAuthorized'" in LAUNCHER_CODE
+    return l9_literal and production_literal, "l9_literal=%s production_literal=%s" % (l9_literal, production_literal)
+
+
+@check("252. L9's child ExitCode assertion is unchanged -- still asserts exactly 2")
+def _c252():
+    return "if ($l9.ExitCode -ne 2) { $failures.Add('live_entrypoint_child_exit_code_not_two') }" in SELFTEST_BODY_CODE, ""
+
+
+@check("253. L9's child stdout-empty assertion is unchanged")
+def _c253():
+    return "live_entrypoint_child_unexpected_stdout" in SELFTEST_BODY_CODE, ""
+
+
+@check("254. L9's child transport-activity assertion is unchanged")
+def _c254():
+    return "live_entrypoint_child_unexpected_transport_activity_observed" in SELFTEST_BODY_CODE, ""
 
 
 if __name__ == "__main__":

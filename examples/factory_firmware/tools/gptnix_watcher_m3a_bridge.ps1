@@ -105,6 +105,13 @@ $Script:GwReadCancelGraceMs = 2000
 # same window -- e.g. RX backlog accumulated while this bridge was blocked waiting on the backend TOKEN_FRAME.
 $Script:GwMaxResyncNoiseBytes = 172800
 
+# The real, unmodified exit-status contract Invoke-GwLiveBridge has always returned: 0 for both the COMMIT
+# and ABORT success/decision paths, 2 for each of its three classified failure paths (device_ready timeout,
+# backend_token_frame invalid, backend_decision malformed). Defined once, up front, so both the production
+# top-level launcher and the -SelfTest dynamic regression cases (via the shared Resolve-GwLiveBridgeExitCode
+# helper below) validate against the exact same set -- never an invented or duplicated one.
+$Script:GwLiveBridgeExitCodes = @(0, 2)
+
 # -----------------------------------------------------------------------------
 # GptnixWatcherBoundedProcessRead -- hard-bounded synchronous Process-stdout read.
 #
@@ -627,6 +634,28 @@ function New-GwSelfTestChildProcess {
     $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
     return [System.Diagnostics.Process]::Start($psi)
+}
+
+# Canonical single owner for invoking a live-bridge-shaped scriptblock and validating its captured
+# success-stream result against the real production exit contract $Script:GwLiveBridgeExitCodes (0, 2).
+# Used by BOTH the top-level production launcher (invoking the real Invoke-GwLiveBridge) and this file's own
+# -SelfTest dynamic regression cases below (invoking synthetic scriptblocks) -- so a runtime PowerShell
+# stream/exit-semantics defect in one path is provably a defect in the other; there is no duplicated or
+# parallel validation logic anywhere else to drift out of sync. The classified Write-Error on the malformed
+# path is explicitly -ErrorAction Continue: this script sets $ErrorActionPreference = 'Stop' at top scope, so
+# an unqualified Write-Error here would itself become a terminating error and the `return 2` immediately
+# below it would never execute -- the exact class of unreliable runtime behavior this whole correction exists
+# to catch, not something to accidentally reintroduce in new code.
+function Resolve-GwLiveBridgeExitCode {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Invoke
+    )
+    $result = & $Invoke
+    if ($result -isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains $result)) {
+        Write-Error -Message '[M3A_BRIDGE] live_result_malformed: unexpected non-integer or out-of-contract status' -ErrorAction Continue
+        return 2
+    }
+    return $result
 }
 
 function Invoke-GwLiveBridge {
@@ -1387,6 +1416,64 @@ function Invoke-GwSelfTest {
     if (Test-GwProtocolTimeoutSecondsValid -Seconds 0) { $failures.Add('protocol_timeout_0_accepted') }
     if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds 1)) { $failures.Add('protocol_timeout_boundary_1_rejected') }
 
+    # L1-L7: dynamic hermetic Windows proof for Resolve-GwLiveBridgeExitCode -- the EXACT SAME function the
+    # production top-level launcher calls at the bottom of this file, not a copy or parallel
+    # re-implementation. These cases exercise real PowerShell success/Information-stream semantics on the
+    # actual pinned runtime (windows-2022's `powershell.exe -File ... -SelfTest`, see
+    # .github/workflows/gptnix-firmware-build.yml) -- a static source grep alone previously let this exact
+    # class of runtime stream/exit defect ship undetected. No COM, no SSH, no network, no backend, no device.
+
+    # L1. COMMIT synthetic: a Write-Host diagnostic identical in shape to Invoke-GwLiveBridge's own COMMIT
+    # line, plus `return 0`. The `6>&1` redirection here is a SelfTest-only observation trick applied to this
+    # ONE outer call -- it never touches Resolve-GwLiveBridgeExitCode's own internals, which still capture
+    # only the real success stream exactly as production does.
+    $l1Raw = Resolve-GwLiveBridgeExitCode -Invoke { Write-Host '[M3A_BRIDGE] decision: commit'; return 0 } 6>&1
+    $l1Result = $l1Raw | Where-Object { $_ -is [int] } | Select-Object -Last 1
+    $l1Diagnostic = $l1Raw | Where-Object { $_ -isnot [int] }
+    if ($l1Result -ne 0) { $failures.Add('live_result_commit_not_zero') }
+    if (-not ($l1Diagnostic | Where-Object { "$_" -like '*decision: commit*' })) {
+        $failures.Add('live_result_commit_diagnostic_not_observed')
+    }
+
+    # L2. ABORT synthetic: same shape, ABORT's own diagnostic and its documented 0 result.
+    $l2Raw = Resolve-GwLiveBridgeExitCode -Invoke { Write-Host '[M3A_BRIDGE] decision: abort'; return 0 } 6>&1
+    $l2Result = $l2Raw | Where-Object { $_ -is [int] } | Select-Object -Last 1
+    $l2Diagnostic = $l2Raw | Where-Object { $_ -isnot [int] }
+    if ($l2Result -ne 0) { $failures.Add('live_result_abort_not_zero') }
+    if (-not ($l2Diagnostic | Where-Object { "$_" -like '*decision: abort*' })) {
+        $failures.Add('live_result_abort_diagnostic_not_observed')
+    }
+
+    # L3. FAILURE synthetic: an invoker that returns the real production classified-failure code directly (2)
+    # -- proves the pass-through path preserves a valid non-zero result unchanged.
+    $l3Result = Resolve-GwLiveBridgeExitCode -Invoke { return 2 }
+    if ($l3Result -ne 2) { $failures.Add('live_result_failure_not_preserved') }
+
+    # L4. MALFORMED string: '0' is never [int] -- must fail closed to 2, never coerce to a truthy success.
+    $l4Result = Resolve-GwLiveBridgeExitCode -Invoke { return '0' }
+    if ($l4Result -ne 2) { $failures.Add('live_result_malformed_string_not_rejected') }
+
+    # L5. MULTI-ELEMENT: the exact original bug class, reproduced on purpose and proven caught. If a future
+    # diagnostic inside an invoked scriptblock ever again used Write-Output instead of Write-Host, its text
+    # would land on the SAME success stream Resolve-GwLiveBridgeExitCode's own `$result = & $Invoke` reads --
+    # producing a 2-element array (the leaked string plus the real 0), which is `-isnot [int]` and must fail
+    # closed to 2, never silently become a truthy/zero-like result.
+    $l5Result = Resolve-GwLiveBridgeExitCode -Invoke { Write-Output 'unexpected-success-stream-leak'; return 0 }
+    if ($l5Result -ne 2) { $failures.Add('live_result_multi_element_not_rejected') }
+
+    # L6. NULL/missing: an invoker that never reaches a `return` at all yields $null on the success stream --
+    # must fail closed to 2.
+    $l6Result = Resolve-GwLiveBridgeExitCode -Invoke { }
+    if ($l6Result -ne 2) { $failures.Add('live_result_null_not_rejected') }
+
+    # L7. STALE: a valid call immediately followed by a malformed one, proving the second call's result is
+    # never contaminated by the first call's prior value (each call's $result is function-local; this proves
+    # it dynamically rather than only structurally).
+    $l7First = Resolve-GwLiveBridgeExitCode -Invoke { return 0 }
+    $l7Second = Resolve-GwLiveBridgeExitCode -Invoke { return 'stale-should-not-leak-a-prior-zero' }
+    if ($l7First -ne 0) { $failures.Add('live_result_stale_first_call_not_zero') }
+    if ($l7Second -ne 2) { $failures.Add('live_result_stale_second_call_contaminated') }
+
     return $failures.ToArray()
 }
 
@@ -1436,15 +1523,12 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
 # `function f { Write-Output 'x'; return 0 }; exit (f)` never prints 'x' at all. Now that every diagnostic
 # inside Invoke-GwLiveBridge uses Write-Host (a separate, uncapturable stream -- see above), its success
 # stream carries only the final `return` value, so capturing it here is safe and the diagnostics still print
-# live regardless. The captured value is still explicitly validated against the function's own real exit
-# contract (0 = success/abort per its documented ABORT/COMMIT/READY paths, 2 = a classified failure) before
-# `exit` ever runs, so a malformed/stale/non-integer/multi-element result can never silently coerce to 0.
-$liveBridgeResult = Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
-    -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds
-
-$Script:GwLiveBridgeExitCodes = @(0, 2)
-if ($liveBridgeResult -isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains $liveBridgeResult)) {
-    Write-Error '[M3A_BRIDGE] live_result_malformed: unexpected non-integer or out-of-contract status'
-    exit 2
+# live regardless. Resolve-GwLiveBridgeExitCode (defined above, alongside Invoke-GwLiveBridge) is the ONE
+# owner of the invoke-then-validate step -- the exact same function this file's own -SelfTest dynamic
+# regression cases call with synthetic scriptblocks below, so a runtime PowerShell stream/exit-semantics
+# regression here would be caught by that dynamic Windows proof, not merely by an unrelated static grep.
+$liveExitCode = Resolve-GwLiveBridgeExitCode -Invoke {
+    Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
+        -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds
 }
-exit $liveBridgeResult
+exit $liveExitCode

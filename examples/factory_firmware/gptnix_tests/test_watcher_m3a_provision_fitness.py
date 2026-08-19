@@ -1747,6 +1747,9 @@ def _c208():
 
 LIVE_BRIDGE_CODE = _extract_c_function(BRIDGE_PS1_CODE, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
 LAUNCHER_CODE = _extract_c_function(BRIDGE_PS1_CODE, "if ($SelfTest)")
+RESOLVE_EXIT_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwLiveBridgeExitCode", "function Invoke-GwLiveBridge")
+SELFTEST_BODY_CODE = _extract_c_function(BRIDGE_PS1_CODE, "function Invoke-GwSelfTest", "if ($SelfTest)")
 
 
 @check("209. the top-level live invocation no longer captures Invoke-GwLiveBridge's output stream inside exit(...)")
@@ -1781,20 +1784,43 @@ def _c213():
 
 @check("214. a malformed/non-integer/out-of-contract live result fails closed to a non-zero exit, never a silent exit 0")
 def _c214():
-    has_type_check = "-isnot [int]" in LAUNCHER_CODE
-    has_set_check = "-notcontains $liveBridgeResult" in LAUNCHER_CODE
-    idx_check = LAUNCHER_CODE.find("-notcontains $liveBridgeResult")
-    idx_final_exit = LAUNCHER_CODE.find("exit $liveBridgeResult")
-    between = LAUNCHER_CODE[idx_check:idx_final_exit] if (idx_check != -1 and idx_final_exit != -1) else ""
-    fails_closed = "exit 2" in between
-    ok = has_type_check and has_set_check and idx_check != -1 and idx_final_exit != -1 and idx_check < idx_final_exit and fails_closed
-    return ok, "type_check=%s set_check=%s fails_closed=%s idx_check=%d idx_final=%d" % (
-        has_type_check, has_set_check, fails_closed, idx_check, idx_final_exit)
+    has_type_check = "-isnot [int]" in RESOLVE_EXIT_HELPER_CODE
+    has_set_check = "-notcontains $result" in RESOLVE_EXIT_HELPER_CODE
+    idx_check = RESOLVE_EXIT_HELPER_CODE.find("-notcontains $result")
+    idx_return2 = RESOLVE_EXIT_HELPER_CODE.find("return 2", idx_check) if idx_check != -1 else -1
+    fails_closed = idx_check != -1 and idx_return2 != -1 and idx_check < idx_return2
+    ok = has_type_check and has_set_check and fails_closed
+    return ok, "type_check=%s set_check=%s fails_closed=%s idx_check=%d idx_return2=%d" % (
+        has_type_check, has_set_check, fails_closed, idx_check, idx_return2)
 
 
-@check("215. the validated live exit-code contract is exactly {0, 2} -- the function's own real return values, never invented")
+@check("215. the validated live exit-code contract is exactly {0, 2} -- the function's own real return values, never invented, and defined exactly once file-wide")
 def _c215():
-    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in LAUNCHER_CODE, ""
+    n = BRIDGE_PS1_CODE.count("$Script:GwLiveBridgeExitCodes = @(0, 2)")
+    return n == 1, "count=%d" % n
+
+
+@check("215b. the production top-level launcher calls Resolve-GwLiveBridgeExitCode -- not an inline re-implementation of the validation logic")
+def _c215b():
+    calls_helper = "Resolve-GwLiveBridgeExitCode -Invoke" in LAUNCHER_CODE
+    no_inline_type_check = "-isnot [int]" not in LAUNCHER_CODE
+    return calls_helper and no_inline_type_check, "calls_helper=%s no_inline_type_check=%s" % (calls_helper, no_inline_type_check)
+
+
+@check("215c. the -SelfTest dynamic regression cases call the SAME Resolve-GwLiveBridgeExitCode owner the production launcher calls -- not a copy or parallel validator")
+def _c215c():
+    n = SELFTEST_BODY_CODE.count("Resolve-GwLiveBridgeExitCode -Invoke")
+    return n >= 7, "count=%d" % n
+
+
+@check("215d. no second/duplicate live-result validation logic exists outside Resolve-GwLiveBridgeExitCode")
+def _c215d():
+    # The compound malformed-result predicate (type check AND allowed-set check together) is the actual
+    # validation logic being guarded against duplication -- not the bare `-isnot [int]` operator, which L1/L2
+    # legitimately reuse for unrelated SelfTest stream-observation filtering (separating a merged 6>&1
+    # int-plus-diagnostic collection), not live-result validation.
+    n_compound = BRIDGE_PS1_CODE.count("-isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains")
+    return n_compound == 1, "count=%d" % n_compound
 
 
 @check("216. -SelfTest's own output/exit semantics are untouched by this fix -- still Write-Output, still plain exit 0/1 statements")

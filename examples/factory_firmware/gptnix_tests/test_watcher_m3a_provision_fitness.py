@@ -1719,7 +1719,7 @@ def _c206():
 
 @check("207. the device_rx_barrier failure label is a fixed non-interpolated string literal -- never echoes the caller's raw exception or transport internals")
 def _c207():
-    m = re.search(r"Write-Error\s+('[^'\n]*device_rx_barrier[^'\n]*')", LIVE_BRIDGE_SOURCE)
+    m = re.search(r"Write-GwClassifiedError\s+-Message\s+('[^'\n]*device_rx_barrier[^'\n]*')", LIVE_BRIDGE_SOURCE)
     literal = m.group(1) if m else None
     ok = bool(m) and "$" not in literal
     return ok, "literal=%r" % literal
@@ -1853,6 +1853,137 @@ def _c220():
     n2 = len(re.findall(r"\breturn 2\b", LIVE_BRIDGE_CODE))
     n0 = len(re.findall(r"\breturn 0\b", LIVE_BRIDGE_CODE))
     return n2 == 3 and n0 == 2, "return_2=%d return_0=%d" % (n2, n0)
+
+
+# ===========================================================================
+# Classified failure exit semantics fix (221-236): $ErrorActionPreference = 'Stop' is set at
+# top scope, so an unqualified Write-Error anywhere in this file is promoted to a terminating
+# error and aborts the current scope before the immediately-following `return 2` / `exit 2`
+# ever executes. Write-GwClassifiedError is now the sole owner of every classified bridge
+# error emission (error stream only, -ErrorAction Continue pinned once), used by both the
+# live-mode failure paths inside Invoke-GwLiveBridge/Resolve-GwLiveBridgeExitCode and the
+# top-level entrypoint argument-validation gate -- and by the new dynamic L8/L9 -SelfTest
+# cases below, which hermetically re-prove on real Windows PowerShell that the classified-
+# error-then-return-2/exit-2 path is actually reachable, not merely structurally present.
+# ===========================================================================
+
+CLASSIFIED_ERROR_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Write-GwClassifiedError", "function Resolve-GwLiveBridgeExitCode")
+CHILD_SCRIPT_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Invoke-GwChildProcessForSelfTest", "function Write-GwClassifiedError")
+
+
+@check("221. Write-GwClassifiedError is defined exactly once file-wide -- the sole owner of every classified bridge error emission")
+def _c221():
+    n = BRIDGE_PS1_CODE.count("function Write-GwClassifiedError")
+    return n == 1, "count=%d" % n
+
+
+@check("222. Write-GwClassifiedError contains exactly one executable Write-Error, with explicit -ErrorAction Continue -- so it can never itself become a terminating error under the file's own $ErrorActionPreference = 'Stop'")
+def _c222():
+    body = CLASSIFIED_ERROR_HELPER_CODE
+    n_write_error = body.count("Write-Error")
+    has_continue = "Write-Error -Message $Message -ErrorAction Continue" in body
+    return n_write_error == 1 and has_continue, "write_error_count=%d has_continue=%s" % (n_write_error, has_continue)
+
+
+@check("223. the global $ErrorActionPreference = 'Stop' default is unchanged by this correction -- still set exactly once, at top scope")
+def _c223():
+    # Comment-stripped BRIDGE_PS1_CODE, not BRIDGE_PS1_RAW: this fix's own explanatory comments necessarily
+    # quote the literal `$ErrorActionPreference = 'Stop'` as prose (explaining WHY the helper exists), which
+    # must never be mistaken for a second real assignment.
+    n = BRIDGE_PS1_CODE.count("$ErrorActionPreference = 'Stop'")
+    return n == 1, "count=%d" % n
+
+
+@check("224. no raw, unqualified Write-Error escapes Write-GwClassifiedError anywhere in the file -- every classified/entrypoint emission goes through the single owner")
+def _c224():
+    n = BRIDGE_PS1_CODE.count("Write-Error")
+    return n == 1, "count=%d (expected exactly 1, inside Write-GwClassifiedError's own body)" % n
+
+
+@check("225. Write-GwClassifiedError is invoked from exactly 12 call sites file-wide -- the 11 real production classified-failure paths plus the L8 SelfTest synthetic invoker")
+def _c225():
+    n = BRIDGE_PS1_CODE.count("Write-GwClassifiedError -Message")
+    n_production = LIVE_BRIDGE_CODE.count("Write-GwClassifiedError -Message") + LAUNCHER_CODE.count(
+        "Write-GwClassifiedError -Message") + RESOLVE_EXIT_HELPER_CODE.count("Write-GwClassifiedError -Message")
+    return n == 12 and n_production == 11, "count=%d n_production=%d" % (n, n_production)
+
+
+@check("226. the device_ready timeout classified failure uses Write-GwClassifiedError")
+def _c226():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] device_ready: timeout" in LIVE_BRIDGE_CODE, ""
+
+
+@check("227. both the RX-barrier and backend TOKEN_FRAME classified failure branches use Write-GwClassifiedError")
+def _c227():
+    has_barrier = "Write-GwClassifiedError -Message '[M3A_BRIDGE] device_rx_barrier: failed'" in LIVE_BRIDGE_CODE
+    has_frame = "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'" in LIVE_BRIDGE_CODE
+    return has_barrier and has_frame, "has_barrier=%s has_frame=%s" % (has_barrier, has_frame)
+
+
+@check("228. the backend_decision malformed classified failure uses Write-GwClassifiedError")
+def _c228():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_decision: malformed'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("229. all six top-level entrypoint argument-validation classified failures use Write-GwClassifiedError")
+def _c229():
+    n = LAUNCHER_CODE.count("Write-GwClassifiedError -Message")
+    return n == 6, "count=%d" % n
+
+
+@check("230. Resolve-GwLiveBridgeExitCode's malformed-result path uses Write-GwClassifiedError, consistent with every other classified call site")
+def _c230():
+    return "Write-GwClassifiedError -Message '[M3A_BRIDGE] live_result_malformed" in RESOLVE_EXIT_HELPER_CODE, ""
+
+
+@check("231. -SelfTest contains a dynamic L8 case proving Write-GwClassifiedError followed by return 2 is actually reachable -- via the SAME Resolve-GwLiveBridgeExitCode production owner, not a copy")
+def _c231():
+    body = SELFTEST_BODY_CODE
+    calls_helper_in_invoke = "Write-GwClassifiedError -Message '[M3A_BRIDGE] selftest_l8_synthetic_classified_error'; return 2" in body
+    via_owner = "Resolve-GwLiveBridgeExitCode -Invoke { Write-GwClassifiedError" in body
+    return calls_helper_in_invoke and via_owner, "calls_helper_in_invoke=%s via_owner=%s" % (calls_helper_in_invoke, via_owner)
+
+
+@check("232. -SelfTest contains a dynamic L9 case that spawns a REAL local child process and asserts its actual OS exit code is exactly 2, with the expected classified stderr text")
+def _c232():
+    body = SELFTEST_BODY_CODE
+    spawns_child = "Invoke-GwChildProcessForSelfTest -ArgumentList @()" in body
+    checks_exit_two = "$l9.ExitCode -ne 2" in body
+    checks_stderr = "$l9.StdErr" in body and "live mode requires -LiveAuthorized" in body
+    return spawns_child and checks_exit_two and checks_stderr, "spawns_child=%s checks_exit_two=%s checks_stderr=%s" % (
+        spawns_child, checks_exit_two, checks_stderr)
+
+
+@check("233. Invoke-GwChildProcessForSelfTest runs the bridge's OWN script file via $PSCommandPath -- never a hardcoded developer path -- and never itself opens a serial port, starts the real backend SSH process, or makes a network call")
+def _c233():
+    body = CHILD_SCRIPT_HELPER_CODE
+    uses_self_path = "$psi.ArgumentList.Add($PSCommandPath)" in body
+    no_hardcoded_path = not re.search(r"[A-Za-z]:\\", body)
+    hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod", "'ssh.exe'") if s in body]
+    return uses_self_path and no_hardcoded_path and not hits, "uses_self_path=%s no_hardcoded_path=%s hits=%s" % (
+        uses_self_path, no_hardcoded_path, hits)
+
+
+@check("234. exact-device TOKEN_STAGED forwarding (PR #5) remains unaffected by this correction -- still assigned from Confirm-GwDeviceTokenStaged, never a fabricated New-GwFrame in the live path")
+def _c234():
+    assigns = "$stagedFrame = Confirm-GwDeviceTokenStaged" in LIVE_BRIDGE_CODE
+    no_fabricate = "New-GwFrame -Type $Script:GwMsgTokenStaged" not in LIVE_BRIDGE_CODE
+    return assigns and no_fabricate, "assigns=%s no_fabricate=%s" % (assigns, no_fabricate)
+
+
+@check("235. the RX backlog barrier (PR #6) remains the ONE live DiscardInBuffer call site file-wide -- unaffected by this correction")
+def _c235():
+    n = BRIDGE_PS1_CODE.count("$port.DiscardInBuffer()")
+    return n == 1, "count=%d" % n
+
+
+@check("236. -SelfTest still never opens a real serial port, starts the real backend SSH process, or makes a real network call, including the new L8/L9 dynamic fixtures")
+def _c236():
+    body = SELFTEST_BODY_CODE
+    hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod") if s in body]
+    return not hits, "found=%s" % hits
 
 
 if __name__ == "__main__":

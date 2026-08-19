@@ -636,23 +636,63 @@ function New-GwSelfTestChildProcess {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
+function Invoke-GwChildProcessForSelfTest {
+    <# SelfTest-only: spawns a REAL local powershell.exe child process running THIS SAME bridge script file --
+       via $PSCommandPath, the canonical self-path PowerShell exposes for the currently executing script, never
+       a hardcoded developer path -- with the given arguments, and captures its actual OS ExitCode plus its
+       stdout/stderr text. Used ONLY to dynamically prove the top-level argument-validation gate's real process
+       exit code on a real separate Windows process; this helper itself never touches COM/SSH/network -- the
+       child it spawns is deliberately invoked WITHOUT -LiveAuthorized/-ComPort/-SshTarget by its caller, so it
+       must terminate at the very first top-level argument-validation gate before any such activity could occur. #>
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ArgumentList)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.ArgumentList.Add('-NoProfile')
+    $psi.ArgumentList.Add('-ExecutionPolicy')
+    $psi.ArgumentList.Add('Bypass')
+    $psi.ArgumentList.Add('-File')
+    $psi.ArgumentList.Add($PSCommandPath)
+    foreach ($a in $ArgumentList) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdOut = $proc.StandardOutput.ReadToEnd()
+    $stdErr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    return [PSCustomObject]@{ ExitCode = $proc.ExitCode; StdOut = $stdOut; StdErr = $stdErr }
+}
+
+# Canonical single owner for EVERY classified bridge error emission (live-mode failures and top-level
+# argument-validation failures alike). $ErrorActionPreference = 'Stop' is set at top scope, so an unqualified
+# Write-Error anywhere in this file is promoted to a terminating error and would abort the current scope
+# before the immediately-following `return 2` / `exit 2` ever executes -- this helper exists solely to pin
+# -ErrorAction Continue in exactly one place so every classified call site behaves the same, real way. Error
+# stream only; never the success stream; never a throw; never secret-bearing; never a return payload.
+function Write-GwClassifiedError {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    Write-Error -Message $Message -ErrorAction Continue
+}
+
 # Canonical single owner for invoking a live-bridge-shaped scriptblock and validating its captured
 # success-stream result against the real production exit contract $Script:GwLiveBridgeExitCodes (0, 2).
 # Used by BOTH the top-level production launcher (invoking the real Invoke-GwLiveBridge) and this file's own
 # -SelfTest dynamic regression cases below (invoking synthetic scriptblocks) -- so a runtime PowerShell
 # stream/exit-semantics defect in one path is provably a defect in the other; there is no duplicated or
-# parallel validation logic anywhere else to drift out of sync. The classified Write-Error on the malformed
-# path is explicitly -ErrorAction Continue: this script sets $ErrorActionPreference = 'Stop' at top scope, so
-# an unqualified Write-Error here would itself become a terminating error and the `return 2` immediately
-# below it would never execute -- the exact class of unreliable runtime behavior this whole correction exists
-# to catch, not something to accidentally reintroduce in new code.
+# parallel validation logic anywhere else to drift out of sync. The classified error on the malformed path
+# goes through Write-GwClassifiedError (the file's sole classified-error owner, defined immediately above) --
+# not a raw Write-Error -- so it reliably reaches the error stream and lets the `return 2` immediately below
+# it execute, rather than becoming a terminating error under top-scope $ErrorActionPreference = 'Stop'.
 function Resolve-GwLiveBridgeExitCode {
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Invoke
     )
     $result = & $Invoke
     if ($result -isnot [int] -or ($Script:GwLiveBridgeExitCodes -notcontains $result)) {
-        Write-Error -Message '[M3A_BRIDGE] live_result_malformed: unexpected non-integer or out-of-contract status' -ErrorAction Continue
+        Write-GwClassifiedError -Message '[M3A_BRIDGE] live_result_malformed: unexpected non-integer or out-of-contract status'
         return 2
     }
     return $result
@@ -690,7 +730,7 @@ function Invoke-GwLiveBridge {
         Write-Host '[M3A_BRIDGE] waiting for device BRIDGE_READY before starting backend session'
         $found = Wait-GwBridgeReady -ReadByte $readDeviceByte -TimeoutSeconds $DeviceReadyTimeoutSeconds
         if (-not $found) {
-            Write-Error '[M3A_BRIDGE] device_ready: timeout -- refusing to start backend session'
+            Write-GwClassifiedError -Message '[M3A_BRIDGE] device_ready: timeout -- refusing to start backend session'
             return 2
         }
         Write-Host '[M3A_BRIDGE] device_ready: true'
@@ -742,13 +782,13 @@ function Invoke-GwLiveBridge {
                 # The RX barrier itself threw -- classify distinctly from an ordinary backend/frame failure so a
                 # future diagnostic can tell the two apart. No serial write occurred (see the barrier's own
                 # contract); the outer finally tears down the backend transport defensively either way.
-                Write-Error '[M3A_BRIDGE] device_rx_barrier: failed'
+                Write-GwClassifiedError -Message '[M3A_BRIDGE] device_rx_barrier: failed'
             } else {
                 # Bounded backend read failed (timeout/EOF) or the frame was malformed -- no serial write occurred
                 # (see the comment above). Terminate the backend transport now so no abandoned async read can ever
                 # later deliver a late TOKEN_FRAME while the device may already have left its raw provisioning
                 # window; the outer finally also tears this down defensively.
-                Write-Error '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'
+                Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'
             }
             return 2
         }
@@ -787,7 +827,7 @@ function Invoke-GwLiveBridge {
         $isCommit = $decisionParsed.Ok -and $decisionParsed.Length -eq 0 -and $decisionParsed.Type -eq $Script:GwMsgProvisionCommit
         $isAbort = $decisionParsed.Ok -and $decisionParsed.Length -eq 0 -and $decisionParsed.Type -eq $Script:GwMsgProvisionAbort
         if (-not ($isCommit -or $isAbort)) {
-            Write-Error '[M3A_BRIDGE] backend_decision: malformed'
+            Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_decision: malformed'
             return 2
         }
         $port.Write($decisionHeader, 0, $decisionHeader.Length)
@@ -1474,6 +1514,44 @@ function Invoke-GwSelfTest {
     if ($l7First -ne 0) { $failures.Add('live_result_stale_first_call_not_zero') }
     if ($l7Second -ne 2) { $failures.Add('live_result_stale_second_call_contaminated') }
 
+    # L8. CLASSIFIED-ERROR-THEN-RETURN-2: the exact real production shape of every classified failure path --
+    # a synthetic invoker that itself calls Write-GwClassifiedError (the file's sole classified-error owner)
+    # and then `return 2`, run through the SAME Resolve-GwLiveBridgeExitCode owner the production launcher
+    # calls, under the SAME top-scope $ErrorActionPreference = 'Stop' this whole process runs under. The `2>&1`
+    # redirection here is a SelfTest-only observation trick applied to this ONE outer call, exactly like L1/L2's
+    # `6>&1` -- it never touches Resolve-GwLiveBridgeExitCode's or Write-GwClassifiedError's own internals. If
+    # Write-GwClassifiedError (or any call site) ever regressed back to a raw, unqualified Write-Error, this
+    # would become a terminating error under $ErrorActionPreference = 'Stop' and $l8Result would never become 2
+    # -- proving both that no terminating exception occurs and that the classified message actually reached the
+    # error stream, not merely that some value happened to end up in $result.
+    $l8Raw = Resolve-GwLiveBridgeExitCode -Invoke { Write-GwClassifiedError -Message '[M3A_BRIDGE] selftest_l8_synthetic_classified_error'; return 2 } 2>&1
+    $l8Result = $l8Raw | Where-Object { $_ -is [int] } | Select-Object -Last 1
+    $l8ErrorObserved = $l8Raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }
+    if ($l8Result -ne 2) { $failures.Add('live_result_classified_error_path_not_reached') }
+    if (-not ($l8ErrorObserved | Where-Object { "$_" -like '*selftest_l8_synthetic_classified_error*' })) {
+        $failures.Add('live_result_classified_error_not_observed_on_error_stream')
+    }
+
+    # L9. REAL CHILD-PROCESS PROOF: the strongest possible dynamic proof, one level up from L8's in-process
+    # call -- an actual separate `powershell.exe` process running THIS SAME bridge script file (via
+    # Invoke-GwChildProcessForSelfTest's $PSCommandPath, never a hardcoded path), invoked with none of
+    # -LiveAuthorized/-ComPort/-SshTarget, so it must terminate at the very first top-level argument-validation
+    # gate (the -LiveAuthorized check) before any COM/SSH/network activity could ever be attempted. Asserts the
+    # child's actual OS exit code is exactly 2 (never a hang, crash, or silent 0), its stderr carries the exact
+    # fixed non-secret classified message, its stdout is empty (nothing past the gate ever ran), and neither
+    # stream shows any sign of transport activity having started.
+    $l9 = Invoke-GwChildProcessForSelfTest -ArgumentList @()
+    if ($l9.ExitCode -ne 2) { $failures.Add('live_entrypoint_child_exit_code_not_two') }
+    if ($l9.StdErr -notlike '*[M3A_BRIDGE] live mode requires -LiveAuthorized*') {
+        $failures.Add('live_entrypoint_child_stderr_missing_classified_message')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($l9.StdOut)) {
+        $failures.Add('live_entrypoint_child_unexpected_stdout')
+    }
+    if ($l9.StdOut -match 'BRIDGE_READY|COM[0-9]|backend' -or $l9.StdErr -match 'BRIDGE_READY|COM[0-9]|backend') {
+        $failures.Add('live_entrypoint_child_unexpected_transport_activity_observed')
+    }
+
     return $failures.ToArray()
 }
 
@@ -1491,27 +1569,27 @@ if ($SelfTest) {
 }
 
 if (-not $LiveAuthorized) {
-    Write-Error '[M3A_BRIDGE] live mode requires -LiveAuthorized'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] live mode requires -LiveAuthorized'
     exit 2
 }
 if ([string]::IsNullOrWhiteSpace($ComPort)) {
-    Write-Error '[M3A_BRIDGE] live mode requires a non-empty -ComPort'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] live mode requires a non-empty -ComPort'
     exit 2
 }
 if ([string]::IsNullOrWhiteSpace($SshTarget)) {
-    Write-Error '[M3A_BRIDGE] live mode requires a non-empty -SshTarget'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] live mode requires a non-empty -SshTarget'
     exit 2
 }
 if ($ComPort -notmatch '^COM[0-9]{1,3}$') {
-    Write-Error '[M3A_BRIDGE] -ComPort has an unexpected shape'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] -ComPort has an unexpected shape'
     exit 2
 }
 if ($SshTarget -notmatch '^[A-Za-z0-9_.@:-]{1,255}$') {
-    Write-Error '[M3A_BRIDGE] -SshTarget has an unexpected shape'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] -SshTarget has an unexpected shape'
     exit 2
 }
 if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) {
-    Write-Error '[M3A_BRIDGE] -ProtocolTimeoutSeconds must be between 1 and 15'
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] -ProtocolTimeoutSeconds must be between 1 and 15'
     exit 2
 }
 

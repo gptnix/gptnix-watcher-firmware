@@ -516,7 +516,9 @@ function Confirm-GwDeviceTokenStaged {
     if (-not $parsed.Ok -or $parsed.Type -ne $Script:GwMsgTokenStaged -or $parsed.Length -ne 0) {
         throw "gw_token_staged_not_confirmed: $($parsed.Reason)"
     }
-    return $true
+    # Exact-forward correction: return the actual validated device header bytes -- never a bare boolean --
+    # so the caller (Invoke-GwLiveBridge) forwards the SAME bytes the device sent, never a reconstructed frame.
+    return [byte[]]$parsed.Header
 }
 
 function Read-GwStreamExactBounded {
@@ -680,9 +682,11 @@ function Invoke-GwLiveBridge {
         # fresh wall-clock deadline for this exchange (same $ProtocolTimeoutSeconds budget concept the prior
         # exact-count reader used, now shared across both the magic scan and the remaining-header read).
         $tokenStagedDeadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)
-        Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline | Out-Null
+        # Exact-forward correction: $stagedFrame IS the validated device header returned by
+        # Confirm-GwDeviceTokenStaged -- never a bridge-reconstructed frame. The bridge must forward exactly
+        # what the device sent, never fabricate a fresh TOKEN_STAGED of its own.
+        $stagedFrame = Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline
 
-        $stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged -Payload @()
         $inStream.Write($stagedFrame, 0, $stagedFrame.Length)
         $inStream.Flush()
         # ---- Past this point the bridge MUST NOT originate its own PROVISION_ABORT. It may only forward
@@ -866,13 +870,18 @@ function Invoke-GwSelfTest {
         $realState.Index++
         return $b
     }.GetNewClosure()
-    $acceptedReal = $false
+    $acceptedReal = $null
     try {
         $acceptedReal = Confirm-GwDeviceTokenStaged -ReadByte $readReal -Deadline ((Get-Date).AddSeconds(2))
     } catch {
-        $acceptedReal = $false
+        $acceptedReal = $null
     }
-    if (-not $acceptedReal) { $failures.Add('token_staged_guard_rejected_real_frame') }
+    # Exact-forward correction: Confirm-GwDeviceTokenStaged's OWN return value (not merely the underlying
+    # scanner's Header field) must be the exact 8 device bytes -- this is what Invoke-GwLiveBridge actually
+    # forwards upstream.
+    if ($null -eq $acceptedReal -or $acceptedReal.Length -ne 8 -or -not (Test-GwByteArrayEqual -A $acceptedReal -B $realStagedFrame)) {
+        $failures.Add('token_staged_guard_rejected_real_frame_or_bytes_not_exact')
+    }
 
     # 8b. text noise (a realistic firmware console/log line sharing the UART) preceding a real TOKEN_STAGED
     # frame is tolerated, and the returned header is the EXACT device bytes -- never a reconstruction.
@@ -1015,6 +1024,29 @@ function Invoke-GwSelfTest {
         $rejectedNonZeroPayload = $true
     }
     if (-not $rejectedNonZeroPayload) { $failures.Add('resync_nonzero_payload_not_rejected') }
+
+    # 8j. forwarding ownership: Confirm-GwDeviceTokenStaged itself (the function Invoke-GwLiveBridge actually
+    # calls) -- not merely the underlying Read-GwFrameHeaderResynchronized scanner exercised by 8b above --
+    # returns the exact device header bytes even when the frame is preceded by realistic UART noise. This
+    # closes the exact PR #5 architect-review gap: a green test on the scanner's own Header field did not prove
+    # Confirm-GwDeviceTokenStaged's own return value (what Invoke-GwLiveBridge actually receives and forwards
+    # upstream) was the same exact bytes rather than a bridge-reconstructed frame.
+    $ownershipState = [pscustomobject]@{ Index = 0 }
+    $readOwnership = {
+        if ($ownershipState.Index -ge $noisyRealArray.Length) { return $null }
+        $b = $noisyRealArray[$ownershipState.Index]
+        $ownershipState.Index++
+        return $b
+    }.GetNewClosure()
+    $ownershipResult = $null
+    try {
+        $ownershipResult = Confirm-GwDeviceTokenStaged -ReadByte $readOwnership -Deadline ((Get-Date).AddSeconds(2))
+    } catch {
+        $ownershipResult = $null
+    }
+    if ($null -eq $ownershipResult -or $ownershipResult.Length -ne 8 -or -not (Test-GwByteArrayEqual -A $ownershipResult -B $realStagedFrame)) {
+        $failures.Add('confirm_token_staged_return_not_exact_device_bytes')
+    }
 
     # The former "9"/"10" AnonymousPipeClientStream timeout/partial fixtures are retired: they called
     # Read-GwStreamExactBounded with an explicit null in place of a real backend Process, but that parameter is

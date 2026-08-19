@@ -991,9 +991,15 @@ function Invoke-GwSelfTest {
         $failures.Add('resync_split_reads_or_false_start_not_tolerated')
     }
 
-    # 8e. bounded scan limit: a stream of pure non-magic noise beyond $Script:GwMaxResyncNoiseBytes fails
-    # closed with a classified reason instead of scanning forever.
-    $overLimitNoise = New-Object byte[] ($Script:GwMaxResyncNoiseBytes + 16)
+    # 8e. bounded scan limit: a stream of pure non-magic noise beyond an explicit small test-local
+    # -MaxNoiseBytes fails closed with a classified reason instead of scanning forever. This fixture proves
+    # generic byte-bound scan_limit semantics, not real-world throughput -- it deliberately does NOT scale
+    # against the live $Script:GwMaxResyncNoiseBytes canonical default (172800): scanning a fixture that size
+    # is >172k per-byte closure invocations, which on the real Windows CI runner can exceed a short bounded
+    # deadline before the byte ceiling itself is ever reached, turning this into an accidental timing test
+    # instead of a scan_limit test. Same small-explicit-bound pattern already proven by fixture K5 below.
+    $overLimitTestMaxNoiseBytes = 32
+    $overLimitNoise = New-Object byte[] ($overLimitTestMaxNoiseBytes + 16)
     for ($i = 0; $i -lt $overLimitNoise.Length; $i++) { $overLimitNoise[$i] = 0x58 }
     $overLimitState = [pscustomobject]@{ Index = 0 }
     $readOverLimit = {
@@ -1002,7 +1008,7 @@ function Invoke-GwSelfTest {
         $overLimitState.Index++
         return $b
     }.GetNewClosure()
-    $overLimitResult = Read-GwFrameHeaderResynchronized -ReadByte $readOverLimit -Deadline ((Get-Date).AddSeconds(5))
+    $overLimitResult = Read-GwFrameHeaderResynchronized -ReadByte $readOverLimit -Deadline ((Get-Date).AddSeconds(2)) -MaxNoiseBytes $overLimitTestMaxNoiseBytes
     if ($overLimitResult.Ok -or $overLimitResult.Reason -ne 'scan_limit') {
         $failures.Add('resync_scan_limit_not_enforced')
     }
@@ -1116,7 +1122,11 @@ function Invoke-GwSelfTest {
         param($bytes)
         $k1Track.WriteCalls++
         $k1Track.Order.Add('WRITE')
-        $k1Track.Written = [byte[]]$bytes
+        # Snapshot/clone at callback time: Receive-GwTokenFrameAndForward's own `finally` zeroizes its
+        # internal $frame buffer (the SAME underlying array $bytes references here) immediately after this
+        # callback returns -- correct, unchanged production behavior. A bare reference-cast would observe
+        # that zeroized state by the time this fixture asserts equality below; an independent copy does not.
+        $k1Track.Written = [byte[]]($bytes.Clone())
     }.GetNewClosure()
     Receive-GwTokenFrameAndForward -ReadBytesExact $k1ReadExact -BeforeWrite $k1Barrier -WriteBytes $k1Write
     if ($k1Track.BarrierCalls -ne 1) { $failures.Add('rx_barrier_call_count_not_one') }

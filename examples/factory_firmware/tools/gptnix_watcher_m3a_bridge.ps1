@@ -94,11 +94,16 @@ $Script:GwMsgProvisionAbort  = [byte]0x05
 # read worker a bounded chance to actually quiesce before this process either continues or fail-closed exits.
 $Script:GwReadCancelGraceMs = 2000
 
-# Bounded noise-tolerance ceiling for device-frame resynchronization (see Read-GwFrameHeaderResynchronized).
-# Large enough to skip a realistic firmware console/log line sharing the same UART (e.g.
-# "[V2_WATCHER_PROVISION] bridge: ready\n" is ~37 bytes) with generous margin for several such lines; small
-# enough to still fail closed quickly on genuine garbage rather than scanning indefinitely.
-$Script:GwMaxResyncNoiseBytes = 512
+# Physically-derived noise-tolerance ceiling for device-frame resynchronization (see
+# Read-GwFrameHeaderResynchronized) -- NOT an arbitrary retry budget. It is the maximum number of bytes the
+# pinned physical transport (115200 baud, 8N1 = 10 line bits per payload byte) can physically deliver within
+# the maximum allowed protocol wall-clock budget (ProtocolTimeoutSeconds max = 15s):
+#   115200 / 10 * 15 = 172800 bytes
+# The caller-owned wall-clock $Deadline passed into Read-GwFrameHeaderResynchronized remains the sole
+# authoritative timeout in every case; this byte ceiling is only a secondary hard bound, and by construction it
+# can never be smaller than what the wire could legitimately have queued (stale console/log backlog) in that
+# same window -- e.g. RX backlog accumulated while this bridge was blocked waiting on the backend TOKEN_FRAME.
+$Script:GwMaxResyncNoiseBytes = 172800
 
 # -----------------------------------------------------------------------------
 # GptnixWatcherBoundedProcessRead -- hard-bounded synchronous Process-stdout read.
@@ -469,9 +474,20 @@ function Receive-GwTokenFrameAndForward {
     <# Reads exactly one TOKEN_FRAME via $ReadBytesExact (backend fd3 stream),
        forwards the exact raw frame bytes to $WriteBytes (serial) unmodified,
        and clears the local byte[] copy in a finally block immediately after
-       the write. Never converts the payload to a String, never prints it. #>
+       the write. Never converts the payload to a String, never prints it.
+
+       -BeforeWrite (M3A TOKEN_STAGED RX-backlog fix): an optional hook invoked EXACTLY ONCE, after the backend
+       TOKEN_FRAME has been fully read and validated but strictly BEFORE the first byte of that frame is written
+       via $WriteBytes. It receives no token bytes at all -- it exists solely so the live caller can discard a
+       stale device RX backlog (firmware console/log output that queued up while this function was waiting on
+       the backend) immediately before writing TOKEN_FRAME. Never before validation (which could otherwise
+       discard bytes belonging to a real in-flight exchange) and never after the write begins (which could race
+       the device's own read of what this function just wrote). If -BeforeWrite throws, $WriteBytes is never
+       called and the failure is re-thrown as one fixed classified string -- never the caller's raw exception,
+       in case it were ever to mention transport internals. #>
     param(
         [Parameter(Mandatory = $true)][scriptblock]$ReadBytesExact, # (count) -> byte[] or $null
+        [scriptblock]$BeforeWrite,                                  # () -> void, invoked once before WriteBytes
         [Parameter(Mandatory = $true)][scriptblock]$WriteBytes      # (byte[]) -> void
     )
     $header = & $ReadBytesExact $Script:GwHeaderBytes
@@ -487,6 +503,13 @@ function Receive-GwTokenFrameAndForward {
     [Array]::Copy($header, 0, $frame, 0, $Script:GwHeaderBytes)
     [Array]::Copy($payload, 0, $frame, $Script:GwHeaderBytes, $parsed.Length)
     try {
+        if ($BeforeWrite) {
+            try {
+                & $BeforeWrite
+            } catch {
+                throw 'gw_token_frame_rx_barrier_failed'
+            }
+        }
         & $WriteBytes $frame
     } finally {
         [Array]::Clear($frame, 0, $frame.Length)
@@ -666,14 +689,33 @@ function Invoke-GwLiveBridge {
             param($bytes) $port.Write($bytes, 0, $bytes.Length)
         }.GetNewClosure()
 
+        # RX backlog barrier (M3A TOKEN_STAGED RX-backlog fix): passed as Receive-GwTokenFrameAndForward's
+        # -BeforeWrite hook, so it runs exactly once, strictly after the backend TOKEN_FRAME has been fully
+        # validated and strictly before its first byte is written to the device -- see that function's own
+        # contract. The device cannot legally emit TOKEN_STAGED before it has received a valid TOKEN_FRAME, so
+        # this discard can never delete a legitimate current-exchange TOKEN_STAGED; it only clears stale
+        # firmware console/log output that queued up in the Windows RX buffer while this function was blocked
+        # waiting on the backend. This is the ONE live DiscardInBuffer call site in the whole bridge -- never
+        # DiscardOutBuffer, never a Close/Open of the port, never a DTR/RTS toggle.
+        $discardDeviceInput = {
+            $port.DiscardInBuffer()
+        }.GetNewClosure()
+
         try {
-            Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact -WriteBytes $writeSerialBytes
+            Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact -BeforeWrite $discardDeviceInput -WriteBytes $writeSerialBytes
         } catch {
-            # Bounded backend read failed (timeout/EOF) or the frame was malformed -- no serial write occurred
-            # (see the comment above). Terminate the backend transport now so no abandoned async read can ever
-            # later deliver a late TOKEN_FRAME while the device may already have left its raw provisioning
-            # window; the outer finally also tears this down defensively.
-            Write-Error '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'
+            if ($_.Exception.Message -eq 'gw_token_frame_rx_barrier_failed') {
+                # The RX barrier itself threw -- classify distinctly from an ordinary backend/frame failure so a
+                # future diagnostic can tell the two apart. No serial write occurred (see the barrier's own
+                # contract); the outer finally tears down the backend transport defensively either way.
+                Write-Error '[M3A_BRIDGE] device_rx_barrier: failed'
+            } else {
+                # Bounded backend read failed (timeout/EOF) or the frame was malformed -- no serial write occurred
+                # (see the comment above). Terminate the backend transport now so no abandoned async read can ever
+                # later deliver a late TOKEN_FRAME while the device may already have left its raw provisioning
+                # window; the outer finally also tears this down defensively.
+                Write-Error '[M3A_BRIDGE] backend_token_frame: bounded read failed or frame invalid'
+            }
             return 2
         }
 
@@ -949,9 +991,15 @@ function Invoke-GwSelfTest {
         $failures.Add('resync_split_reads_or_false_start_not_tolerated')
     }
 
-    # 8e. bounded scan limit: a stream of pure non-magic noise beyond $Script:GwMaxResyncNoiseBytes fails
-    # closed with a classified reason instead of scanning forever.
-    $overLimitNoise = New-Object byte[] ($Script:GwMaxResyncNoiseBytes + 16)
+    # 8e. bounded scan limit: a stream of pure non-magic noise beyond an explicit small test-local
+    # -MaxNoiseBytes fails closed with a classified reason instead of scanning forever. This fixture proves
+    # generic byte-bound scan_limit semantics, not real-world throughput -- it deliberately does NOT scale
+    # against the live $Script:GwMaxResyncNoiseBytes canonical default (172800): scanning a fixture that size
+    # is >172k per-byte closure invocations, which on the real Windows CI runner can exceed a short bounded
+    # deadline before the byte ceiling itself is ever reached, turning this into an accidental timing test
+    # instead of a scan_limit test. Same small-explicit-bound pattern already proven by fixture K5 below.
+    $overLimitTestMaxNoiseBytes = 32
+    $overLimitNoise = New-Object byte[] ($overLimitTestMaxNoiseBytes + 16)
     for ($i = 0; $i -lt $overLimitNoise.Length; $i++) { $overLimitNoise[$i] = 0x58 }
     $overLimitState = [pscustomobject]@{ Index = 0 }
     $readOverLimit = {
@@ -960,7 +1008,7 @@ function Invoke-GwSelfTest {
         $overLimitState.Index++
         return $b
     }.GetNewClosure()
-    $overLimitResult = Read-GwFrameHeaderResynchronized -ReadByte $readOverLimit -Deadline ((Get-Date).AddSeconds(5))
+    $overLimitResult = Read-GwFrameHeaderResynchronized -ReadByte $readOverLimit -Deadline ((Get-Date).AddSeconds(2)) -MaxNoiseBytes $overLimitTestMaxNoiseBytes
     if ($overLimitResult.Ok -or $overLimitResult.Reason -ne 'scan_limit') {
         $failures.Add('resync_scan_limit_not_enforced')
     }
@@ -1046,6 +1094,147 @@ function Invoke-GwSelfTest {
     }
     if ($null -eq $ownershipResult -or $ownershipResult.Length -ne 8 -or -not (Test-GwByteArrayEqual -A $ownershipResult -B $realStagedFrame)) {
         $failures.Add('confirm_token_staged_return_not_exact_device_bytes')
+    }
+
+    # K1-K5 (M3A TOKEN_STAGED RX-backlog fix): the -BeforeWrite RX barrier hook on
+    # Receive-GwTokenFrameAndForward, and the physically-derived resync ceiling, proven purely offline against
+    # synthetic in-memory fixtures -- never COM/SSH/network.
+
+    # K1. barrier ordering happy path: a valid synthetic backend TOKEN_FRAME proves the exact call order
+    # READ_VALIDATED -> BARRIER -> WRITE, that the barrier runs exactly once, and that WriteBytes receives the
+    # untouched original frame bytes -- binary fixture bytes only, never stringified.
+    $k1Payload = [byte[]](0x01, 0x02, 0x03, 0x04)
+    $k1Frame = New-GwFrame -Type $Script:GwMsgTokenFrame -Payload $k1Payload
+    $k1State = [pscustomobject]@{ Index = 0 }
+    $k1ReadExact = {
+        param($count)
+        if ($k1State.Index + $count -gt $k1Frame.Length) { return $null }
+        $slice = $k1Frame[$k1State.Index..($k1State.Index + $count - 1)]
+        $k1State.Index += $count
+        return $slice
+    }.GetNewClosure()
+    $k1Track = [pscustomobject]@{ Order = (New-Object System.Collections.Generic.List[string]); BarrierCalls = 0; WriteCalls = 0; Written = $null }
+    $k1Barrier = {
+        $k1Track.BarrierCalls++
+        $k1Track.Order.Add('BARRIER')
+    }.GetNewClosure()
+    $k1Write = {
+        param($bytes)
+        $k1Track.WriteCalls++
+        $k1Track.Order.Add('WRITE')
+        # Snapshot/clone at callback time: Receive-GwTokenFrameAndForward's own `finally` zeroizes its
+        # internal $frame buffer (the SAME underlying array $bytes references here) immediately after this
+        # callback returns -- correct, unchanged production behavior. A bare reference-cast would observe
+        # that zeroized state by the time this fixture asserts equality below; an independent copy does not.
+        $k1Track.Written = [byte[]]($bytes.Clone())
+    }.GetNewClosure()
+    Receive-GwTokenFrameAndForward -ReadBytesExact $k1ReadExact -BeforeWrite $k1Barrier -WriteBytes $k1Write
+    if ($k1Track.BarrierCalls -ne 1) { $failures.Add('rx_barrier_call_count_not_one') }
+    if ($k1Track.WriteCalls -ne 1) { $failures.Add('rx_barrier_write_call_count_not_one') }
+    if ($k1Track.Order.Count -lt 2 -or $k1Track.Order[0] -ne 'BARRIER' -or $k1Track.Order[1] -ne 'WRITE') {
+        $failures.Add('rx_barrier_not_before_write')
+    }
+    if ($null -eq $k1Track.Written -or -not (Test-GwByteArrayEqual -A $k1Track.Written -B $k1Frame)) {
+        $failures.Add('rx_barrier_write_frame_mismatch')
+    }
+
+    # K2. a malformed backend TOKEN_FRAME (bad magic) never reaches the RX barrier or the serial write.
+    $k2BadFrame = [byte[]](0x00, 0x00, 0x00, 0x00, $Script:GwVersion, $Script:GwMsgTokenFrame, 0x00, 0x01, 0x41)
+    $k2State = [pscustomobject]@{ Index = 0 }
+    $k2ReadExact = {
+        param($count)
+        if ($k2State.Index + $count -gt $k2BadFrame.Length) { return $null }
+        $slice = $k2BadFrame[$k2State.Index..($k2State.Index + $count - 1)]
+        $k2State.Index += $count
+        return $slice
+    }.GetNewClosure()
+    $k2Track = [pscustomobject]@{ BarrierCalls = 0; WriteCalls = 0 }
+    $k2Barrier = { $k2Track.BarrierCalls++ }.GetNewClosure()
+    $k2Write = { param($bytes) $k2Track.WriteCalls++ }.GetNewClosure()
+    $k2Failed = $false
+    try {
+        Receive-GwTokenFrameAndForward -ReadBytesExact $k2ReadExact -BeforeWrite $k2Barrier -WriteBytes $k2Write
+    } catch {
+        $k2Failed = $true
+    }
+    if (-not $k2Failed) { $failures.Add('rx_barrier_malformed_frame_not_rejected') }
+    if ($k2Track.BarrierCalls -ne 0) { $failures.Add('rx_barrier_ran_on_malformed_frame') }
+    if ($k2Track.WriteCalls -ne 0) { $failures.Add('rx_barrier_wrote_on_malformed_frame') }
+
+    # K3. backend timeout/EOF (ReadBytesExact returns $null) never reaches the RX barrier or the serial write.
+    $k3ReadExact = { param($count) return $null }.GetNewClosure()
+    $k3Track = [pscustomobject]@{ BarrierCalls = 0; WriteCalls = 0 }
+    $k3Barrier = { $k3Track.BarrierCalls++ }.GetNewClosure()
+    $k3Write = { param($bytes) $k3Track.WriteCalls++ }.GetNewClosure()
+    $k3Failed = $false
+    try {
+        Receive-GwTokenFrameAndForward -ReadBytesExact $k3ReadExact -BeforeWrite $k3Barrier -WriteBytes $k3Write
+    } catch {
+        $k3Failed = $true
+    }
+    if (-not $k3Failed) { $failures.Add('rx_barrier_backend_timeout_not_rejected') }
+    if ($k3Track.BarrierCalls -ne 0) { $failures.Add('rx_barrier_ran_on_backend_timeout') }
+    if ($k3Track.WriteCalls -ne 0) { $failures.Add('rx_barrier_wrote_on_backend_timeout') }
+
+    # K4. if the RX barrier itself throws, the serial write must never occur and the failure must be classified
+    # as gw_token_frame_rx_barrier_failed -- never the caller's raw exception object/message.
+    $k4Payload = [byte[]](0x05, 0x06)
+    $k4Frame = New-GwFrame -Type $Script:GwMsgTokenFrame -Payload $k4Payload
+    $k4State = [pscustomobject]@{ Index = 0 }
+    $k4ReadExact = {
+        param($count)
+        if ($k4State.Index + $count -gt $k4Frame.Length) { return $null }
+        $slice = $k4Frame[$k4State.Index..($k4State.Index + $count - 1)]
+        $k4State.Index += $count
+        return $slice
+    }.GetNewClosure()
+    $k4Track = [pscustomobject]@{ WriteCalls = 0 }
+    $k4Barrier = { throw 'synthetic_barrier_failure' }.GetNewClosure()
+    $k4Write = { param($bytes) $k4Track.WriteCalls++ }.GetNewClosure()
+    $k4ThrownMessage = $null
+    try {
+        Receive-GwTokenFrameAndForward -ReadBytesExact $k4ReadExact -BeforeWrite $k4Barrier -WriteBytes $k4Write
+    } catch {
+        $k4ThrownMessage = $_.Exception.Message
+    }
+    if ($k4ThrownMessage -ne 'gw_token_frame_rx_barrier_failed') { $failures.Add('rx_barrier_failure_not_classified') }
+    if ($k4Track.WriteCalls -ne 0) { $failures.Add('rx_barrier_failure_still_wrote') }
+
+    # K5. resync boundary semantics proven generically with a small deterministic -MaxNoiseBytes bound (never
+    # the full 172800-byte canonical ceiling, to keep this fixture fast) -- the canonical constant itself is
+    # verified separately by static fitness (test_watcher_m3a_provision_fitness.py).
+    $k5RealFrame = New-GwFrame -Type $Script:GwMsgTokenStaged -Payload @()
+
+    $k5Below = New-Object System.Collections.Generic.List[byte]
+    for ($i = 0; $i -lt 40; $i++) { $k5Below.Add([byte](0x30 + ($i % 10))) } # synthetic non-secret noise, never GNX3
+    $k5Below.AddRange([byte[]]$k5RealFrame)
+    $k5BelowArray = $k5Below.ToArray()
+    $k5BelowState = [pscustomobject]@{ Index = 0 }
+    $k5BelowReadByte = {
+        if ($k5BelowState.Index -ge $k5BelowArray.Length) { return $null }
+        $b = $k5BelowArray[$k5BelowState.Index]
+        $k5BelowState.Index++
+        return $b
+    }.GetNewClosure()
+    $k5BelowResult = Read-GwFrameHeaderResynchronized -ReadByte $k5BelowReadByte -Deadline ((Get-Date).AddSeconds(5)) -MaxNoiseBytes 100
+    if (-not $k5BelowResult.Ok -or $k5BelowResult.Type -ne $Script:GwMsgTokenStaged) {
+        $failures.Add('rx_barrier_resync_below_small_ceiling_rejected')
+    }
+
+    $k5Above = New-Object System.Collections.Generic.List[byte]
+    for ($i = 0; $i -lt 200; $i++) { $k5Above.Add([byte](0x30 + ($i % 10))) }
+    $k5Above.AddRange([byte[]]$k5RealFrame)
+    $k5AboveArray = $k5Above.ToArray()
+    $k5AboveState = [pscustomobject]@{ Index = 0 }
+    $k5AboveReadByte = {
+        if ($k5AboveState.Index -ge $k5AboveArray.Length) { return $null }
+        $b = $k5AboveArray[$k5AboveState.Index]
+        $k5AboveState.Index++
+        return $b
+    }.GetNewClosure()
+    $k5AboveResult = Read-GwFrameHeaderResynchronized -ReadByte $k5AboveReadByte -Deadline ((Get-Date).AddSeconds(5)) -MaxNoiseBytes 100
+    if ($k5AboveResult.Ok -or $k5AboveResult.Reason -ne 'scan_limit') {
+        $failures.Add('rx_barrier_resync_above_small_ceiling_accepted')
     }
 
     # The former "9"/"10" AnonymousPipeClientStream timeout/partial fixtures are retired: they called

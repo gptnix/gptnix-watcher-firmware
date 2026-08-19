@@ -840,9 +840,12 @@ def _c85():
 
 @check("86. TOKEN_STAGED forwarded upstream only after a real device TOKEN_STAGED")
 def _c86():
+    # PR #5 exact-forward correction: the upstream forward is no longer a separate New-GwFrame reconstruction
+    # after Confirm-GwDeviceTokenStaged -- $stagedFrame IS the Confirm-GwDeviceTokenStaged return value, so the
+    # boundary anchor is the assignment itself, and the write must still come strictly after it.
     live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
     idx_confirm = live_body.find("Confirm-GwDeviceTokenStaged")
-    idx_forward = live_body.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    idx_forward = live_body.find("$inStream.Write($stagedFrame")
     return idx_confirm != -1 and idx_forward != -1 and idx_confirm < idx_forward, ""
 
 
@@ -1067,9 +1070,11 @@ def _c117():
 
 @check("118. the post-staged backend decision read uses its OWN fresh deadline, separate from the TOKEN_FRAME deadline")
 def _c118():
+    # PR #5 exact-forward correction: boundary anchor moved from the retired New-GwFrame reconstruction to the
+    # $stagedFrame assignment (now the Confirm-GwDeviceTokenStaged return value) -- same ordering intent.
     live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
     has_decision_sw = "$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()" in live_body
-    idx_staged_write = live_body.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    idx_staged_write = live_body.find("$stagedFrame = Confirm-GwDeviceTokenStaged")
     idx_decision_sw = live_body.find("$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
     distinct_from_token_frame_sw = "$decisionStopwatch" != "$tokenFrameStopwatch"
     return (has_decision_sw and idx_staged_write != -1 and idx_decision_sw != -1
@@ -1264,7 +1269,9 @@ def _c146():
 
 @check("147. the post-staged decision read still uses its own fresh Stopwatch")
 def _c147():
-    idx_staged = LIVE_BRIDGE_SOURCE.find("$stagedFrame = New-GwFrame -Type $Script:GwMsgTokenStaged")
+    # PR #5 exact-forward correction: boundary anchor moved from the retired New-GwFrame reconstruction to the
+    # $stagedFrame assignment (now the Confirm-GwDeviceTokenStaged return value) -- same ordering intent.
+    idx_staged = LIVE_BRIDGE_SOURCE.find("$stagedFrame = Confirm-GwDeviceTokenStaged")
     idx_decision_sw = LIVE_BRIDGE_SOURCE.find("$decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()")
     return idx_staged != -1 and idx_decision_sw != -1 and idx_staged < idx_decision_sw, ""
 
@@ -1462,6 +1469,125 @@ def _c174():
     return all_ok, ("beginread_ok=%s endread_ok=%s asyncwait_ok=%s worker_ok=%s cancel_ok=%s failfast_ok=%s "
                      "shared_deadline_ok=%s fresh_decision_ok=%s") % (
         beginread_ok, endread_ok, asyncwait_ok, worker_ok, cancel_ok, failfast_ok, shared_deadline_ok, fresh_decision_ok)
+
+
+# ===========================================================================
+# M3A TOKEN_STAGED serial resynchronization fix (175-182)
+# ===========================================================================
+
+RESYNC_FN_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Read-GwFrameHeaderResynchronized", "function Receive-GwTokenFrameAndForward")
+CONFIRM_STAGED_SOURCE = _extract_c_function(BRIDGE_PS1_RAW, "function Confirm-GwDeviceTokenStaged", "function Read-GwStreamExactBounded")
+
+
+@check("175. resync scanner never fabricates a success -- Ok is only ever assigned from Test-GwFrameHeader's own result")
+def _c175():
+    hardcoded_true = len(re.findall(r"Ok\s*=\s*\$true", RESYNC_FN_SOURCE)) > 0
+    from_parsed = "Ok = $parsed.Ok" in RESYNC_FN_SOURCE
+    return (not hardcoded_true) and from_parsed, "hardcoded_true=%s from_parsed=%s" % (hardcoded_true, from_parsed)
+
+
+@check("176. resync scanner never stringifies or prints scanned noise/header bytes")
+def _c176():
+    string_hits = [s for s in ("[string]$b", "[string]$window", "[string]$rest", "[string]$header", "GetString(") if s in RESYNC_FN_SOURCE]
+    print_hits = [s for s in re.findall(r"Write-(?:Host|Output)\s+\$\w+", RESYNC_FN_SOURCE)]
+    return not string_hits and not print_hits, "string_hits=%s print_hits=%s" % (string_hits, print_hits)
+
+
+@check("177. resync scanner is bounded -- only one while-loop condition tests the caller-owned deadline, plus one fixed noise-count bound")
+def _c177():
+    deadline_loops = len(re.findall(r"while\s*\(\(Get-Date\)\s*-lt\s*\$Deadline\)|while\s*\(\(Get-Date\)\s*-ge\s*\$Deadline\)", RESYNC_FN_SOURCE))
+    has_scan_limit = "scanned -gt $MaxNoiseBytes" in RESYNC_FN_SOURCE
+    return deadline_loops >= 1 and has_scan_limit, "deadline_loops=%d has_scan_limit=%s" % (deadline_loops, has_scan_limit)
+
+
+@check("178. Confirm-GwDeviceTokenStaged uses the resync-based -ReadByte/-Deadline signature, not the retired -ReadBytesExact positional reader")
+def _c178():
+    sig_ok = "[scriptblock]$ReadByte" in CONFIRM_STAGED_SOURCE and "[datetime]$Deadline" in CONFIRM_STAGED_SOURCE
+    old_gone = "ReadBytesExact" not in CONFIRM_STAGED_SOURCE
+    calls_resync = "Read-GwFrameHeaderResynchronized -ReadByte $ReadByte -Deadline $Deadline" in CONFIRM_STAGED_SOURCE
+    return sig_ok and old_gone and calls_resync, "sig_ok=%s old_gone=%s calls_resync=%s" % (sig_ok, old_gone, calls_resync)
+
+
+@check("179. Confirm-GwDeviceTokenStaged still throws (never returns falsy) on any non-OK/wrong-type/nonzero-payload result")
+def _c179():
+    return bool(re.search(r'if\s*\(-not \$parsed\.Ok -or \$parsed\.Type -ne \$Script:GwMsgTokenStaged -or \$parsed\.Length -ne 0\)\s*\{\s*throw', CONFIRM_STAGED_SOURCE)), ""
+
+
+@check("180. Invoke-GwLiveBridge's TOKEN_STAGED call site reuses the single existing device-byte reader -- no second reader/owner introduced")
+def _c180():
+    reader_uses = len(re.findall(r"\$readDeviceByte\b", LIVE_BRIDGE_SOURCE))
+    confirm_call = "Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline" in LIVE_BRIDGE_SOURCE
+    no_old_exact_reader = "$readSerialExact" not in LIVE_BRIDGE_SOURCE
+    return reader_uses >= 2 and confirm_call and no_old_exact_reader, "reader_uses=%d confirm_call=%s no_old_exact_reader=%s" % (reader_uses, confirm_call, no_old_exact_reader)
+
+
+@check("181. TOKEN_STAGED deadline is a single fresh budget derived from -ProtocolTimeoutSeconds, matching the retired reader's own budget concept")
+def _c181():
+    return "$tokenStagedDeadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)" in LIVE_BRIDGE_SOURCE, ""
+
+
+@check("182. GwMaxResyncNoiseBytes is a fixed, bounded, positive constant")
+def _c182():
+    m = re.search(r"\$Script:GwMaxResyncNoiseBytes\s*=\s*(\d+)", BRIDGE_PS1_RAW)
+    if not m:
+        return False, "constant not found"
+    value = int(m.group(1))
+    return 0 < value <= 65536, "value=%d" % value
+
+
+# ===========================================================================
+# PR #5 architect-review correction: exact device TOKEN_STAGED forwarding
+# ownership (183-188). A green test on Read-GwFrameHeaderResynchronized's own
+# Header field (checks 175-182) does NOT prove Confirm-GwDeviceTokenStaged
+# hands that value to its caller, nor that Invoke-GwLiveBridge forwards it
+# upstream instead of fabricating a fresh frame -- that exact gap is what let
+# a reconstructed-frame implementation pass the prior green CI run. These
+# checks specifically test the ownership/forwarding chain, not the scanner.
+# ===========================================================================
+
+@check("183. Confirm-GwDeviceTokenStaged returns the validated device header bytes on success, never a bare boolean")
+def _c183():
+    returns_header = "return [byte[]]$parsed.Header" in CONFIRM_STAGED_SOURCE
+    no_bare_true_return = not re.search(r"return\s+\$true\b", CONFIRM_STAGED_SOURCE)
+    return returns_header and no_bare_true_return, "returns_header=%s no_bare_true_return=%s" % (returns_header, no_bare_true_return)
+
+
+@check("184. Invoke-GwLiveBridge's TOKEN_STAGED call site assigns the Confirm-GwDeviceTokenStaged return value -- never discards it")
+def _c184():
+    assigns = "$stagedFrame = Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline" in LIVE_BRIDGE_SOURCE
+    discards = "Confirm-GwDeviceTokenStaged -ReadByte $readDeviceByte -Deadline $tokenStagedDeadline | Out-Null" in LIVE_BRIDGE_SOURCE
+    return assigns and not discards, "assigns=%s discards=%s" % (assigns, discards)
+
+
+@check("185. the exact assigned $stagedFrame reaches the live upstream write with no reconstruction in between")
+def _c185():
+    assign_idx = LIVE_BRIDGE_SOURCE.find("$stagedFrame = Confirm-GwDeviceTokenStaged")
+    write_idx = LIVE_BRIDGE_SOURCE.find("$inStream.Write($stagedFrame")
+    if assign_idx == -1 or write_idx == -1 or assign_idx >= write_idx:
+        return False, "assign_idx=%d write_idx=%d" % (assign_idx, write_idx)
+    between = LIVE_BRIDGE_SOURCE[assign_idx:write_idx]
+    no_reconstruction = "New-GwFrame" not in between
+    return no_reconstruction, "between=%r" % between
+
+
+@check("186. Invoke-GwLiveBridge's live path contains zero New-GwFrame(TOKEN_STAGED) reconstruction calls")
+def _c186():
+    hits = LIVE_BRIDGE_SOURCE.count("New-GwFrame -Type $Script:GwMsgTokenStaged")
+    return hits == 0, "hits=%d" % hits
+
+
+@check("187. any New-GwFrame(TOKEN_STAGED) construction file-wide is confined to Invoke-GwSelfTest fixture setup only")
+def _c187():
+    total = BRIDGE_PS1_RAW.count("New-GwFrame -Type $Script:GwMsgTokenStaged")
+    in_selftest = SELFTEST_SOURCE.count("New-GwFrame -Type $Script:GwMsgTokenStaged")
+    return total > 0 and total - in_selftest == 0, "total=%d in_selftest=%d" % (total, in_selftest)
+
+
+@check("188. the corrected $stagedFrame device bytes are never stringified, logged, or printed")
+def _c188():
+    string_hits = [s for s in ("[string]$stagedFrame", "GetString($stagedFrame") if s in LIVE_BRIDGE_SOURCE]
+    print_hits = re.findall(r"Write-(?:Host|Output)\s+\$stagedFrame\b", LIVE_BRIDGE_SOURCE)
+    return not string_hits and not print_hits, "string_hits=%s print_hits=%s" % (string_hits, print_hits)
 
 
 if __name__ == "__main__":

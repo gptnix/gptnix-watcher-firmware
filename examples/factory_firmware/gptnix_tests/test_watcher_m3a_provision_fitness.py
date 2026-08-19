@@ -1946,24 +1946,28 @@ def _c231():
     return calls_helper_in_invoke and via_owner, "calls_helper_in_invoke=%s via_owner=%s" % (calls_helper_in_invoke, via_owner)
 
 
-@check("232. -SelfTest contains a dynamic L9 case that spawns a REAL local child process and asserts its actual OS exit code is exactly 2, with the expected classified stderr text")
+@check("232. -SelfTest contains a dynamic L9 case that calls the NO-ARGUMENT Invoke-GwChildProcessForSelfTest helper (no -ArgumentList, no live args possible) and asserts a REAL local child process's actual OS exit code is exactly 2, with the expected classified stderr text")
 def _c232():
     body = SELFTEST_BODY_CODE
-    spawns_child = "Invoke-GwChildProcessForSelfTest -ArgumentList @()" in body
+    spawns_child = "$l9 = Invoke-GwChildProcessForSelfTest" in body
+    no_argument_list_call = "Invoke-GwChildProcessForSelfTest -ArgumentList" not in body
     checks_exit_two = "$l9.ExitCode -ne 2" in body
     checks_stderr = "$l9.StdErr" in body and "live mode requires -LiveAuthorized" in body
-    return spawns_child and checks_exit_two and checks_stderr, "spawns_child=%s checks_exit_two=%s checks_stderr=%s" % (
-        spawns_child, checks_exit_two, checks_stderr)
+    return spawns_child and no_argument_list_call and checks_exit_two and checks_stderr, (
+        "spawns_child=%s no_argument_list_call=%s checks_exit_two=%s checks_stderr=%s" % (
+            spawns_child, no_argument_list_call, checks_exit_two, checks_stderr))
 
 
-@check("233. Invoke-GwChildProcessForSelfTest runs the bridge's OWN script file via $PSCommandPath -- never a hardcoded developer path -- and never itself opens a serial port, starts the real backend SSH process, or makes a network call")
+@check("233. Invoke-GwChildProcessForSelfTest runs the bridge's OWN script file via a $selfPath local captured from $PSCommandPath -- never a hardcoded developer path -- and never itself opens a serial port, starts the real backend SSH process, or makes a network call")
 def _c233():
     body = CHILD_SCRIPT_HELPER_CODE
-    uses_self_path = "$psi.ArgumentList.Add($PSCommandPath)" in body
+    captures_self_path = "$selfPath = $PSCommandPath" in body
+    uses_self_path_in_arguments = '-File `"$selfPath`"' in body
     no_hardcoded_path = not re.search(r"[A-Za-z]:\\", body)
     hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod", "'ssh.exe'") if s in body]
-    return uses_self_path and no_hardcoded_path and not hits, "uses_self_path=%s no_hardcoded_path=%s hits=%s" % (
-        uses_self_path, no_hardcoded_path, hits)
+    return captures_self_path and uses_self_path_in_arguments and no_hardcoded_path and not hits, (
+        "captures_self_path=%s uses_self_path_in_arguments=%s no_hardcoded_path=%s hits=%s" % (
+            captures_self_path, uses_self_path_in_arguments, no_hardcoded_path, hits))
 
 
 @check("234. exact-device TOKEN_STAGED forwarding (PR #5) remains unaffected by this correction -- still assigned from Confirm-GwDeviceTokenStaged, never a fabricated New-GwFrame in the live path")
@@ -1984,6 +1988,97 @@ def _c236():
     body = SELFTEST_BODY_CODE
     hits = [s for s in ("SerialPort", "Start-GwBackendProcess", "Invoke-WebRequest", "Invoke-RestMethod") if s in body]
     return not hits, "found=%s" % hits
+
+
+# ===========================================================================
+# PR #7 Windows PowerShell 5.1 child-process fixture correction (237-248):
+# ProcessStartInfo.ArgumentList is $null on Windows PowerShell 5.1 / .NET Framework (it was only
+# introduced with .NET Core/5+) -- $psi.ArgumentList.Add(...) crashed the real Windows CI runner
+# with "You cannot call a method on a null-valued expression" before Process.Start() was ever
+# reached. Invoke-GwChildProcessForSelfTest is now a strictly no-argument, fixed-invocation-shape
+# helper built on the legacy-compatible ProcessStartInfo.Arguments string instead.
+# ===========================================================================
+
+@check("237. Invoke-GwChildProcessForSelfTest is defined exactly once file-wide")
+def _c237():
+    n = BRIDGE_PS1_CODE.count("function Invoke-GwChildProcessForSelfTest")
+    return n == 1, "count=%d" % n
+
+
+@check("238. Invoke-GwChildProcessForSelfTest contains zero ArgumentList.Add(...) calls and zero .ArgumentList references -- the API proven $null on Windows PowerShell 5.1 / .NET Framework is fully removed from this helper")
+def _c238():
+    body = CHILD_SCRIPT_HELPER_CODE
+    n_add = body.count("ArgumentList.Add(")
+    n_ref = body.count(".ArgumentList")
+    return n_add == 0 and n_ref == 0, "argumentlist_add_count=%d argumentlist_ref_count=%d" % (n_add, n_ref)
+
+
+@check("239. Invoke-GwChildProcessForSelfTest assigns ProcessStartInfo.Arguments (the legacy-compatible string property) exactly once")
+def _c239():
+    body = CHILD_SCRIPT_HELPER_CODE
+    n = body.count("$psi.Arguments = ")
+    return n == 1, "count=%d" % n
+
+
+@check("240. Invoke-GwChildProcessForSelfTest's ProcessStartInfo.FileName remains 'powershell.exe'")
+def _c240():
+    body = CHILD_SCRIPT_HELPER_CODE
+    return "$psi.FileName = 'powershell.exe'" in body, ""
+
+
+@check("241. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -NoProfile")
+def _c241():
+    return "-NoProfile" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("242. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -NonInteractive")
+def _c242():
+    return "-NonInteractive" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("243. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -ExecutionPolicy Bypass")
+def _c243():
+    return "-ExecutionPolicy Bypass" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("244. Invoke-GwChildProcessForSelfTest's fixed Arguments string includes -File")
+def _c244():
+    return "-File" in CHILD_SCRIPT_HELPER_CODE, ""
+
+
+@check("245. Invoke-GwChildProcessForSelfTest never passes -LiveAuthorized, -ComPort, or -SshTarget to the child -- the whole point of L9 is that the child hits the very first argument-validation gate")
+def _c245():
+    body = CHILD_SCRIPT_HELPER_CODE
+    hits = [s for s in ("-LiveAuthorized", "-ComPort", "-SshTarget") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("246. Invoke-GwChildProcessForSelfTest uses no generic shell-eval/command-runner substitute -- no cmd.exe, Invoke-Expression, or Start-Process -- this is a fixed self-path invocation, not a generic child-process command runner")
+def _c246():
+    body = CHILD_SCRIPT_HELPER_CODE
+    hits = [s for s in ("cmd.exe", "Invoke-Expression", "Start-Process") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("247. Invoke-GwChildProcessForSelfTest fails closed with a fixed, non-secret classification -- never attempting a child launch -- when $PSCommandPath is null or whitespace")
+def _c247():
+    body = CHILD_SCRIPT_HELPER_CODE
+    has_guard = "[string]::IsNullOrWhiteSpace($selfPath)" in body
+    fails_before_launch = body.index("IsNullOrWhiteSpace($selfPath)") < body.index("[System.Diagnostics.Process]::Start($psi)")
+    fixed_message = "selftest_l9_self_path_unavailable" in body
+    return has_guard and fails_before_launch and fixed_message, (
+        "has_guard=%s fails_before_launch=%s fixed_message=%s" % (has_guard, fails_before_launch, fixed_message))
+
+
+@check("248. Invoke-GwChildProcessForSelfTest guards against a $null Process.Start() result (defense-in-depth, not the proven root cause) before ever touching StandardOutput/StandardError, failing closed with a fixed non-secret classification instead of a null dereference")
+def _c248():
+    body = CHILD_SCRIPT_HELPER_CODE
+    guard_idx = body.find("$null -eq $proc")
+    start_idx = body.find("[System.Diagnostics.Process]::Start($psi)")
+    read_idx = body.find(".StandardOutput.ReadToEnd()")
+    ordered = start_idx != -1 and guard_idx != -1 and read_idx != -1 and start_idx < guard_idx < read_idx
+    fixed_message = "selftest_l9_child_process_start_failed" in body
+    return ordered and fixed_message, "ordered=%s fixed_message=%s" % (ordered, fixed_message)
 
 
 if __name__ == "__main__":

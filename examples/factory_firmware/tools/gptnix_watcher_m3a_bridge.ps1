@@ -639,25 +639,30 @@ function New-GwSelfTestChildProcess {
 function Invoke-GwChildProcessForSelfTest {
     <# SelfTest-only: spawns a REAL local powershell.exe child process running THIS SAME bridge script file --
        via $PSCommandPath, the canonical self-path PowerShell exposes for the currently executing script, never
-       a hardcoded developer path -- with the given arguments, and captures its actual OS ExitCode plus its
+       a hardcoded developer path -- with no live arguments, and captures its actual OS ExitCode plus its
        stdout/stderr text. Used ONLY to dynamically prove the top-level argument-validation gate's real process
        exit code on a real separate Windows process; this helper itself never touches COM/SSH/network -- the
-       child it spawns is deliberately invoked WITHOUT -LiveAuthorized/-ComPort/-SshTarget by its caller, so it
-       must terminate at the very first top-level argument-validation gate before any such activity could occur. #>
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ArgumentList)
+       child it spawns is deliberately invoked WITHOUT -LiveAuthorized/-ComPort/-SshTarget, so it must terminate
+       at the very first top-level argument-validation gate before any such activity could occur. Fixed, single
+       invocation shape only -- never a generic child-process command runner. ProcessStartInfo.ArgumentList is
+       $null on Windows PowerShell 5.1 / .NET Framework (it was only introduced with .NET Core/5+), so this uses
+       the legacy-compatible ProcessStartInfo.Arguments string instead -- the same mechanism already used by
+       Start-GwBackendProcess and New-GwSelfTestChildProcess above. #>
+    $selfPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($selfPath)) {
+        return [PSCustomObject]@{ ExitCode = -1; StdOut = ''; StdErr = '[M3A_BRIDGE] selftest_l9_self_path_unavailable' }
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
-    $psi.ArgumentList.Add('-NoProfile')
-    $psi.ArgumentList.Add('-ExecutionPolicy')
-    $psi.ArgumentList.Add('Bypass')
-    $psi.ArgumentList.Add('-File')
-    $psi.ArgumentList.Add($PSCommandPath)
-    foreach ($a in $ArgumentList) { $psi.ArgumentList.Add($a) }
+    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$selfPath`""
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($null -eq $proc) {
+        return [PSCustomObject]@{ ExitCode = -1; StdOut = ''; StdErr = '[M3A_BRIDGE] selftest_l9_child_process_start_failed' }
+    }
     $stdOut = $proc.StandardOutput.ReadToEnd()
     $stdErr = $proc.StandardError.ReadToEnd()
     $proc.WaitForExit()
@@ -1540,7 +1545,7 @@ function Invoke-GwSelfTest {
     # child's actual OS exit code is exactly 2 (never a hang, crash, or silent 0), its stderr carries the exact
     # fixed non-secret classified message, its stdout is empty (nothing past the gate ever ran), and neither
     # stream shows any sign of transport activity having started.
-    $l9 = Invoke-GwChildProcessForSelfTest -ArgumentList @()
+    $l9 = Invoke-GwChildProcessForSelfTest
     if ($l9.ExitCode -ne 2) { $failures.Add('live_entrypoint_child_exit_code_not_two') }
     if ($l9.StdErr -notlike '*[M3A_BRIDGE] live mode requires -LiveAuthorized*') {
         $failures.Add('live_entrypoint_child_stderr_missing_classified_message')

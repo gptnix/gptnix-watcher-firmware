@@ -57,9 +57,17 @@
     gives up and refuses to start the backend SSH session. Default 60.
 
 .PARAMETER ProtocolTimeoutSeconds
-    Bounded wait for each subsequent protocol exchange (TOKEN_STAGED,
-    PROVISION_COMMIT/ABORT, the diagnostic device-READY observation window).
-    Default 15.
+    Bounded wait for each subsequent pre-COMMIT protocol exchange (TOKEN_STAGED,
+    PROVISION_COMMIT/ABORT). Default 15.
+
+.PARAMETER VoiceReadyTimeoutSeconds
+    Bounded, diagnostics-only wait for the post-COMMIT device READY marker
+    ("[V2_WATCHER_PROVISION] voice: ready"). Never part of COMMIT/security
+    semantics -- a timeout here is diagnostic only and never turns an
+    already-successful COMMIT into a failure. Separate from
+    -ProtocolTimeoutSeconds because the firmware's own legal post-COMMIT
+    voice-ready chain (Wi-Fi IP wait + HTTPS session + voice READY wait) can
+    take up to 60s, well beyond the pre-COMMIT protocol budget. Default 75.
 #>
 [CmdletBinding()]
 param(
@@ -69,7 +77,8 @@ param(
     [string]$SshTarget = '',
     [int]$BaudRate = 115200,
     [int]$DeviceReadyTimeoutSeconds = 60,
-    [int]$ProtocolTimeoutSeconds = 15
+    [int]$ProtocolTimeoutSeconds = 15,
+    [int]$VoiceReadyTimeoutSeconds = 75
 )
 
 $ErrorActionPreference = 'Stop'
@@ -384,6 +393,16 @@ function Test-GwProtocolTimeoutSecondsValid {
        GW_TOKEN_FRAME_WAIT_MS=60000 window. Used by both the script entry point and the self-test. #>
     param([int]$Seconds)
     return ($Seconds -ge 1 -and $Seconds -le 15)
+}
+
+function Test-GwVoiceReadyTimeoutSecondsValid {
+    <# Pure, directly testable: -VoiceReadyTimeoutSeconds must cover the firmware's own legal
+       post-COMMIT worst-case voice-ready chain (GW_IP_WAIT_MS=30000 + GW_HTTP_TIMEOUT_MS=10000 +
+       GW_VOICE_READY_TIMEOUT_MS=20000 = 60000ms) plus a minimum 5s safety margin -- hence 65 as the
+       floor. 120 is an upper sanity bound so the diagnostics-only F7 window can never grow
+       unbounded. Used by both the script entry point and the self-test. #>
+    param([int]$Seconds)
+    return ($Seconds -ge 65 -and $Seconds -le 120)
 }
 
 function Test-GwByteArrayEqual {
@@ -711,7 +730,8 @@ function Invoke-GwLiveBridge {
         [Parameter(Mandatory = $true)][string]$SshTarget,
         [int]$BaudRate,
         [int]$DeviceReadyTimeoutSeconds,
-        [int]$ProtocolTimeoutSeconds
+        [int]$ProtocolTimeoutSeconds,
+        [int]$VoiceReadyTimeoutSeconds
     )
 
     $port = New-Object -TypeName 'System.IO.Ports.SerialPort' -ArgumentList $ComPort, $BaudRate, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
@@ -844,9 +864,13 @@ function Invoke-GwLiveBridge {
         Write-Host '[M3A_BRIDGE] decision: commit'
 
         # F7 -- bounded, diagnostics-only observation window for the device READY marker. Never part of
-        # security/commit semantics; never echoes arbitrary device log bytes.
+        # security/commit semantics; never echoes arbitrary device log bytes. Uses its OWN dedicated
+        # -VoiceReadyTimeoutSeconds budget, never -ProtocolTimeoutSeconds: the firmware's own legal post-COMMIT
+        # voice-ready chain (Wi-Fi IP wait + HTTPS session + voice READY wait, up to 60s) can exceed the
+        # pre-COMMIT protocol budget (max 15s), so reusing that budget here was a proven false-negative
+        # observation window, not a real device/audio failure.
         $marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')
-        $deadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)
+        $deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)
         $window = New-Object System.Collections.Generic.Queue[byte]
         $deviceReady = $false
         while ((Get-Date) -lt $deadline) {
@@ -1602,6 +1626,10 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
     Write-GwClassifiedError -Message '[M3A_BRIDGE] -ProtocolTimeoutSeconds must be between 1 and 15'
     exit 2
 }
+if (-not (Test-GwVoiceReadyTimeoutSecondsValid -Seconds $VoiceReadyTimeoutSeconds)) {
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] -VoiceReadyTimeoutSeconds must be between 65 and 120'
+    exit 2
+}
 
 # Live-output / exit-status fix: `exit (Invoke-GwLiveBridge ...)` previously forced PowerShell to fully
 # evaluate the parenthesized call as one subexpression -- capturing the function's ENTIRE success/pipeline
@@ -1617,6 +1645,7 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
 # regression here would be caught by that dynamic Windows proof, not merely by an unrelated static grep.
 $liveExitCode = Resolve-GwLiveBridgeExitCode -Invoke {
     Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
-        -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds
+        -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds `
+        -VoiceReadyTimeoutSeconds $VoiceReadyTimeoutSeconds
 }
 exit $liveExitCode

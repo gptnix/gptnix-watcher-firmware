@@ -1902,12 +1902,12 @@ def _c224():
     return n == 1, "count=%d (expected exactly 1, inside Write-GwClassifiedError's own body)" % n
 
 
-@check("225. Write-GwClassifiedError is invoked from exactly 12 call sites file-wide -- the 11 real production classified-failure paths plus the L8 SelfTest synthetic invoker")
+@check("225. Write-GwClassifiedError is invoked from exactly 13 call sites file-wide -- the 12 real production classified-failure paths (11 pre-existing plus the new -VoiceReadyTimeoutSeconds entrypoint validation) plus the L8 SelfTest synthetic invoker")
 def _c225():
     n = BRIDGE_PS1_CODE.count("Write-GwClassifiedError -Message")
     n_production = LIVE_BRIDGE_CODE.count("Write-GwClassifiedError -Message") + LAUNCHER_CODE.count(
         "Write-GwClassifiedError -Message") + RESOLVE_EXIT_HELPER_CODE.count("Write-GwClassifiedError -Message")
-    return n == 12 and n_production == 11, "count=%d n_production=%d" % (n, n_production)
+    return n == 13 and n_production == 12, "count=%d n_production=%d" % (n, n_production)
 
 
 @check("226. the device_ready timeout classified failure uses Write-GwClassifiedError")
@@ -1927,10 +1927,10 @@ def _c228():
     return "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_decision: malformed'" in LIVE_BRIDGE_CODE, ""
 
 
-@check("229. all six top-level entrypoint argument-validation classified failures use Write-GwClassifiedError")
+@check("229. all seven top-level entrypoint argument-validation classified failures (the six pre-existing plus the new -VoiceReadyTimeoutSeconds bounds check) use Write-GwClassifiedError")
 def _c229():
     n = LAUNCHER_CODE.count("Write-GwClassifiedError -Message")
-    return n == 6, "count=%d" % n
+    return n == 7, "count=%d" % n
 
 
 @check("230. Resolve-GwLiveBridgeExitCode's malformed-result path uses Write-GwClassifiedError, consistent with every other classified call site")
@@ -2124,6 +2124,87 @@ def _c253():
 @check("254. L9's child transport-activity assertion is unchanged")
 def _c254():
     return "live_entrypoint_child_unexpected_transport_activity_observed" in SELFTEST_BODY_CODE, ""
+
+
+# ===========================================================================
+# M3B-TIMING correction (255-264): the F7 post-COMMIT, diagnostics-only voice-ready observation
+# window previously reused the generic -ProtocolTimeoutSeconds budget (max 15s), but the firmware's
+# own legal post-COMMIT chain (Wi-Fi IP wait up to 30s + HTTPS session up to 10s + voice READY wait
+# up to 20s = up to 60s) can legitimately exceed that -- a proven false-negative observation window,
+# not evidence of an audio/device fault. F7 now uses its own dedicated -VoiceReadyTimeoutSeconds
+# budget (default 75, bounded 65..120), fully decoupled from the pre-COMMIT protocol timeout.
+# ===========================================================================
+
+@check("255. the bridge declares a -VoiceReadyTimeoutSeconds parameter with default 75")
+def _c255():
+    return "[int]$VoiceReadyTimeoutSeconds = 75" in BRIDGE_PS1_RAW, ""
+
+
+@check("256. -VoiceReadyTimeoutSeconds validation rejects values below 65")
+def _c256():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwVoiceReadyTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-ge 65" in body, ""
+
+
+@check("257. -VoiceReadyTimeoutSeconds validation rejects values above 120")
+def _c257():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwVoiceReadyTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-le 120" in body, ""
+
+
+@check("258. the F7 post-COMMIT observation deadline uses -VoiceReadyTimeoutSeconds")
+def _c258():
+    return "$deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)" in LIVE_BRIDGE_CODE, ""
+
+
+@check("259. the F7 post-COMMIT observation block no longer references -ProtocolTimeoutSeconds anywhere -- fully decoupled from the pre-COMMIT protocol budget")
+def _c259():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1 and f7_start < finally_idx
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "ProtocolTimeoutSeconds" not in f7_body, ""
+
+
+@check("260. -ProtocolTimeoutSeconds still exists and its bound (1..15) is unchanged -- not widened to paper over the F7 false negative")
+def _c260():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwProtocolTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-ge 1 -and $Seconds -le 15" in body, ""
+
+
+@check("261. the [V2_WATCHER_PROVISION] voice: ready literal is unchanged and [M3A_BRIDGE] decision: commit remains structurally before the F7 observation block")
+def _c261():
+    marker_ok = "'[V2_WATCHER_PROVISION] voice: ready'" in LIVE_BRIDGE_CODE
+    commit_idx = LIVE_BRIDGE_CODE.find("Write-Host '[M3A_BRIDGE] decision: commit'")
+    f7_idx = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    ordered = commit_idx != -1 and f7_idx != -1 and commit_idx < f7_idx
+    return marker_ok and ordered, "marker_ok=%s commit_idx=%d f7_idx=%d" % (marker_ok, commit_idx, f7_idx)
+
+
+@check("262. the F7 observation window remains diagnostics-only and non-fatal after COMMIT -- both the READY-observed and timeout branches share one `return 0`, never `return 2`, and never emit PROVISION_ABORT")
+def _c262():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    has_true = "Write-Host '[M3A_BRIDGE] device_ready: true'" in f7_body
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in f7_body
+    has_return_zero = "return 0" in f7_body
+    no_return_two = "return 2" not in f7_body
+    no_abort = "GwMsgProvisionAbort" not in f7_body
+    return has_true and has_timeout and has_return_zero and no_return_two and no_abort, (
+        "has_true=%s has_timeout=%s has_return_zero=%s no_return_two=%s no_abort=%s" % (
+            has_true, has_timeout, has_return_zero, no_return_two, no_abort))
+
+
+@check("263. firmware GW_IP_WAIT_MS remains 30000 -- unaffected by this bridge-only correction (READ ONLY target)")
+def _c263():
+    return "GW_IP_WAIT_MS            30000" in PROVISION_C_RAW, ""
+
+
+@check("264. firmware GW_VOICE_READY_TIMEOUT_MS remains 20000 -- unaffected by this bridge-only correction (READ ONLY target)")
+def _c264():
+    return "GW_VOICE_READY_TIMEOUT_MS 20000" in PROVISION_C_RAW, ""
 
 
 if __name__ == "__main__":

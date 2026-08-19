@@ -1547,7 +1547,12 @@ function Invoke-GwSelfTest {
     # stream shows any sign of transport activity having started.
     $l9 = Invoke-GwChildProcessForSelfTest
     if ($l9.ExitCode -ne 2) { $failures.Add('live_entrypoint_child_exit_code_not_two') }
-    if ($l9.StdErr -notlike '*[M3A_BRIDGE] live mode requires -LiveAuthorized*') {
+    # Literal containment, NOT -like/-notlike: PowerShell wildcard syntax treats a `[...]` run as a character
+    # class, so a `-like '*[M3A_BRIDGE] ...*'` pattern never matches the literal bracketed `[M3A_BRIDGE]` prefix
+    # -- hermetically reproduced (BROKEN_LIKE=False, LITERAL_CONTAINS=True for the exact same string). .Contains()
+    # has no wildcard/regex semantics, so it matches the classified message's real literal text.
+    $l9ExpectedClassifiedMessage = '[M3A_BRIDGE] live mode requires -LiveAuthorized'
+    if ([string]::IsNullOrEmpty($l9.StdErr) -or -not $l9.StdErr.Contains($l9ExpectedClassifiedMessage)) {
         $failures.Add('live_entrypoint_child_stderr_missing_classified_message')
     }
     if (-not [string]::IsNullOrWhiteSpace($l9.StdOut)) {

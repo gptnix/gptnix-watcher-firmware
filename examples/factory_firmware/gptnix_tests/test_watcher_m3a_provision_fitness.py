@@ -2081,5 +2081,50 @@ def _c248():
     return ordered and fixed_message, "ordered=%s fixed_message=%s" % (ordered, fixed_message)
 
 
+# ===========================================================================
+# PR #7 L9 literal stderr assertion correction (249-254): PowerShell -like/-notlike treats a
+# `[...]` run as a wildcard character class, so `-notlike '*[M3A_BRIDGE] ...*'` never matched the
+# literal bracketed `[M3A_BRIDGE]` prefix -- hermetically reproduced (BROKEN_LIKE=False,
+# LITERAL_CONTAINS=True for the identical string). L9 now uses String.Contains(), which has no
+# wildcard/regex semantics, against a local constant byte-identical to the production entrypoint's
+# actual classified message.
+# ===========================================================================
+
+@check("249. L9's expected-classified-message assertion no longer uses -like/-notlike -- the wildcard operator whose `[...]` character-class semantics caused the proven false negative")
+def _c249():
+    body = SELFTEST_BODY_CODE
+    l9_section = body[body.index("$l9 = Invoke-GwChildProcessForSelfTest"):]
+    has_like = "-notlike" in l9_section or " -like " in l9_section
+    return not has_like, "has_like_or_notlike=%s" % has_like
+
+
+@check("250. L9's expected-classified-message assertion uses literal String.Contains() containment")
+def _c250():
+    body = SELFTEST_BODY_CODE
+    return "$l9.StdErr.Contains($l9ExpectedClassifiedMessage)" in body, ""
+
+
+@check("251. L9's expected classified message local constant is byte-identical to the production entrypoint's actual Write-GwClassifiedError -LiveAuthorized message")
+def _c251():
+    l9_literal = "$l9ExpectedClassifiedMessage = '[M3A_BRIDGE] live mode requires -LiveAuthorized'" in SELFTEST_BODY_CODE
+    production_literal = "Write-GwClassifiedError -Message '[M3A_BRIDGE] live mode requires -LiveAuthorized'" in LAUNCHER_CODE
+    return l9_literal and production_literal, "l9_literal=%s production_literal=%s" % (l9_literal, production_literal)
+
+
+@check("252. L9's child ExitCode assertion is unchanged -- still asserts exactly 2")
+def _c252():
+    return "if ($l9.ExitCode -ne 2) { $failures.Add('live_entrypoint_child_exit_code_not_two') }" in SELFTEST_BODY_CODE, ""
+
+
+@check("253. L9's child stdout-empty assertion is unchanged")
+def _c253():
+    return "live_entrypoint_child_unexpected_stdout" in SELFTEST_BODY_CODE, ""
+
+
+@check("254. L9's child transport-activity assertion is unchanged")
+def _c254():
+    return "live_entrypoint_child_unexpected_transport_activity_observed" in SELFTEST_BODY_CODE, ""
+
+
 if __name__ == "__main__":
     sys.exit(main())

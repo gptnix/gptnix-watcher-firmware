@@ -1528,11 +1528,16 @@ def _c181():
 
 @check("182. GwMaxResyncNoiseBytes is a fixed, bounded, positive constant")
 def _c182():
+    # Upper bound widened from the original 65536 to 250000 by the M3A TOKEN_STAGED RX-backlog fix: the
+    # canonical constant itself became the physically-derived 172800 (115200 baud / 10 line-bits * 15s, see
+    # check 189), which exceeds the old arbitrary guess. The invariant this check actually protects -- fixed,
+    # bounded, positive, nowhere near an unbounded/Int32.MaxValue-style value -- is unchanged and still enforced;
+    # only the specific historical magic number has been corrected to match the now-canonical value.
     m = re.search(r"\$Script:GwMaxResyncNoiseBytes\s*=\s*(\d+)", BRIDGE_PS1_RAW)
     if not m:
         return False, "constant not found"
     value = int(m.group(1))
-    return 0 < value <= 65536, "value=%d" % value
+    return 0 < value <= 250000, "value=%d" % value
 
 
 # ===========================================================================
@@ -1588,6 +1593,142 @@ def _c188():
     string_hits = [s for s in ("[string]$stagedFrame", "GetString($stagedFrame") if s in LIVE_BRIDGE_SOURCE]
     print_hits = re.findall(r"Write-(?:Host|Output)\s+\$stagedFrame\b", LIVE_BRIDGE_SOURCE)
     return not string_hits and not print_hits, "string_hits=%s print_hits=%s" % (string_hits, print_hits)
+
+
+# ===========================================================================
+# M3A TOKEN_STAGED RX-backlog fix (189-208): the -BeforeWrite RX barrier hook on
+# Receive-GwTokenFrameAndForward, and the physically-derived 172800-byte resync ceiling.
+# ===========================================================================
+
+RECEIVE_TOKEN_FRAME_SOURCE = _extract_c_function(
+    BRIDGE_PS1_RAW, "function Receive-GwTokenFrameAndForward", "function Confirm-GwDeviceTokenStaged")
+CONFIRM_TOKEN_STAGED_SOURCE = _extract_c_function(
+    BRIDGE_PS1_RAW, "function Confirm-GwDeviceTokenStaged", "function Read-GwStreamExactBounded")
+
+
+@check("189. GwMaxResyncNoiseBytes is the physically-derived 172800-byte ceiling (115200 baud / 10 line-bits * 15s), not an arbitrary retry budget")
+def _c189():
+    m = re.search(r"\$Script:GwMaxResyncNoiseBytes\s*=\s*(\d+)", BRIDGE_PS1_RAW)
+    ok = bool(m) and m.group(1) == "172800" and 115200 // 10 * 15 == 172800
+    return ok, "value=%s" % (m.group(1) if m else None)
+
+
+@check("190. the retired 512-byte resync ceiling is no longer assigned to GwMaxResyncNoiseBytes")
+def _c190():
+    hits = re.findall(r"\$Script:GwMaxResyncNoiseBytes\s*=\s*512\b", BRIDGE_PS1_RAW)
+    return len(hits) == 0, "hits=%d" % len(hits)
+
+
+@check("191. ProtocolTimeoutSeconds max remains 15 -- unchanged by this correction")
+def _c191():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwProtocolTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    ok = "-le 15" in body and "-le 16" not in body and "-le 20" not in body
+    return ok, "body_has_le_15=%s" % ("-le 15" in body)
+
+
+@check("192. default BaudRate remains 115200 -- unchanged by this correction")
+def _c192():
+    return "[int]$BaudRate = 115200" in BRIDGE_PS1_RAW, ""
+
+
+@check("193. Receive-GwTokenFrameAndForward owns the pre-write RX-barrier hook (-BeforeWrite, optional scriptblock)")
+def _c193():
+    return "[scriptblock]$BeforeWrite" in RECEIVE_TOKEN_FRAME_SOURCE, ""
+
+
+@check("194. the live RX barrier is implemented via $port.DiscardInBuffer()")
+def _c194():
+    return "$port.DiscardInBuffer()" in LIVE_BRIDGE_SOURCE, ""
+
+
+@check("195. the live path has exactly one DiscardInBuffer call site file-wide")
+def _c195():
+    hits = BRIDGE_PS1_RAW.count("$port.DiscardInBuffer()")
+    return hits == 1, "hits=%d" % hits
+
+
+@check("196. no DiscardOutBuffer call exists anywhere -- the barrier only ever discards stale RX, never TX")
+def _c196():
+    return "DiscardOutBuffer(" not in BRIDGE_PS1_RAW, ""
+
+
+@check("197. inside Receive-GwTokenFrameAndForward, the -BeforeWrite invocation is structurally before the WriteBytes invocation")
+def _c197():
+    before_idx = RECEIVE_TOKEN_FRAME_SOURCE.find("& $BeforeWrite")
+    write_idx = RECEIVE_TOKEN_FRAME_SOURCE.find("& $WriteBytes $frame")
+    ok = before_idx != -1 and write_idx != -1 and before_idx < write_idx
+    return ok, "before_idx=%d write_idx=%d" % (before_idx, write_idx)
+
+
+@check("198. the -BeforeWrite hook is invoked with zero arguments -- it never receives token/frame bytes")
+def _c198():
+    m = re.search(r"&\s+\$BeforeWrite([^\r\n]*)", RECEIVE_TOKEN_FRAME_SOURCE)
+    trailing = m.group(1).strip() if m else None
+    return bool(m) and trailing == "", "trailing=%r" % trailing
+
+
+@check("199. a malformed/incomplete backend TOKEN_FRAME cannot reach WriteBytes -- both validation throws precede the barrier/write try block")
+def _c199():
+    idx_header_throw = RECEIVE_TOKEN_FRAME_SOURCE.find('throw "gw_token_frame_invalid:')
+    idx_payload_throw = RECEIVE_TOKEN_FRAME_SOURCE.find("throw 'gw_token_frame_payload_read_failed'")
+    idx_try = RECEIVE_TOKEN_FRAME_SOURCE.find("try {")
+    ok = -1 not in (idx_header_throw, idx_payload_throw, idx_try) and idx_header_throw < idx_try and idx_payload_throw < idx_try
+    return ok, "header=%d payload=%d try=%d" % (idx_header_throw, idx_payload_throw, idx_try)
+
+
+@check("200. Confirm-GwDeviceTokenStaged's TOKEN_STAGED scanner remains deadline-owned (mandatory -Deadline), unchanged by this correction")
+def _c200():
+    ok = "[Parameter(Mandatory = $true)][datetime]$Deadline" in CONFIRM_TOKEN_STAGED_SOURCE
+    return ok, ""
+
+
+@check("201. Confirm-GwDeviceTokenStaged still returns the exact validated device header bytes -- the PR #5 exact-forwarding invariant is unaffected by this correction")
+def _c201():
+    return "return [byte[]]$parsed.Header" in CONFIRM_TOKEN_STAGED_SOURCE, ""
+
+
+@check("202. Invoke-GwLiveBridge's live path still contains zero New-GwFrame(TOKEN_STAGED) reconstruction calls -- regression of the PR #5 fix")
+def _c202():
+    hits = LIVE_BRIDGE_SOURCE.count("New-GwFrame -Type $Script:GwMsgTokenStaged")
+    return hits == 0, "hits=%d" % hits
+
+
+@check("203. DtrEnable remains false -- unchanged by this correction")
+def _c203():
+    return "$port.DtrEnable = $false" in LIVE_BRIDGE_SOURCE, ""
+
+
+@check("204. RtsEnable remains false -- unchanged by this correction")
+def _c204():
+    return "$port.RtsEnable = $false" in LIVE_BRIDGE_SOURCE, ""
+
+
+@check("205. the bridge still starts the backend SSH process only after a real device BRIDGE_READY -- Wait-GwBridgeReady precedes Start-GwBackendProcess")
+def _c205():
+    idx_ready = LIVE_BRIDGE_SOURCE.find("Wait-GwBridgeReady -ReadByte $readDeviceByte")
+    idx_ssh = LIVE_BRIDGE_SOURCE.find("Start-GwBackendProcess -SshTarget")
+    ok = idx_ready != -1 and idx_ssh != -1 and idx_ready < idx_ssh
+    return ok, "ready_idx=%d ssh_idx=%d" % (idx_ready, idx_ssh)
+
+
+@check("206. the RX barrier closure and hook never stringify/convert the token/frame material they run alongside")
+def _c206():
+    hits = [s for s in ("[string]$discardDeviceInput", "GetString($discardDeviceInput", "$discardDeviceInput.ToString(") if s in BRIDGE_PS1_RAW]
+    return not hits, "hits=%s" % hits
+
+
+@check("207. the device_rx_barrier failure label is a fixed non-interpolated string literal -- never echoes the caller's raw exception or transport internals")
+def _c207():
+    m = re.search(r"Write-Error\s+('[^'\n]*device_rx_barrier[^'\n]*')", LIVE_BRIDGE_SOURCE)
+    literal = m.group(1) if m else None
+    ok = bool(m) and "$" not in literal
+    return ok, "literal=%r" % literal
+
+
+@check("208. the RX barrier path never writes a temp file, sets an environment variable, or otherwise persists token/frame material")
+def _c208():
+    hits = [s for s in ("Out-File", "Set-Content", "[System.IO.File]::Write", "$env:") if s in RECEIVE_TOKEN_FRAME_SOURCE]
+    return not hits, "hits=%s" % hits
 
 
 if __name__ == "__main__":

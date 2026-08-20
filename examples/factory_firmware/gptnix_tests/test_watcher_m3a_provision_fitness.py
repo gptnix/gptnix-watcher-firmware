@@ -2207,5 +2207,197 @@ def _c264():
     return "GW_VOICE_READY_TIMEOUT_MS 20000" in PROVISION_C_RAW, ""
 
 
+# ===========================================================================
+# M3B safe post-COMMIT diagnostics correction (265-286): the F7 observer previously discarded every safe
+# firmware terminal/WSS classification line the physical attempt #1 root-cause audit proved was needed but
+# NOT_RECOVERABLE. F7 now additionally recognizes a FIXED allowlist of already-existing safe firmware markers
+# and surfaces them as this bridge's own normalized `[M3A_BRIDGE] voice_diag: ...` strings -- never a raw
+# serial echo, never persisted, never able to influence device_ready/exit-code/COMMIT/ABORT semantics.
+# ===========================================================================
+
+SAFE_DIAG_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwSafeFirmwareDiagnosticLine", "function New-GwSafeFirmwareDiagnosticState")
+SAFE_DIAG_STATE_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function New-GwSafeFirmwareDiagnosticState", "function Push-GwSafeFirmwareDiagnosticByte")
+SAFE_DIAG_PUSH_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Push-GwSafeFirmwareDiagnosticByte", "function Wait-GwBridgeReady")
+
+
+@check("265. GwSafeDiagnosticLineMaxBytes exists and equals 256")
+def _c265():
+    return "$Script:GwSafeDiagnosticLineMaxBytes = 256" in BRIDGE_PS1_RAW, ""
+
+
+@check("266. Resolve-GwSafeFirmwareDiagnosticLine exists exactly once")
+def _c266():
+    n = BRIDGE_PS1_CODE.count("function Resolve-GwSafeFirmwareDiagnosticLine")
+    return n == 1, "count=%d" % n
+
+
+@check("267. New-GwSafeFirmwareDiagnosticState exists exactly once")
+def _c267():
+    n = BRIDGE_PS1_CODE.count("function New-GwSafeFirmwareDiagnosticState")
+    return n == 1, "count=%d" % n
+
+
+@check("268. Push-GwSafeFirmwareDiagnosticByte exists exactly once")
+def _c268():
+    n = BRIDGE_PS1_CODE.count("function Push-GwSafeFirmwareDiagnosticByte")
+    return n == 1, "count=%d" % n
+
+
+@check("269. all eight normalized `[M3A_BRIDGE] voice_diag: ...` event shapes are present")
+def _c269():
+    body = BRIDGE_PS1_CODE
+    required = [
+        "[M3A_BRIDGE] voice_diag: session_http_200",
+        "[M3A_BRIDGE] voice_diag: session_ready setup_bytes=",
+        "[M3A_BRIDGE] voice_diag: ws_connected",
+        "[M3A_BRIDGE] voice_diag: ws_setup_sent",
+        "[M3A_BRIDGE] voice_diag: ws_ready",
+        "[M3A_BRIDGE] voice_diag: ws_error type=",
+        "[M3A_BRIDGE] voice_diag: ws_closed",
+        "[M3A_BRIDGE] voice_diag: terminal_code=",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+@check("270. the terminal-code diagnostic parser is bounded to 0..16")
+def _c270():
+    body = SAFE_DIAG_HELPER_CODE
+    return "$code -ge 0 -and $code -le 16" in body, ""
+
+
+@check("271. the setup_bytes diagnostic parser is bounded to 1..32767")
+def _c271():
+    body = SAFE_DIAG_HELPER_CODE
+    return "$setupBytes -ge 1 -and $setupBytes -le 32767" in body, ""
+
+
+@check("272. F7 constructs exactly one diagnostic state before its observation loop")
+def _c272():
+    body = LIVE_BRIDGE_CODE
+    n = body.count("New-GwSafeFirmwareDiagnosticState")
+    idx_state = body.find("$diagnosticState = New-GwSafeFirmwareDiagnosticState")
+    idx_loop = body.find("while ((Get-Date) -lt $deadline)")
+    ordered = idx_state != -1 and idx_loop != -1 and idx_state < idx_loop
+    return n == 1 and ordered, "count=%d ordered=%s" % (n, ordered)
+
+
+@check("273. F7 feeds the same already-read UART byte to the diagnostic byte helper -- never a second serial read")
+def _c273():
+    body = LIVE_BRIDGE_CODE
+    return "Push-GwSafeFirmwareDiagnosticByte -State $diagnosticState -Byte ([byte]$b)" in body, ""
+
+
+@check("274. F7 prints only the normalized helper return value via Write-Host -- never a raw serial line, never Write-Output/Write-Error for diagnostics")
+def _c274():
+    body = LIVE_BRIDGE_CODE
+    prints_normalized = "Write-Host $safeDiagnostic" in body
+    no_raw_echo = "Write-Host $b" not in body and "Write-Host $line" not in body and "Write-Host $rawLine" not in body
+    return prints_normalized and no_raw_echo, "prints_normalized=%s no_raw_echo=%s" % (prints_normalized, no_raw_echo)
+
+
+@check("275. F7 still uses the exact existing voice-ready marker, unchanged by the diagnostics correction")
+def _c275():
+    return "'[V2_WATCHER_PROVISION] voice: ready'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("276. F7 still uses -VoiceReadyTimeoutSeconds for its deadline, unchanged by the diagnostics correction")
+def _c276():
+    return "$deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)" in LIVE_BRIDGE_CODE, ""
+
+
+@check("277. F7's post-COMMIT observation block still contains no -ProtocolTimeoutSeconds reference")
+def _c277():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1 and f7_start < finally_idx
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "ProtocolTimeoutSeconds" not in f7_body, ""
+
+
+@check("278. F7 still emits both device_ready true and device_ready timeout, unchanged by the diagnostics correction")
+def _c278():
+    has_true = "Write-Host '[M3A_BRIDGE] device_ready: true'" in LIVE_BRIDGE_CODE
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in LIVE_BRIDGE_CODE
+    return has_true and has_timeout, "has_true=%s has_timeout=%s" % (has_true, has_timeout)
+
+
+@check("279. F7 still shares one `return 0` after the observation loop and contains no `return 2` -- diagnostics cannot turn a successful COMMIT into a failure")
+def _c279():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "return 0" in f7_body and "return 2" not in f7_body, ""
+
+
+@check("280. F7 contains no GwMsgProvisionAbort reference -- diagnostics cannot originate a bridge ABORT")
+def _c280():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "GwMsgProvisionAbort" not in f7_body, ""
+
+
+@check("281. the bridge live exit-code contract remains exactly {0, 2}, unchanged by the diagnostics correction")
+def _c281():
+    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in BRIDGE_PS1_RAW, ""
+
+
+@check("282. firmware GW_VOICE_READY_TIMEOUT_MS remains 20000 -- READ ONLY target, unaffected by this bridge-only correction")
+def _c282():
+    return "GW_VOICE_READY_TIMEOUT_MS 20000" in PROVISION_C_RAW, ""
+
+
+@check("283. firmware terminal log format remains `[V2_WATCHER_PROVISION] terminal: code=%d` -- READ ONLY target, the exact source shape the new parser consumes")
+def _c283():
+    return '"[V2_WATCHER_PROVISION] terminal: code=%d"' in PROVISION_C_RAW, ""
+
+
+@check("284. firmware WSS safe-log source strings remain the canonical shapes the new parser consumes -- READ ONLY target")
+def _c284():
+    voice_c_path = os.path.join(FACTORY_DIR, "main", "app", "app_gptnix_watcher_voice.c")
+    voice_c_raw = _read(voice_c_path) if os.path.isfile(voice_c_path) else ""
+    required = [
+        '"[V2_WATCHER_PROVISION] session: http_200"',
+        '"[V2_WATCHER_VOICE] session_ready: setup_bytes=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: connected"',
+        '"[V2_WATCHER_VOICE] ws_state: setup_sent"',
+        '"[V2_WATCHER_VOICE] ws_state: ready"',
+        '"[V2_WATCHER_VOICE] ws_error: type=%d status=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: closed"',
+    ]
+    combined = PROVISION_C_RAW + voice_c_raw
+    missing = [s for s in required if s not in combined]
+    return not missing, "missing=%s" % missing
+
+
+@check("285. no new file path or persistence primitive is introduced anywhere in the F7 diagnostics addition")
+def _c285():
+    body = SAFE_DIAG_HELPER_CODE + SAFE_DIAG_STATE_CODE + SAFE_DIAG_PUSH_CODE
+    hits = [s for s in ("New-Item", "Out-File", "Set-Content", "Add-Content", "[System.IO.File]", "Export-") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("286. the existing Windows -SelfTest includes overflow, injection, unknown-line, and CRLF safe-diagnostic cases")
+def _c286():
+    body = SELFTEST_BODY_CODE
+    required = [
+        "safe_diag_overflow_suppressed_until_newline",
+        "safe_diag_recovery_after_overflow_newline",
+        "safe_diag_crlf_single_emit",
+        "safe_diag_suffix_injection_rejected",
+        "safe_diag_prefix_injection_rejected",
+        "safe_diag_unknown_line_suppressed",
+        "safe_diag_token_like_line_suppressed",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
 if __name__ == "__main__":
     sys.exit(main())

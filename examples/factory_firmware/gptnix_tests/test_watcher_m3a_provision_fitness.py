@@ -2215,6 +2215,10 @@ def _c264():
 # serial echo, never persisted, never able to influence device_ready/exit-code/COMMIT/ABORT semantics.
 # ===========================================================================
 
+SAFE_DIAG_PAYLOAD_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwSafeDiagnosticPayload", "function Resolve-GwEspIdfDiagnosticPayload")
+SAFE_DIAG_ENVELOPE_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwEspIdfDiagnosticPayload", "function Resolve-GwSafeFirmwareDiagnosticLine")
 SAFE_DIAG_HELPER_CODE = _extract_c_function(
     BRIDGE_PS1_CODE, "function Resolve-GwSafeFirmwareDiagnosticLine", "function New-GwSafeFirmwareDiagnosticState")
 SAFE_DIAG_STATE_CODE = _extract_c_function(
@@ -2263,15 +2267,15 @@ def _c269():
     return not missing, "missing=%s" % missing
 
 
-@check("270. the terminal-code diagnostic parser is bounded to 0..16")
+@check("270. the terminal-code diagnostic parser is bounded to 0..16 -- owned by the single canonical Resolve-GwSafeDiagnosticPayload allowlist, reused by both the bare and ESP-IDF envelope acceptance paths")
 def _c270():
-    body = SAFE_DIAG_HELPER_CODE
+    body = SAFE_DIAG_PAYLOAD_CODE
     return "$code -ge 0 -and $code -le 16" in body, ""
 
 
-@check("271. the setup_bytes diagnostic parser is bounded to 1..32767")
+@check("271. the setup_bytes diagnostic parser is bounded to 1..32767 -- owned by the single canonical Resolve-GwSafeDiagnosticPayload allowlist, reused by both the bare and ESP-IDF envelope acceptance paths")
 def _c271():
-    body = SAFE_DIAG_HELPER_CODE
+    body = SAFE_DIAG_PAYLOAD_CODE
     return "$setupBytes -ge 1 -and $setupBytes -le 32767" in body, ""
 
 
@@ -2397,6 +2401,117 @@ def _c286():
     ]
     missing = [s for s in required if s not in body]
     return not missing, "missing=%s" % missing
+
+
+# ===========================================================================
+# M3B PR#8 ESP-IDF diagnostic envelope correction (287-298): the prior safe-diagnostics correction's parser
+# only recognized a bare payload line, but ESP_LOGI/ESP_LOGW render "<I|W> (<timestamp>) <tag>: <payload>"
+# (plus an optional bounded ANSI SGR wrapper) on the real physical UART -- a proven false-green coverage gap
+# (290/290 + Windows SelfTest PASS while emitting zero voice_diag lines on the real device). The parser now
+# additionally recognizes that exact envelope via Resolve-GwEspIdfDiagnosticPayload, reusing the SAME
+# Resolve-GwSafeDiagnosticPayload allowlist owner the bare path already used -- never a parallel parser.
+# ===========================================================================
+
+@check("287. realistic ESP-IDF envelope SelfTest fixtures exist for all eight canonical diagnostic markers")
+def _c287():
+    body = SELFTEST_BODY_CODE
+    required = [
+        "safe_diag_esp_envelope_http_200", "safe_diag_esp_envelope_terminal",
+        "safe_diag_esp_envelope_session_ready", "safe_diag_esp_envelope_ws_connected",
+        "safe_diag_esp_envelope_ws_setup_sent", "safe_diag_esp_envelope_ws_ready",
+        "safe_diag_esp_envelope_ws_error", "safe_diag_esp_envelope_ws_closed",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+@check("288. an ANSI-wrapped ESP-IDF envelope fixture exists for both Info and Warning severities, using distinct SGR prefixes -- not one hardcoded color")
+def _c288():
+    body = SELFTEST_BODY_CODE
+    has_info = "safe_diag_esp_envelope_ansi" in body and "0;32m" in body
+    has_warn = "safe_diag_esp_envelope_ansi_warn" in body and "0;33m" in body
+    return has_info and has_warn, "has_info=%s has_warn=%s" % (has_info, has_warn)
+
+
+@check("289. a wrong-tag rejection fixture exists")
+def _c289():
+    return "safe_diag_wrong_tag_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("290. a wrong-severity rejection fixture exists")
+def _c290():
+    return "safe_diag_wrong_severity_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("291. a wrong-timestamp-syntax rejection fixture exists")
+def _c291():
+    return "safe_diag_wrong_timestamp_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("292. an embedded-ANSI-inside-payload rejection fixture exists")
+def _c292():
+    return "safe_diag_embedded_ansi_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("293. the ESP-IDF envelope parser requires an exact V2_WATCHER_PROVISION or V2_WATCHER_VOICE tag -- no arbitrary tag name")
+def _c293():
+    body = SAFE_DIAG_ENVELOPE_CODE
+    return "(V2_WATCHER_PROVISION|V2_WATCHER_VOICE)" in body, ""
+
+
+@check("294. the ESP-IDF envelope parser distinguishes I (Info) vs W (Warning) severity and cross-checks it against the payload's own expected severity -- a correct payload under the wrong severity is rejected")
+def _c294():
+    envelope_severity_capture = "([IW]) \\(" in SAFE_DIAG_ENVELOPE_CODE
+    orchestrator_checks_severity = "$envelope.Severity -cne $payloadMatch.ExpectedSeverity" in SAFE_DIAG_HELPER_CODE
+    payload_owner_sets_severity = "ExpectedSeverity = 'W'" in SAFE_DIAG_PAYLOAD_CODE and "ExpectedSeverity = 'I'" in SAFE_DIAG_PAYLOAD_CODE
+    return envelope_severity_capture and orchestrator_checks_severity and payload_owner_sets_severity, (
+        "envelope_severity_capture=%s orchestrator_checks_severity=%s payload_owner_sets_severity=%s" % (
+            envelope_severity_capture, orchestrator_checks_severity, payload_owner_sets_severity))
+
+
+@check("295. Resolve-GwSafeFirmwareDiagnosticLine still never returns/echoes the raw input line -- every return path is either $null or a fixed normalized string from the single canonical Resolve-GwSafeDiagnosticPayload owner")
+def _c295():
+    body = SAFE_DIAG_HELPER_CODE
+    returns_raw_line = "return $Line" in body or "return $envelope" in body
+    only_normalized_or_null = "return $bareMatch.Normalized" in body and "return $payloadMatch.Normalized" in body
+    return not returns_raw_line and only_normalized_or_null, (
+        "returns_raw_line=%s only_normalized_or_null=%s" % (returns_raw_line, only_normalized_or_null))
+
+
+@check("296. F7 remains a single-reader, same-byte observer -- the diagnostic accumulator is fed the exact same already-read $b as the ready-marker scanner, never a second serial read")
+def _c296():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    n_readbyte = f7_body.count("$port.ReadByte()")
+    feeds_same_byte = "Push-GwSafeFirmwareDiagnosticByte -State $diagnosticState -Byte ([byte]$b)" in f7_body
+    return n_readbyte == 1 and feeds_same_byte, "n_readbyte=%d feeds_same_byte=%s" % (n_readbyte, feeds_same_byte)
+
+
+@check("297. the bridge live exit-code contract remains exactly {0, 2}, unchanged by the ESP-IDF envelope correction")
+def _c297():
+    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in BRIDGE_PS1_RAW, ""
+
+
+@check("298. firmware source remains READ ONLY -- unaffected by this bridge-only ESP-IDF envelope correction (both C/H files and canonical log strings unchanged)")
+def _c298():
+    voice_c_path = os.path.join(FACTORY_DIR, "main", "app", "app_gptnix_watcher_voice.c")
+    voice_c_raw = _read(voice_c_path) if os.path.isfile(voice_c_path) else ""
+    required = [
+        '"[V2_WATCHER_PROVISION] session: http_200"',
+        '"[V2_WATCHER_PROVISION] terminal: code=%d"',
+        '"[V2_WATCHER_VOICE] session_ready: setup_bytes=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: connected"',
+        '"[V2_WATCHER_VOICE] ws_state: setup_sent"',
+        '"[V2_WATCHER_VOICE] ws_state: ready"',
+        '"[V2_WATCHER_VOICE] ws_error: type=%d status=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: closed"',
+    ]
+    combined = PROVISION_C_RAW + voice_c_raw
+    missing = [s for s in required if s not in combined]
+    tag_ok = 'static const char *TAG = "V2_WATCHER_PROVISION"' in PROVISION_C_RAW and 'static const char *TAG = "V2_WATCHER_VOICE"' in voice_c_raw
+    return not missing and tag_ok, "missing=%s tag_ok=%s" % (missing, tag_ok)
 
 
 if __name__ == "__main__":

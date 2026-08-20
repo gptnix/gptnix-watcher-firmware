@@ -419,59 +419,126 @@ function Test-GwByteArrayEqual {
 # unrecognized/oversized line can never be held in memory indefinitely or matched by a truncated suffix.
 $Script:GwSafeDiagnosticLineMaxBytes = 256
 
-function Resolve-GwSafeFirmwareDiagnosticLine {
-    <# Pure, directly testable, zero side effects (no print/file/network): takes ONE already-decoded
-       post-COMMIT firmware log line and returns either a single normalized `[M3A_BRIDGE] voice_diag: ...`
-       string or $null. Never returns the raw input line, never partially echoes it, never throws on a
-       malformed/unrecognized line. Accepts ONLY the fixed set of already-existing safe firmware markers,
-       via exact (case-sensitive) whole-line matching -- no prefix, no suffix, no partial/concatenated match,
-       and no case-insensitive smuggling. `switch -CaseSensitive` is used deliberately instead of a `@{}`
+function Resolve-GwSafeDiagnosticPayload {
+    <# Pure, zero side effects: the SINGLE canonical allowlist/bounded-integer owner for a candidate diagnostic
+       PAYLOAD string (never a full raw UART line) -- reused identically by both the bare-fixture path and the
+       real ESP-IDF envelope path in Resolve-GwSafeFirmwareDiagnosticLine below, so there is never a second/
+       parallel allowlist. Returns a PSCustomObject with Normalized/ExpectedTag/ExpectedSeverity fields on an
+       exact (case-sensitive) match, or $null. `switch -CaseSensitive` is used deliberately instead of a `@{}`
        hashtable literal: PowerShell hashtables perform case-INSENSITIVE string-key lookups by default, which
        would silently defeat the case-sensitive matching this parser requires. The three parameterized markers
        (session_ready/ws_error/terminal) are matched via a fixed anchored pattern with a bounded integer
-       capture, never a generic/open regex. #>
-    param([string]$Line)
+       capture, never a generic/open regex. Never returns the raw input. #>
+    param([string]$Payload)
 
-    if ([string]::IsNullOrEmpty($Line)) { return $null }
-
-    # Fixed, non-secret allowlist of already-existing safe firmware diagnostic markers this observer is
-    # allowed to surface. This is a fixed technical log-contract table, never semantic/routing logic. Every
-    # returned value here is this bridge's OWN literal, non-secret string -- the output is always one of these
-    # fixed forms (or a bounded-integer variant below), never any part of the raw input line.
-    switch -CaseSensitive ($Line) {
-        '[V2_WATCHER_PROVISION] session: http_200' { return '[M3A_BRIDGE] voice_diag: session_http_200' }
-        '[V2_WATCHER_VOICE] ws_state: connected' { return '[M3A_BRIDGE] voice_diag: ws_connected' }
-        '[V2_WATCHER_VOICE] ws_state: setup_sent' { return '[M3A_BRIDGE] voice_diag: ws_setup_sent' }
-        '[V2_WATCHER_VOICE] ws_state: ready' { return '[M3A_BRIDGE] voice_diag: ws_ready' }
-        '[V2_WATCHER_VOICE] ws_state: closed' { return '[M3A_BRIDGE] voice_diag: ws_closed' }
+    switch -CaseSensitive ($Payload) {
+        '[V2_WATCHER_PROVISION] session: http_200' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: session_http_200'; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: connected' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_connected'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: setup_sent' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_setup_sent'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: ready' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_ready'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: closed' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_closed'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
     }
 
-    if ($Line -cmatch '^\[V2_WATCHER_VOICE\] session_ready: setup_bytes=(\d{1,5})$') {
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] session_ready: setup_bytes=(\d{1,5})$') {
         $setupBytes = [int]$Matches[1]
         if ($setupBytes -ge 1 -and $setupBytes -le 32767) {
-            return "[M3A_BRIDGE] voice_diag: session_ready setup_bytes=$setupBytes"
+            return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: session_ready setup_bytes=$setupBytes"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
         }
         return $null
     }
 
-    if ($Line -cmatch '^\[V2_WATCHER_VOICE\] ws_error: type=(-?\d{1,11}) status=(-?\d{1,11})$') {
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] ws_error: type=(-?\d{1,11}) status=(-?\d{1,11})$') {
         [int]$errType = 0
         [int]$errStatus = 0
         if (-not [int]::TryParse($Matches[1], [ref]$errType)) { return $null }
         if (-not [int]::TryParse($Matches[2], [ref]$errStatus)) { return $null }
-        return "[M3A_BRIDGE] voice_diag: ws_error type=$errType status=$errStatus"
+        return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: ws_error type=$errType status=$errStatus"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'W' }
     }
 
-    if ($Line -cmatch '^\[V2_WATCHER_PROVISION\] terminal: code=(-?\d{1,11})$') {
+    if ($Payload -cmatch '^\[V2_WATCHER_PROVISION\] terminal: code=(-?\d{1,11})$') {
         [int]$code = 0
         if (-not [int]::TryParse($Matches[1], [ref]$code)) { return $null }
         if ($code -ge 0 -and $code -le 16) {
-            return "[M3A_BRIDGE] voice_diag: terminal_code=$code"
+            return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: terminal_code=$code"; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
         }
         return $null
     }
 
     return $null
+}
+
+function Resolve-GwEspIdfDiagnosticPayload {
+    <# Pure, zero side effects: validates a decoded post-COMMIT UART line against the narrow, explicit physical
+       ESP-IDF log envelope this firmware's own ESP_LOGI/ESP_LOGW calls actually render on the console --
+       "[optional ANSI SGR]<I|W> (<decimal timestamp>) <tag>: <payload>[optional ANSI reset]" (ESP-IDF's
+       LOG_COLOR_x/LOG_RESET_COLOR macros: both are compiled to the empty string when CONFIG_LOG_COLORS is
+       off, or to a real bounded SGR/reset pair when it is on -- this parser accepts either, never assumes
+       one specific color value). Strips AT MOST one leading, syntactically bounded SGR sequence and AT MOST
+       one trailing `ESC[0m` reset -- both explicitly matched, never a generic ANSI stripper. Any ESC (0x1B)
+       byte still present in the candidate after that single strip is a hard reject, which also deterministically
+       rejects embedded/multiple ANSI injection. Returns a PSCustomObject with Severity/Tag/Payload on a
+       well-formed envelope, or $null. Never returns/echoes the raw input line. #>
+    param([string]$Line)
+
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+
+    $candidate = $Line
+
+    if ($candidate -cmatch '^\x1b\[[0-9;]{1,15}m') {
+        $candidate = $candidate.Substring($Matches[0].Length)
+    }
+    if ($candidate -cmatch '\x1b\[0m$') {
+        $candidate = $candidate.Substring(0, $candidate.Length - $Matches[0].Length)
+    }
+    if ($candidate.IndexOf([char]0x1b) -ge 0) { return $null }
+
+    if ($candidate -cmatch '^([IW]) \((\d{1,10})\) (V2_WATCHER_PROVISION|V2_WATCHER_VOICE): (.+)$') {
+        return [PSCustomObject]@{
+            Severity = $Matches[1]
+            Tag      = $Matches[3]
+            Payload  = $Matches[4]
+        }
+    }
+
+    return $null
+}
+
+function Resolve-GwSafeFirmwareDiagnosticLine {
+    <# Pure, directly testable, zero side effects (no print/file/network): takes ONE already-decoded
+       post-COMMIT firmware log line and returns either a single normalized `[M3A_BRIDGE] voice_diag: ...`
+       string or $null. Never returns the raw input line, never partially echoes it, never throws on a
+       malformed/unrecognized line. Two acceptance paths, BOTH reusing the SAME Resolve-GwSafeDiagnosticPayload
+       allowlist owner -- never a parallel/duplicated allowlist: (1) the bare canonical payload form, kept only
+       for fixture/regression compatibility; (2) the real physical ESP-IDF UART envelope
+       (Resolve-GwEspIdfDiagnosticPayload), which is authoritative for the actual device and additionally
+       requires the envelope's own tag/severity to exactly match the payload's expected tag/severity -- so a
+       correct payload under the wrong tag or wrong severity is rejected, never silently accepted. #>
+    param([string]$Line)
+
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+
+    $bareMatch = Resolve-GwSafeDiagnosticPayload -Payload $Line
+    if ($null -ne $bareMatch) { return $bareMatch.Normalized }
+
+    $envelope = Resolve-GwEspIdfDiagnosticPayload -Line $Line
+    if ($null -eq $envelope) { return $null }
+
+    $payloadMatch = Resolve-GwSafeDiagnosticPayload -Payload $envelope.Payload
+    if ($null -eq $payloadMatch) { return $null }
+    if ($envelope.Tag -cne $payloadMatch.ExpectedTag) { return $null }
+    if ($envelope.Severity -cne $payloadMatch.ExpectedSeverity) { return $null }
+
+    return $payloadMatch.Normalized
 }
 
 function New-GwSafeFirmwareDiagnosticState {
@@ -1802,6 +1869,51 @@ function Invoke-GwSelfTest {
     if ($null -ne (Push-GwSafeFirmwareDiagnosticByte -State $crlfState -Byte 13)) { $crlfEmitCount++ }
     if ($null -ne (Push-GwSafeFirmwareDiagnosticByte -State $crlfState -Byte 10)) { $crlfEmitCount++ }
     if ($crlfEmitCount -ne 1) { $failures.Add('safe_diag_crlf_single_emit') }
+
+    # M3B ESP-IDF envelope correction: realistic physical UART line shapes -- "<I|W> (<timestamp>) <tag>:
+    # <payload>", NOT bare-payload-only fixtures -- built from explicit character codes, never dependent on
+    # host terminal coloring. Proves the SAME Resolve-GwSafeFirmwareDiagnosticLine owner recognizes the actual
+    # ESP_LOGI/ESP_LOGW rendered envelope this firmware's own console output uses.
+    $espEnvelopeCases = @(
+        @{ Line = 'I (1234) V2_WATCHER_PROVISION: [V2_WATCHER_PROVISION] session: http_200'; Expected = '[M3A_BRIDGE] voice_diag: session_http_200'; Failure = 'safe_diag_esp_envelope_http_200' }
+        @{ Line = 'I (1234) V2_WATCHER_PROVISION: [V2_WATCHER_PROVISION] terminal: code=7'; Expected = '[M3A_BRIDGE] voice_diag: terminal_code=7'; Failure = 'safe_diag_esp_envelope_terminal' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] session_ready: setup_bytes=1234'; Expected = '[M3A_BRIDGE] voice_diag: session_ready setup_bytes=1234'; Failure = 'safe_diag_esp_envelope_session_ready' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Expected = '[M3A_BRIDGE] voice_diag: ws_connected'; Failure = 'safe_diag_esp_envelope_ws_connected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: setup_sent'; Expected = '[M3A_BRIDGE] voice_diag: ws_setup_sent'; Failure = 'safe_diag_esp_envelope_ws_setup_sent' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: ready'; Expected = '[M3A_BRIDGE] voice_diag: ws_ready'; Failure = 'safe_diag_esp_envelope_ws_ready' }
+        @{ Line = 'W (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006'; Expected = '[M3A_BRIDGE] voice_diag: ws_error type=4 status=1006'; Failure = 'safe_diag_esp_envelope_ws_error' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: closed'; Expected = '[M3A_BRIDGE] voice_diag: ws_closed'; Failure = 'safe_diag_esp_envelope_ws_closed' }
+    )
+    foreach ($case in $espEnvelopeCases) {
+        if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $case.Line) -ne $case.Expected) { $failures.Add($case.Failure) }
+    }
+
+    # ANSI-wrapped envelope: a leading SGR sequence plus a trailing reset -- one Info case (green, 0;32) and
+    # the Warning case with a syntactically different, equally valid SGR prefix (0;33). The parser validates
+    # BOUNDED SGR syntax, never one hardcoded color value -- ESP-IDF's own LOG_COLOR_I/LOG_COLOR_W differ.
+    $ansiInfoLine = "$([char]27)[0;32mI (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected$([char]27)[0m"
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $ansiInfoLine) -ne '[M3A_BRIDGE] voice_diag: ws_connected') {
+        $failures.Add('safe_diag_esp_envelope_ansi')
+    }
+    $ansiWarnLine = "$([char]27)[0;33mW (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006$([char]27)[0m"
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $ansiWarnLine) -ne '[M3A_BRIDGE] voice_diag: ws_error type=4 status=1006') {
+        $failures.Add('safe_diag_esp_envelope_ansi_warn')
+    }
+
+    # Negative envelope fixtures -- each must be rejected ($null), never partially/incorrectly accepted.
+    $negativeEnvelopeCases = @(
+        @{ Line = 'I (1234) view: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_tag_rejected' }
+        @{ Line = 'W (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_severity_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006'; Failure = 'safe_diag_wrong_severity_ws_error_rejected' }
+        @{ Line = 'I (12x34) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_timestamp_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE[V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_missing_separator_rejected' }
+        @{ Line = "I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state:$([char]27)[31m connected"; Failure = 'safe_diag_embedded_ansi_rejected' }
+        @{ Line = 'SECRET I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_envelope_prefix_injection_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected EXTRA'; Failure = 'safe_diag_envelope_suffix_injection_rejected' }
+    )
+    foreach ($case in $negativeEnvelopeCases) {
+        if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line $case.Line)) { $failures.Add($case.Failure) }
+    }
 
     return $failures.ToArray()
 }

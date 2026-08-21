@@ -570,6 +570,15 @@ static void s_ws_event_handler(void *handler_args,
     }
 
     case WEBSOCKET_EVENT_DATA: {
+        // M3B diagnostic (plans/M3B_GEMINI_AUTHTOKEN_SCHEMA_CHILD_TASK.md follow-up): fires before ANY of
+        // the validation checks below, since several early `break`s can exit before the setup_reply
+        // diagnostic (added further down) is ever reached. Logs only non-secret frame metadata (state
+        // enum value, byte counts, fin/opcode) -- never the raw payload content.
+        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_data: state=%d null=%d op=%d fin=%d plen=%d poff=%d dlen=%d",
+            (int)ctx->state, (int)(data == NULL),
+            data ? (int)data->op_code : -1, data ? (int)data->fin : -1,
+            data ? (int)data->payload_len : -1, data ? (int)data->payload_offset : -1,
+            data ? (int)data->data_len : -1);
         if (data == NULL) break;
 
         if (ctx->state == GPTNIX_WATCHER_VOICE_STATE_READY) {
@@ -593,7 +602,14 @@ static void s_ws_event_handler(void *handler_args,
         }
 
         if (data->payload_offset == 0) {
-            if (data->op_code != 0x01 /* WS text frame opcode */) {
+            // M3B fix (plans/M3B_GEMINI_AUTHTOKEN_SCHEMA_CHILD_TASK.md follow-up): the original assumption
+            // that Gemini's setupComplete reply arrives as a WS TEXT frame (opcode 0x01) only was never
+            // proven against the real live API (M2 had no prior physical proof). A live physical attempt,
+            // once M3B's other root causes were fixed, showed Gemini actually sends it as a BINARY frame
+            // (opcode 0x02) -- proven via the ws_data diagnostic (opcode value logged, non-secret). The
+            // payload itself is still parsed identically either way (UTF-8 JSON text, decoded via cJSON) --
+            // only the WS framing opcode differs, so both are accepted for this JSON-parsing path.
+            if (data->op_code != 0x01 /* WS text frame opcode */ && data->op_code != 0x02 /* WS binary frame opcode */) {
                 ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
                 ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;
                 break;
@@ -648,10 +664,10 @@ static void s_ws_event_handler(void *handler_args,
             bool full_consumption = (reply != NULL)
                 && (parse_end == (const char *)ctx->rx_buf + ctx->rx_accumulated);
             bool is_setup_complete = false;
+            int key_count = 0;
+            bool has_setup_complete_key = false;
 
             if (full_consumption && cJSON_IsObject(reply)) {
-                int key_count = 0;
-                bool has_setup_complete_key = false;
                 cJSON *child = NULL;
                 cJSON_ArrayForEach(child, reply) {
                     key_count++;
@@ -667,6 +683,14 @@ static void s_ws_event_handler(void *handler_args,
                 }
                 is_setup_complete = (key_count == 1) && has_setup_complete_key;
             }
+            // M3B diagnostic (plans/M3B_GEMINI_AUTHTOKEN_SCHEMA_CHILD_TASK.md follow-up): the setup-response
+            // acceptance contract is locked to EXACTLY {"setupComplete":{}} -- if Gemini's current response
+            // shape has drifted (extra/renamed keys), this fires silently as a generic PROTOCOL_ERROR with no
+            // detail. Logs only structural, non-secret integers: whether parsing/full-consumption succeeded,
+            // key count, and whether the setupComplete key was found -- never the raw JSON content.
+            ESP_LOGI(TAG, "[V2_WATCHER_VOICE] setup_reply: parsed=%d full=%d obj=%d keys=%d has_sc=%d",
+                (int)(reply != NULL), (int)full_consumption, (int)(full_consumption && cJSON_IsObject(reply)),
+                key_count, (int)has_setup_complete_key);
             if (reply != NULL) {
                 cJSON_Delete(reply);
             }

@@ -35,7 +35,13 @@ WORKFLOW_YML = os.path.join(REPO_ROOT, ".github", "workflows", "gptnix-firmware-
 # runtime -- CI uses fetch-depth: 1.
 PROTECTED_M3A_BLOBS = {
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.c":
-        "c20f9d1934879a8b645aa462e15de49304cd7329",
+        # M3B fix (plans/M3B_GEMINI_AUTHTOKEN_SCHEMA_CHILD_TASK.md follow-up): updated to add a safe,
+        # integer-only diagnostic (setup_reply: parsed/full/obj/keys/has_sc) inside WEBSOCKET_EVENT_DATA's
+        # setupComplete acceptance check -- the locked contract itself (accepts ONLY {"setupComplete":{}})
+        # is unchanged; this only adds visibility into WHY a real Gemini response gets rejected, proven
+        # necessary by a live physical attempt reaching terminal_code=16 (VOICE_RUNTIME_ERROR) with zero
+        # prior diagnostic detail once M3B's first two root causes were fixed.
+        "76f238b331448ce52d4f45d52b524c07fdb0b776",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         "85399fa916407ab9d8602b62d8a7cc6946b5ec40",
     "examples/factory_firmware/main/app/app_wifi.c":

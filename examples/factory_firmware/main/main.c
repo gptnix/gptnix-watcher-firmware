@@ -262,7 +262,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create(&app_event_loop_args, &app_event_loop_handle));
 
     // app modules init
-    xTaskCreatePinnedToCore(task_app_init, "task_app_init", 4096, NULL, 4, NULL, 1);
+    // M3B fix (plans/M3B_HTTP_BUFFER_TX_CHILD_TASK.md follow-up): 4096 bytes was too small for
+    // task_app_init's stack once app_gptnix_watcher_provision_run() (full HTTPS POST + cert bundle
+    // verification + cJSON) runs on it, layered on top of every other app_*_init() call before it.
+    // TLS/mbedTLS operations are stack-hungry; the buffer_size_tx fix alone did not resolve the M3B
+    // session-POST stall, and known ESP-IDF community reports describe exactly this class of subtle
+    // stall/corruption (not a clean panic) from HTTPS operations on an undersized task stack.
+    xTaskCreatePinnedToCore(task_app_init, "task_app_init", 8192, NULL, 4, NULL, 1);
 
 #ifdef CONFIG_FREERTOS_USE_TRACE_FACILITY
     char *buffer = psram_calloc(1, 4096);

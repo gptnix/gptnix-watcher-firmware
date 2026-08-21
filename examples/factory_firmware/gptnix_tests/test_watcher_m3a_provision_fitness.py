@@ -1034,8 +1034,17 @@ def _c113():
     live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
     idx_bind = live_body.find("$readBackendExact = {")
     idx_forward = live_body.find("Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact")
-    bound_between = "Read-GwStreamExactBounded" in live_body[idx_bind:idx_forward] if idx_bind != -1 and idx_forward != -1 else False
-    return idx_bind != -1 and idx_forward != -1 and bound_between, ""
+    if idx_bind == -1 or idx_forward == -1:
+        return False, ""
+    closure_body = live_body[idx_bind:idx_forward]
+    direct = "Read-GwStreamExactBounded" in closure_body
+    # Bare-name resolution inside .GetNewClosure() throws CommandNotFoundException when the bridge is
+    # invoked via `& scriptPath` from an already-running parent script (proven via a live physical
+    # failure, not a hypothesis) -- the corrected pattern binds the function reference via
+    # ${function:...} before defining the closure, then invokes it through that bound reference.
+    ref_match = re.search(r"\$(\w+) = \$\{function:Read-GwStreamExactBounded\}", live_body[:idx_bind])
+    via_ref = bool(ref_match) and ("& $%s " % ref_match.group(1)) in closure_body
+    return direct or via_ref, "direct=%s via_ref=%s" % (direct, via_ref)
 
 
 @check("114. no old naked unbounded backend stream read remains anywhere in the file")
@@ -1257,8 +1266,16 @@ def _c144():
 
 @check("145. live TOKEN_FRAME reads pass the same $proc into the bounded helper")
 def _c145():
-    n = len(re.findall(r"Read-GwStreamExactBounded -Stream \$outStream -Process \$proc", LIVE_BRIDGE_SOURCE))
-    return n == 2, "found %d (expect header-read closure + decision-read closure)" % n
+    direct = len(re.findall(r"Read-GwStreamExactBounded -Stream \$outStream -Process \$proc", LIVE_BRIDGE_SOURCE))
+    # Corrected pattern (see check 113): bare-name resolution fails inside .GetNewClosure() when the
+    # bridge is invoked via `& scriptPath` from a parent script (proven live) -- each closure instead
+    # invokes a pre-bound function reference captured via ${function:Read-GwStreamExactBounded}.
+    ref_names = re.findall(r"\$(\w+) = \$\{function:Read-GwStreamExactBounded\}", LIVE_BRIDGE_SOURCE)
+    via_ref = 0
+    for name in ref_names:
+        via_ref += len(re.findall(r"& \$%s -Stream \$outStream -Process \$proc" % re.escape(name), LIVE_BRIDGE_SOURCE))
+    n = direct + via_ref
+    return n == 2, "found %d (direct=%d via_ref=%d, expect header-read closure + decision-read closure)" % (n, direct, via_ref)
 
 
 @check("146. TOKEN_FRAME header and payload still share exactly one Stopwatch")
@@ -1902,12 +1919,12 @@ def _c224():
     return n == 1, "count=%d (expected exactly 1, inside Write-GwClassifiedError's own body)" % n
 
 
-@check("225. Write-GwClassifiedError is invoked from exactly 12 call sites file-wide -- the 11 real production classified-failure paths plus the L8 SelfTest synthetic invoker")
+@check("225. Write-GwClassifiedError is invoked from exactly 13 call sites file-wide -- the 12 real production classified-failure paths (11 pre-existing plus the new -VoiceReadyTimeoutSeconds entrypoint validation) plus the L8 SelfTest synthetic invoker")
 def _c225():
     n = BRIDGE_PS1_CODE.count("Write-GwClassifiedError -Message")
     n_production = LIVE_BRIDGE_CODE.count("Write-GwClassifiedError -Message") + LAUNCHER_CODE.count(
         "Write-GwClassifiedError -Message") + RESOLVE_EXIT_HELPER_CODE.count("Write-GwClassifiedError -Message")
-    return n == 12 and n_production == 11, "count=%d n_production=%d" % (n, n_production)
+    return n == 13 and n_production == 12, "count=%d n_production=%d" % (n, n_production)
 
 
 @check("226. the device_ready timeout classified failure uses Write-GwClassifiedError")
@@ -1927,10 +1944,10 @@ def _c228():
     return "Write-GwClassifiedError -Message '[M3A_BRIDGE] backend_decision: malformed'" in LIVE_BRIDGE_CODE, ""
 
 
-@check("229. all six top-level entrypoint argument-validation classified failures use Write-GwClassifiedError")
+@check("229. all seven top-level entrypoint argument-validation classified failures (the six pre-existing plus the new -VoiceReadyTimeoutSeconds bounds check) use Write-GwClassifiedError")
 def _c229():
     n = LAUNCHER_CODE.count("Write-GwClassifiedError -Message")
-    return n == 6, "count=%d" % n
+    return n == 7, "count=%d" % n
 
 
 @check("230. Resolve-GwLiveBridgeExitCode's malformed-result path uses Write-GwClassifiedError, consistent with every other classified call site")
@@ -2124,6 +2141,394 @@ def _c253():
 @check("254. L9's child transport-activity assertion is unchanged")
 def _c254():
     return "live_entrypoint_child_unexpected_transport_activity_observed" in SELFTEST_BODY_CODE, ""
+
+
+# ===========================================================================
+# M3B-TIMING correction (255-264): the F7 post-COMMIT, diagnostics-only voice-ready observation
+# window previously reused the generic -ProtocolTimeoutSeconds budget (max 15s), but the firmware's
+# own legal post-COMMIT chain (Wi-Fi IP wait up to 30s + HTTPS session up to 10s + voice READY wait
+# up to 20s = up to 60s) can legitimately exceed that -- a proven false-negative observation window,
+# not evidence of an audio/device fault. F7 now uses its own dedicated -VoiceReadyTimeoutSeconds
+# budget (default 75, bounded 65..120), fully decoupled from the pre-COMMIT protocol timeout.
+# ===========================================================================
+
+@check("255. the bridge declares a -VoiceReadyTimeoutSeconds parameter with default 75")
+def _c255():
+    return "[int]$VoiceReadyTimeoutSeconds = 75" in BRIDGE_PS1_RAW, ""
+
+
+@check("256. -VoiceReadyTimeoutSeconds validation rejects values below 65")
+def _c256():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwVoiceReadyTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-ge 65" in body, ""
+
+
+@check("257. -VoiceReadyTimeoutSeconds validation rejects values above 120")
+def _c257():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwVoiceReadyTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-le 120" in body, ""
+
+
+@check("258. the F7 post-COMMIT observation deadline uses -VoiceReadyTimeoutSeconds")
+def _c258():
+    return "$deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)" in LIVE_BRIDGE_CODE, ""
+
+
+@check("259. the F7 post-COMMIT observation block no longer references -ProtocolTimeoutSeconds anywhere -- fully decoupled from the pre-COMMIT protocol budget")
+def _c259():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1 and f7_start < finally_idx
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "ProtocolTimeoutSeconds" not in f7_body, ""
+
+
+@check("260. -ProtocolTimeoutSeconds still exists and its bound (1..15) is unchanged -- not widened to paper over the F7 false negative")
+def _c260():
+    body = _extract_c_function(BRIDGE_PS1_RAW, "function Test-GwProtocolTimeoutSecondsValid", "function Test-GwByteArrayEqual")
+    return "-ge 1 -and $Seconds -le 15" in body, ""
+
+
+@check("261. the [V2_WATCHER_PROVISION] voice: ready literal is unchanged and [M3A_BRIDGE] decision: commit remains structurally before the F7 observation block")
+def _c261():
+    marker_ok = "'[V2_WATCHER_PROVISION] voice: ready'" in LIVE_BRIDGE_CODE
+    commit_idx = LIVE_BRIDGE_CODE.find("Write-Host '[M3A_BRIDGE] decision: commit'")
+    f7_idx = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    ordered = commit_idx != -1 and f7_idx != -1 and commit_idx < f7_idx
+    return marker_ok and ordered, "marker_ok=%s commit_idx=%d f7_idx=%d" % (marker_ok, commit_idx, f7_idx)
+
+
+@check("262. the F7 observation window remains diagnostics-only and non-fatal after COMMIT -- both the READY-observed and timeout branches share one `return 0`, never `return 2`, and never emit PROVISION_ABORT")
+def _c262():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    has_true = "Write-Host '[M3A_BRIDGE] device_ready: true'" in f7_body
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in f7_body
+    has_return_zero = "return 0" in f7_body
+    no_return_two = "return 2" not in f7_body
+    no_abort = "GwMsgProvisionAbort" not in f7_body
+    return has_true and has_timeout and has_return_zero and no_return_two and no_abort, (
+        "has_true=%s has_timeout=%s has_return_zero=%s no_return_two=%s no_abort=%s" % (
+            has_true, has_timeout, has_return_zero, no_return_two, no_abort))
+
+
+@check("263. firmware GW_IP_WAIT_MS remains 30000 -- unaffected by this bridge-only correction (READ ONLY target)")
+def _c263():
+    return "GW_IP_WAIT_MS            30000" in PROVISION_C_RAW, ""
+
+
+@check("264. firmware GW_VOICE_READY_TIMEOUT_MS remains 20000 -- unaffected by this bridge-only correction (READ ONLY target)")
+def _c264():
+    return "GW_VOICE_READY_TIMEOUT_MS 20000" in PROVISION_C_RAW, ""
+
+
+# ===========================================================================
+# M3B safe post-COMMIT diagnostics correction (265-286): the F7 observer previously discarded every safe
+# firmware terminal/WSS classification line the physical attempt #1 root-cause audit proved was needed but
+# NOT_RECOVERABLE. F7 now additionally recognizes a FIXED allowlist of already-existing safe firmware markers
+# and surfaces them as this bridge's own normalized `[M3A_BRIDGE] voice_diag: ...` strings -- never a raw
+# serial echo, never persisted, never able to influence device_ready/exit-code/COMMIT/ABORT semantics.
+# ===========================================================================
+
+SAFE_DIAG_PAYLOAD_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwSafeDiagnosticPayload", "function Resolve-GwEspIdfDiagnosticPayload")
+SAFE_DIAG_ENVELOPE_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwEspIdfDiagnosticPayload", "function Resolve-GwSafeFirmwareDiagnosticLine")
+SAFE_DIAG_HELPER_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Resolve-GwSafeFirmwareDiagnosticLine", "function New-GwSafeFirmwareDiagnosticState")
+SAFE_DIAG_STATE_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function New-GwSafeFirmwareDiagnosticState", "function Push-GwSafeFirmwareDiagnosticByte")
+SAFE_DIAG_PUSH_CODE = _extract_c_function(
+    BRIDGE_PS1_CODE, "function Push-GwSafeFirmwareDiagnosticByte", "function Wait-GwBridgeReady")
+
+
+@check("265. GwSafeDiagnosticLineMaxBytes exists and equals 256")
+def _c265():
+    return "$Script:GwSafeDiagnosticLineMaxBytes = 256" in BRIDGE_PS1_RAW, ""
+
+
+@check("266. Resolve-GwSafeFirmwareDiagnosticLine exists exactly once")
+def _c266():
+    n = BRIDGE_PS1_CODE.count("function Resolve-GwSafeFirmwareDiagnosticLine")
+    return n == 1, "count=%d" % n
+
+
+@check("267. New-GwSafeFirmwareDiagnosticState exists exactly once")
+def _c267():
+    n = BRIDGE_PS1_CODE.count("function New-GwSafeFirmwareDiagnosticState")
+    return n == 1, "count=%d" % n
+
+
+@check("268. Push-GwSafeFirmwareDiagnosticByte exists exactly once")
+def _c268():
+    n = BRIDGE_PS1_CODE.count("function Push-GwSafeFirmwareDiagnosticByte")
+    return n == 1, "count=%d" % n
+
+
+@check("269. all eight normalized `[M3A_BRIDGE] voice_diag: ...` event shapes are present")
+def _c269():
+    body = BRIDGE_PS1_CODE
+    required = [
+        "[M3A_BRIDGE] voice_diag: session_http_200",
+        "[M3A_BRIDGE] voice_diag: session_ready setup_bytes=",
+        "[M3A_BRIDGE] voice_diag: ws_connected",
+        "[M3A_BRIDGE] voice_diag: ws_setup_sent",
+        "[M3A_BRIDGE] voice_diag: ws_ready",
+        "[M3A_BRIDGE] voice_diag: ws_error type=",
+        "[M3A_BRIDGE] voice_diag: ws_closed",
+        "[M3A_BRIDGE] voice_diag: terminal_code=",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+@check("270. the terminal-code diagnostic parser is bounded to 0..16 -- owned by the single canonical Resolve-GwSafeDiagnosticPayload allowlist, reused by both the bare and ESP-IDF envelope acceptance paths")
+def _c270():
+    body = SAFE_DIAG_PAYLOAD_CODE
+    return "$code -ge 0 -and $code -le 16" in body, ""
+
+
+@check("271. the setup_bytes diagnostic parser is bounded to 1..32767 -- owned by the single canonical Resolve-GwSafeDiagnosticPayload allowlist, reused by both the bare and ESP-IDF envelope acceptance paths")
+def _c271():
+    body = SAFE_DIAG_PAYLOAD_CODE
+    return "$setupBytes -ge 1 -and $setupBytes -le 32767" in body, ""
+
+
+@check("272. F7 constructs exactly one diagnostic state before its observation loop")
+def _c272():
+    body = LIVE_BRIDGE_CODE
+    n = body.count("New-GwSafeFirmwareDiagnosticState")
+    idx_state = body.find("$diagnosticState = New-GwSafeFirmwareDiagnosticState")
+    idx_loop = body.find("while ((Get-Date) -lt $deadline)")
+    ordered = idx_state != -1 and idx_loop != -1 and idx_state < idx_loop
+    return n == 1 and ordered, "count=%d ordered=%s" % (n, ordered)
+
+
+@check("273. F7 feeds the same already-read UART byte to the diagnostic byte helper -- never a second serial read")
+def _c273():
+    body = LIVE_BRIDGE_CODE
+    return "Push-GwSafeFirmwareDiagnosticByte -State $diagnosticState -Byte ([byte]$b)" in body, ""
+
+
+@check("274. F7 prints only the normalized helper return value via Write-Host -- never a raw serial line, never Write-Output/Write-Error for diagnostics")
+def _c274():
+    body = LIVE_BRIDGE_CODE
+    prints_normalized = "Write-Host $safeDiagnostic" in body
+    no_raw_echo = "Write-Host $b" not in body and "Write-Host $line" not in body and "Write-Host $rawLine" not in body
+    return prints_normalized and no_raw_echo, "prints_normalized=%s no_raw_echo=%s" % (prints_normalized, no_raw_echo)
+
+
+@check("275. F7 still uses the exact existing voice-ready marker, unchanged by the diagnostics correction")
+def _c275():
+    return "'[V2_WATCHER_PROVISION] voice: ready'" in LIVE_BRIDGE_CODE, ""
+
+
+@check("276. F7 still uses -VoiceReadyTimeoutSeconds for its deadline, unchanged by the diagnostics correction")
+def _c276():
+    return "$deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)" in LIVE_BRIDGE_CODE, ""
+
+
+@check("277. F7's post-COMMIT observation block still contains no -ProtocolTimeoutSeconds reference")
+def _c277():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1 and f7_start < finally_idx
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "ProtocolTimeoutSeconds" not in f7_body, ""
+
+
+@check("278. F7 still emits both device_ready true and device_ready timeout, unchanged by the diagnostics correction")
+def _c278():
+    has_true = "Write-Host '[M3A_BRIDGE] device_ready: true'" in LIVE_BRIDGE_CODE
+    has_timeout = "Write-Host '[M3A_BRIDGE] device_ready: timeout'" in LIVE_BRIDGE_CODE
+    return has_true and has_timeout, "has_true=%s has_timeout=%s" % (has_true, has_timeout)
+
+
+@check("279. F7 still shares one `return 0` after the observation loop and contains no `return 2` -- diagnostics cannot turn a successful COMMIT into a failure")
+def _c279():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "return 0" in f7_body and "return 2" not in f7_body, ""
+
+
+@check("280. F7 contains no GwMsgProvisionAbort reference -- diagnostics cannot originate a bridge ABORT")
+def _c280():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    return "GwMsgProvisionAbort" not in f7_body, ""
+
+
+@check("281. the bridge live exit-code contract remains exactly {0, 2}, unchanged by the diagnostics correction")
+def _c281():
+    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in BRIDGE_PS1_RAW, ""
+
+
+@check("282. firmware GW_VOICE_READY_TIMEOUT_MS remains 20000 -- READ ONLY target, unaffected by this bridge-only correction")
+def _c282():
+    return "GW_VOICE_READY_TIMEOUT_MS 20000" in PROVISION_C_RAW, ""
+
+
+@check("283. firmware terminal log format remains `[V2_WATCHER_PROVISION] terminal: code=%d` -- READ ONLY target, the exact source shape the new parser consumes")
+def _c283():
+    return '"[V2_WATCHER_PROVISION] terminal: code=%d"' in PROVISION_C_RAW, ""
+
+
+@check("284. firmware WSS safe-log source strings remain the canonical shapes the new parser consumes -- READ ONLY target")
+def _c284():
+    voice_c_path = os.path.join(FACTORY_DIR, "main", "app", "app_gptnix_watcher_voice.c")
+    voice_c_raw = _read(voice_c_path) if os.path.isfile(voice_c_path) else ""
+    required = [
+        '"[V2_WATCHER_PROVISION] session: http_200"',
+        '"[V2_WATCHER_VOICE] session_ready: setup_bytes=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: connected"',
+        '"[V2_WATCHER_VOICE] ws_state: setup_sent"',
+        '"[V2_WATCHER_VOICE] ws_state: ready"',
+        '"[V2_WATCHER_VOICE] ws_error: type=%d status=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: closed"',
+    ]
+    combined = PROVISION_C_RAW + voice_c_raw
+    missing = [s for s in required if s not in combined]
+    return not missing, "missing=%s" % missing
+
+
+@check("285. no new file path or persistence primitive is introduced anywhere in the F7 diagnostics addition")
+def _c285():
+    body = SAFE_DIAG_HELPER_CODE + SAFE_DIAG_STATE_CODE + SAFE_DIAG_PUSH_CODE
+    hits = [s for s in ("New-Item", "Out-File", "Set-Content", "Add-Content", "[System.IO.File]", "Export-") if s in body]
+    return not hits, "found=%s" % hits
+
+
+@check("286. the existing Windows -SelfTest includes overflow, injection, unknown-line, and CRLF safe-diagnostic cases")
+def _c286():
+    body = SELFTEST_BODY_CODE
+    required = [
+        "safe_diag_overflow_suppressed_until_newline",
+        "safe_diag_recovery_after_overflow_newline",
+        "safe_diag_crlf_single_emit",
+        "safe_diag_suffix_injection_rejected",
+        "safe_diag_prefix_injection_rejected",
+        "safe_diag_unknown_line_suppressed",
+        "safe_diag_token_like_line_suppressed",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+# ===========================================================================
+# M3B PR#8 ESP-IDF diagnostic envelope correction (287-298): the prior safe-diagnostics correction's parser
+# only recognized a bare payload line, but ESP_LOGI/ESP_LOGW render "<I|W> (<timestamp>) <tag>: <payload>"
+# (plus an optional bounded ANSI SGR wrapper) on the real physical UART -- a proven false-green coverage gap
+# (290/290 + Windows SelfTest PASS while emitting zero voice_diag lines on the real device). The parser now
+# additionally recognizes that exact envelope via Resolve-GwEspIdfDiagnosticPayload, reusing the SAME
+# Resolve-GwSafeDiagnosticPayload allowlist owner the bare path already used -- never a parallel parser.
+# ===========================================================================
+
+@check("287. realistic ESP-IDF envelope SelfTest fixtures exist for all eight canonical diagnostic markers")
+def _c287():
+    body = SELFTEST_BODY_CODE
+    required = [
+        "safe_diag_esp_envelope_http_200", "safe_diag_esp_envelope_terminal",
+        "safe_diag_esp_envelope_session_ready", "safe_diag_esp_envelope_ws_connected",
+        "safe_diag_esp_envelope_ws_setup_sent", "safe_diag_esp_envelope_ws_ready",
+        "safe_diag_esp_envelope_ws_error", "safe_diag_esp_envelope_ws_closed",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+@check("288. an ANSI-wrapped ESP-IDF envelope fixture exists for both Info and Warning severities, using distinct SGR prefixes -- not one hardcoded color")
+def _c288():
+    body = SELFTEST_BODY_CODE
+    has_info = "safe_diag_esp_envelope_ansi" in body and "0;32m" in body
+    has_warn = "safe_diag_esp_envelope_ansi_warn" in body and "0;33m" in body
+    return has_info and has_warn, "has_info=%s has_warn=%s" % (has_info, has_warn)
+
+
+@check("289. a wrong-tag rejection fixture exists")
+def _c289():
+    return "safe_diag_wrong_tag_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("290. a wrong-severity rejection fixture exists")
+def _c290():
+    return "safe_diag_wrong_severity_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("291. a wrong-timestamp-syntax rejection fixture exists")
+def _c291():
+    return "safe_diag_wrong_timestamp_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("292. an embedded-ANSI-inside-payload rejection fixture exists")
+def _c292():
+    return "safe_diag_embedded_ansi_rejected" in SELFTEST_BODY_CODE, ""
+
+
+@check("293. the ESP-IDF envelope parser requires an exact V2_WATCHER_PROVISION or V2_WATCHER_VOICE tag -- no arbitrary tag name")
+def _c293():
+    body = SAFE_DIAG_ENVELOPE_CODE
+    return "(V2_WATCHER_PROVISION|V2_WATCHER_VOICE)" in body, ""
+
+
+@check("294. the ESP-IDF envelope parser distinguishes I (Info) vs W (Warning) severity and cross-checks it against the payload's own expected severity -- a correct payload under the wrong severity is rejected")
+def _c294():
+    envelope_severity_capture = "([IW]) \\(" in SAFE_DIAG_ENVELOPE_CODE
+    orchestrator_checks_severity = "$envelope.Severity -cne $payloadMatch.ExpectedSeverity" in SAFE_DIAG_HELPER_CODE
+    payload_owner_sets_severity = "ExpectedSeverity = 'W'" in SAFE_DIAG_PAYLOAD_CODE and "ExpectedSeverity = 'I'" in SAFE_DIAG_PAYLOAD_CODE
+    return envelope_severity_capture and orchestrator_checks_severity and payload_owner_sets_severity, (
+        "envelope_severity_capture=%s orchestrator_checks_severity=%s payload_owner_sets_severity=%s" % (
+            envelope_severity_capture, orchestrator_checks_severity, payload_owner_sets_severity))
+
+
+@check("295. Resolve-GwSafeFirmwareDiagnosticLine still never returns/echoes the raw input line -- every return path is either $null or a fixed normalized string from the single canonical Resolve-GwSafeDiagnosticPayload owner")
+def _c295():
+    body = SAFE_DIAG_HELPER_CODE
+    returns_raw_line = "return $Line" in body or "return $envelope" in body
+    only_normalized_or_null = "return $bareMatch.Normalized" in body and "return $payloadMatch.Normalized" in body
+    return not returns_raw_line and only_normalized_or_null, (
+        "returns_raw_line=%s only_normalized_or_null=%s" % (returns_raw_line, only_normalized_or_null))
+
+
+@check("296. F7 remains a single-reader, same-byte observer -- the diagnostic accumulator is fed the exact same already-read $b as the ready-marker scanner, never a second serial read")
+def _c296():
+    f7_start = LIVE_BRIDGE_CODE.find("$marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')")
+    finally_idx = LIVE_BRIDGE_CODE.find("} finally {")
+    assert f7_start != -1 and finally_idx != -1
+    f7_body = LIVE_BRIDGE_CODE[f7_start:finally_idx]
+    n_readbyte = f7_body.count("$port.ReadByte()")
+    feeds_same_byte = "Push-GwSafeFirmwareDiagnosticByte -State $diagnosticState -Byte ([byte]$b)" in f7_body
+    return n_readbyte == 1 and feeds_same_byte, "n_readbyte=%d feeds_same_byte=%s" % (n_readbyte, feeds_same_byte)
+
+
+@check("297. the bridge live exit-code contract remains exactly {0, 2}, unchanged by the ESP-IDF envelope correction")
+def _c297():
+    return "$Script:GwLiveBridgeExitCodes = @(0, 2)" in BRIDGE_PS1_RAW, ""
+
+
+@check("298. firmware source remains READ ONLY -- unaffected by this bridge-only ESP-IDF envelope correction (both C/H files and canonical log strings unchanged)")
+def _c298():
+    voice_c_path = os.path.join(FACTORY_DIR, "main", "app", "app_gptnix_watcher_voice.c")
+    voice_c_raw = _read(voice_c_path) if os.path.isfile(voice_c_path) else ""
+    required = [
+        '"[V2_WATCHER_PROVISION] session: http_200"',
+        '"[V2_WATCHER_PROVISION] terminal: code=%d"',
+        '"[V2_WATCHER_VOICE] session_ready: setup_bytes=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: connected"',
+        '"[V2_WATCHER_VOICE] ws_state: setup_sent"',
+        '"[V2_WATCHER_VOICE] ws_state: ready"',
+        '"[V2_WATCHER_VOICE] ws_error: type=%d status=%d"',
+        '"[V2_WATCHER_VOICE] ws_state: closed"',
+    ]
+    combined = PROVISION_C_RAW + voice_c_raw
+    missing = [s for s in required if s not in combined]
+    tag_ok = 'static const char *TAG = "V2_WATCHER_PROVISION"' in PROVISION_C_RAW and 'static const char *TAG = "V2_WATCHER_VOICE"' in voice_c_raw
+    return not missing and tag_ok, "missing=%s tag_ok=%s" % (missing, tag_ok)
 
 
 if __name__ == "__main__":

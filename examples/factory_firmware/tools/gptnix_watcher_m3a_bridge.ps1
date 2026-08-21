@@ -57,9 +57,17 @@
     gives up and refuses to start the backend SSH session. Default 60.
 
 .PARAMETER ProtocolTimeoutSeconds
-    Bounded wait for each subsequent protocol exchange (TOKEN_STAGED,
-    PROVISION_COMMIT/ABORT, the diagnostic device-READY observation window).
-    Default 15.
+    Bounded wait for each subsequent pre-COMMIT protocol exchange (TOKEN_STAGED,
+    PROVISION_COMMIT/ABORT). Default 15.
+
+.PARAMETER VoiceReadyTimeoutSeconds
+    Bounded, diagnostics-only wait for the post-COMMIT device READY marker
+    ("[V2_WATCHER_PROVISION] voice: ready"). Never part of COMMIT/security
+    semantics -- a timeout here is diagnostic only and never turns an
+    already-successful COMMIT into a failure. Separate from
+    -ProtocolTimeoutSeconds because the firmware's own legal post-COMMIT
+    voice-ready chain (Wi-Fi IP wait + HTTPS session + voice READY wait) can
+    take up to 60s, well beyond the pre-COMMIT protocol budget. Default 75.
 #>
 [CmdletBinding()]
 param(
@@ -69,7 +77,8 @@ param(
     [string]$SshTarget = '',
     [int]$BaudRate = 115200,
     [int]$DeviceReadyTimeoutSeconds = 60,
-    [int]$ProtocolTimeoutSeconds = 15
+    [int]$ProtocolTimeoutSeconds = 15,
+    [int]$VoiceReadyTimeoutSeconds = 75
 )
 
 $ErrorActionPreference = 'Stop'
@@ -386,6 +395,16 @@ function Test-GwProtocolTimeoutSecondsValid {
     return ($Seconds -ge 1 -and $Seconds -le 15)
 }
 
+function Test-GwVoiceReadyTimeoutSecondsValid {
+    <# Pure, directly testable: -VoiceReadyTimeoutSeconds must cover the firmware's own legal
+       post-COMMIT worst-case voice-ready chain (GW_IP_WAIT_MS=30000 + GW_HTTP_TIMEOUT_MS=10000 +
+       GW_VOICE_READY_TIMEOUT_MS=20000 = 60000ms) plus a minimum 5s safety margin -- hence 65 as the
+       floor. 120 is an upper sanity bound so the diagnostics-only F7 window can never grow
+       unbounded. Used by both the script entry point and the self-test. #>
+    param([int]$Seconds)
+    return ($Seconds -ge 65 -and $Seconds -le 120)
+}
+
 function Test-GwByteArrayEqual {
     param([byte[]]$A, [byte[]]$B)
     if ($A.Length -ne $B.Length) { return $false }
@@ -393,6 +412,181 @@ function Test-GwByteArrayEqual {
         if ($A[$i] -ne $B[$i]) { return $false }
     }
     return $true
+}
+
+# Bounded post-COMMIT diagnostic line-parsing budget -- NOT a protocol-frame limit. Any single accumulated
+# line longer than this is discarded whole (see Push-GwSafeFirmwareDiagnosticByte); it exists solely so an
+# unrecognized/oversized line can never be held in memory indefinitely or matched by a truncated suffix.
+$Script:GwSafeDiagnosticLineMaxBytes = 256
+
+function Resolve-GwSafeDiagnosticPayload {
+    <# Pure, zero side effects: the SINGLE canonical allowlist/bounded-integer owner for a candidate diagnostic
+       PAYLOAD string (never a full raw UART line) -- reused identically by both the bare-fixture path and the
+       real ESP-IDF envelope path in Resolve-GwSafeFirmwareDiagnosticLine below, so there is never a second/
+       parallel allowlist. Returns a PSCustomObject with Normalized/ExpectedTag/ExpectedSeverity fields on an
+       exact (case-sensitive) match, or $null. `switch -CaseSensitive` is used deliberately instead of a `@{}`
+       hashtable literal: PowerShell hashtables perform case-INSENSITIVE string-key lookups by default, which
+       would silently defeat the case-sensitive matching this parser requires. The three parameterized markers
+       (session_ready/ws_error/terminal) are matched via a fixed anchored pattern with a bounded integer
+       capture, never a generic/open regex. Never returns the raw input. #>
+    param([string]$Payload)
+
+    switch -CaseSensitive ($Payload) {
+        '[V2_WATCHER_PROVISION] session: http_200' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: session_http_200'; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: connected' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_connected'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: setup_sent' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_setup_sent'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: ready' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_ready'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        '[V2_WATCHER_VOICE] ws_state: closed' {
+            return [PSCustomObject]@{ Normalized = '[M3A_BRIDGE] voice_diag: ws_closed'; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] session_ready: setup_bytes=(\d{1,5})$') {
+        $setupBytes = [int]$Matches[1]
+        if ($setupBytes -ge 1 -and $setupBytes -le 32767) {
+            return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: session_ready setup_bytes=$setupBytes"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+        }
+        return $null
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] ws_error: type=(-?\d{1,11}) status=(-?\d{1,11})$') {
+        [int]$errType = 0
+        [int]$errStatus = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$errType)) { return $null }
+        if (-not [int]::TryParse($Matches[2], [ref]$errStatus)) { return $null }
+        return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: ws_error type=$errType status=$errStatus"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'W' }
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_PROVISION\] terminal: code=(-?\d{1,11})$') {
+        [int]$code = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$code)) { return $null }
+        if ($code -ge 0 -and $code -le 16) {
+            return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: terminal_code=$code"; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
+        }
+        return $null
+    }
+
+    return $null
+}
+
+function Resolve-GwEspIdfDiagnosticPayload {
+    <# Pure, zero side effects: validates a decoded post-COMMIT UART line against the narrow, explicit physical
+       ESP-IDF log envelope this firmware's own ESP_LOGI/ESP_LOGW calls actually render on the console --
+       "[optional ANSI SGR]<I|W> (<decimal timestamp>) <tag>: <payload>[optional ANSI reset]" (ESP-IDF's
+       LOG_COLOR_x/LOG_RESET_COLOR macros: both are compiled to the empty string when CONFIG_LOG_COLORS is
+       off, or to a real bounded SGR/reset pair when it is on -- this parser accepts either, never assumes
+       one specific color value). Strips AT MOST one leading, syntactically bounded SGR sequence and AT MOST
+       one trailing `ESC[0m` reset -- both explicitly matched, never a generic ANSI stripper. Any ESC (0x1B)
+       byte still present in the candidate after that single strip is a hard reject, which also deterministically
+       rejects embedded/multiple ANSI injection. Returns a PSCustomObject with Severity/Tag/Payload on a
+       well-formed envelope, or $null. Never returns/echoes the raw input line. #>
+    param([string]$Line)
+
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+
+    $candidate = $Line
+
+    if ($candidate -cmatch '^\x1b\[[0-9;]{1,15}m') {
+        $candidate = $candidate.Substring($Matches[0].Length)
+    }
+    if ($candidate -cmatch '\x1b\[0m$') {
+        $candidate = $candidate.Substring(0, $candidate.Length - $Matches[0].Length)
+    }
+    if ($candidate.IndexOf([char]0x1b) -ge 0) { return $null }
+
+    if ($candidate -cmatch '^([IW]) \((\d{1,10})\) (V2_WATCHER_PROVISION|V2_WATCHER_VOICE): (.+)$') {
+        return [PSCustomObject]@{
+            Severity = $Matches[1]
+            Tag      = $Matches[3]
+            Payload  = $Matches[4]
+        }
+    }
+
+    return $null
+}
+
+function Resolve-GwSafeFirmwareDiagnosticLine {
+    <# Pure, directly testable, zero side effects (no print/file/network): takes ONE already-decoded
+       post-COMMIT firmware log line and returns either a single normalized `[M3A_BRIDGE] voice_diag: ...`
+       string or $null. Never returns the raw input line, never partially echoes it, never throws on a
+       malformed/unrecognized line. Two acceptance paths, BOTH reusing the SAME Resolve-GwSafeDiagnosticPayload
+       allowlist owner -- never a parallel/duplicated allowlist: (1) the bare canonical payload form, kept only
+       for fixture/regression compatibility; (2) the real physical ESP-IDF UART envelope
+       (Resolve-GwEspIdfDiagnosticPayload), which is authoritative for the actual device and additionally
+       requires the envelope's own tag/severity to exactly match the payload's expected tag/severity -- so a
+       correct payload under the wrong tag or wrong severity is rejected, never silently accepted. #>
+    param([string]$Line)
+
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+
+    $bareMatch = Resolve-GwSafeDiagnosticPayload -Payload $Line
+    if ($null -ne $bareMatch) { return $bareMatch.Normalized }
+
+    $envelope = Resolve-GwEspIdfDiagnosticPayload -Line $Line
+    if ($null -eq $envelope) { return $null }
+
+    $payloadMatch = Resolve-GwSafeDiagnosticPayload -Payload $envelope.Payload
+    if ($null -eq $payloadMatch) { return $null }
+    if ($envelope.Tag -cne $payloadMatch.ExpectedTag) { return $null }
+    if ($envelope.Severity -cne $payloadMatch.ExpectedSeverity) { return $null }
+
+    return $payloadMatch.Normalized
+}
+
+function New-GwSafeFirmwareDiagnosticState {
+    <# Bounded, non-persistent line-accumulation state for the F7 post-COMMIT safe-diagnostic observer. Holds
+       only a bounded in-memory byte buffer for the CURRENT line being assembled -- never a file, never a
+       growing/unbounded string. #>
+    return [PSCustomObject]@{
+        Bytes    = New-Object System.Collections.Generic.List[byte]
+        Overflow = $false
+    }
+}
+
+function Push-GwSafeFirmwareDiagnosticByte {
+    <# Consumes ONE already-read post-COMMIT UART byte. Returns a normalized safe diagnostic string on a
+       completed, recognized line (CR or LF boundary), or $null otherwise. Never prints, never writes a file,
+       never makes a network call, never persists raw line bytes beyond the current in-progress line. An
+       oversized line (exceeding $Script:GwSafeDiagnosticLineMaxBytes) is discarded IN FULL the moment it would
+       exceed the bound -- never partially parsed, never matched by a truncated suffix -- and the parser
+       silently resyncs cleanly on the next CR/LF. A CRLF pair produces exactly one diagnostic event: the first
+       boundary byte parses/clears the buffer, so the second boundary byte always finds an already-empty
+       buffer and emits nothing. #>
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][byte]$Byte
+    )
+
+    if ($Byte -eq 13 -or $Byte -eq 10) {
+        $result = $null
+        if ($State.Bytes.Count -gt 0 -and -not $State.Overflow) {
+            $lineBytes = $State.Bytes.ToArray()
+            $line = [System.Text.Encoding]::ASCII.GetString($lineBytes)
+            $result = Resolve-GwSafeFirmwareDiagnosticLine -Line $line
+        }
+        $State.Bytes.Clear()
+        $State.Overflow = $false
+        return $result
+    }
+
+    if ($State.Overflow) { return $null }
+
+    if ($State.Bytes.Count -ge $Script:GwSafeDiagnosticLineMaxBytes) {
+        $State.Bytes.Clear()
+        $State.Overflow = $true
+        return $null
+    }
+
+    $State.Bytes.Add($Byte)
+    return $null
 }
 
 function Wait-GwBridgeReady {
@@ -711,7 +905,8 @@ function Invoke-GwLiveBridge {
         [Parameter(Mandatory = $true)][string]$SshTarget,
         [int]$BaudRate,
         [int]$DeviceReadyTimeoutSeconds,
-        [int]$ProtocolTimeoutSeconds
+        [int]$ProtocolTimeoutSeconds,
+        [int]$VoiceReadyTimeoutSeconds
     )
 
     $port = New-Object -TypeName 'System.IO.Ports.SerialPort' -ArgumentList $ComPort, $BaudRate, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
@@ -740,9 +935,21 @@ function Invoke-GwLiveBridge {
         }
         Write-Host '[M3A_BRIDGE] device_ready: true'
 
+        # FIX 1/3 (M3A bridge stdin-relay incident, 2026-08-20/21): .NET Framework's Process.StandardInput
+        # StreamWriter defaults to UTF-8 WITH a 3-byte BOM (EF BB BF), taken from [Console]::InputEncoding at
+        # the moment .StandardInput is first accessed (there is no ProcessStartInfo.StandardInputEncoding
+        # pre-.NET 5). This silently prepended a BOM before the real GNX3 magic on every single write to the
+        # backend process's stdin, corrupting every frame the bridge ever sent to the backend -- the true root
+        # cause of every prior "backend_token_frame: bounded read failed or frame invalid" failure. Confirmed
+        # via an isolated ssh.exe stdin-relay test (bytes arrived as EF-BB-BF-47-4E-58-33-... instead of
+        # 47-4E-58-33-...). Restored to the original console encoding immediately after $proc.StandardInput is
+        # first touched, since the StreamWriter's encoding is fixed at that point and does not change later.
+        $origConsoleInputEncoding = [Console]::InputEncoding
+        [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
         $proc = Start-GwBackendProcess -SshTarget $SshTarget
         $inStream = $proc.StandardInput.BaseStream
         $outStream = $proc.StandardOutput.BaseStream
+        [Console]::InputEncoding = $origConsoleInputEncoding
 
         $readyFrame = New-GwFrame -Type $Script:GwMsgBridgeReady -Payload @()
         $inStream.Write($readyFrame, 0, $readyFrame.Length)
@@ -757,9 +964,19 @@ function Invoke-GwLiveBridge {
         # out read's buffer to this closure in the first place.
         $tokenFrameStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $tokenFrameBudgetMs = $ProtocolTimeoutSeconds * 1000
+        # FIX 2/3 (M3A bridge stdin-relay incident): GetNewClosure() does not reliably resolve a script-scoped
+        # FUNCTION by bare name when the closure is later invoked from a DIFFERENT function's scope
+        # (Receive-GwTokenFrameAndForward) AND the bridge script itself was invoked via the call operator
+        # (`& "...\bridge.ps1" ...`) from within an already-running parent script -- confirmed live via full
+        # exception capture: CommandNotFoundException for Read-GwStreamExactBounded, even though the identical
+        # closure pattern works fine when the bridge runs as its own top-level `powershell -File` process
+        # (why -SelfTest always passed and masked this for the entire investigation). Binding the function
+        # reference explicitly via ${function:Name} and invoking it with `&` removes the dependency on ambient
+        # name resolution at call time, regardless of the calling scope.
+        $readStreamExactBoundedRef = ${function:Read-GwStreamExactBounded}
         $readBackendExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
+            $result = & $readStreamExactBoundedRef -Stream $outStream -Process $proc -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()
@@ -820,9 +1037,12 @@ function Invoke-GwLiveBridge {
         # timeout remains the canonical cleanup mechanism for this case.
         $decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $decisionBudgetMs = $ProtocolTimeoutSeconds * 1000
+        # FIX 3/3: same root cause as $readBackendExact above (fix 2/3) -- a second occurrence of the same
+        # GetNewClosure() function-resolution bug, for the post-COMMIT decision-frame read. Same fix.
+        $readStreamExactBoundedRef2 = ${function:Read-GwStreamExactBounded}
         $readBackendDecisionExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
+            $result = & $readStreamExactBoundedRef2 -Stream $outStream -Process $proc -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()
@@ -844,11 +1064,22 @@ function Invoke-GwLiveBridge {
         Write-Host '[M3A_BRIDGE] decision: commit'
 
         # F7 -- bounded, diagnostics-only observation window for the device READY marker. Never part of
-        # security/commit semantics; never echoes arbitrary device log bytes.
+        # security/commit semantics; never echoes arbitrary device log bytes. Uses its OWN dedicated
+        # -VoiceReadyTimeoutSeconds budget, never -ProtocolTimeoutSeconds: the firmware's own legal post-COMMIT
+        # voice-ready chain (Wi-Fi IP wait + HTTPS session + voice READY wait, up to 60s) can exceed the
+        # pre-COMMIT protocol budget (max 15s), so reusing that budget here was a proven false-negative
+        # observation window, not a real device/audio failure.
         $marker = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_PROVISION] voice: ready')
-        $deadline = (Get-Date).AddSeconds($ProtocolTimeoutSeconds)
+        $deadline = (Get-Date).AddSeconds($VoiceReadyTimeoutSeconds)
         $window = New-Object System.Collections.Generic.Queue[byte]
         $deviceReady = $false
+        # Safe post-COMMIT diagnostics (observation only): a SEPARATE, line-oriented pass over the exact same
+        # already-read byte the marker scanner above just consumed -- never a second serial reader, never a
+        # second read of the same byte from the port. Only ever prints a fixed, normalized
+        # `[M3A_BRIDGE] voice_diag: ...` string from Resolve-GwSafeFirmwareDiagnosticLine's own small, fixed
+        # output space; can never echo a raw serial line, and can never influence $deviceReady, the deadline, or
+        # this function's return value.
+        $diagnosticState = New-GwSafeFirmwareDiagnosticState
         while ((Get-Date) -lt $deadline) {
             try {
                 $b = $port.ReadByte()
@@ -861,6 +1092,10 @@ function Invoke-GwLiveBridge {
             if ($window.Count -eq $marker.Length -and (Test-GwByteArrayEqual -A $window.ToArray() -B $marker)) {
                 $deviceReady = $true
                 break
+            }
+            $safeDiagnostic = Push-GwSafeFirmwareDiagnosticByte -State $diagnosticState -Byte ([byte]$b)
+            if ($null -ne $safeDiagnostic) {
+                Write-Host $safeDiagnostic
             }
         }
         if ($deviceReady) {
@@ -1562,6 +1797,149 @@ function Invoke-GwSelfTest {
         $failures.Add('live_entrypoint_child_unexpected_transport_activity_observed')
     }
 
+    # Safe post-COMMIT diagnostics (M3B correction): pure, offline tests of Resolve-GwSafeFirmwareDiagnosticLine
+    # and the Push-GwSafeFirmwareDiagnosticByte line-accumulator -- never opens COM, never starts SSH, never
+    # makes a network call, never creates a file. These prove the F7 observer can only ever emit this bridge's
+    # own fixed, normalized `[M3A_BRIDGE] voice_diag: ...` strings, never a raw serial line.
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] session: http_200') -ne '[M3A_BRIDGE] voice_diag: session_http_200') {
+        $failures.Add('safe_diag_http_200')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] session_ready: setup_bytes=1234') -ne '[M3A_BRIDGE] voice_diag: session_ready setup_bytes=1234') {
+        $failures.Add('safe_diag_session_ready')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_state: connected') -ne '[M3A_BRIDGE] voice_diag: ws_connected') {
+        $failures.Add('safe_diag_ws_connected')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_state: setup_sent') -ne '[M3A_BRIDGE] voice_diag: ws_setup_sent') {
+        $failures.Add('safe_diag_ws_setup_sent')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_state: ready') -ne '[M3A_BRIDGE] voice_diag: ws_ready') {
+        $failures.Add('safe_diag_ws_ready')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_error: type=4 status=1006') -ne '[M3A_BRIDGE] voice_diag: ws_error type=4 status=1006') {
+        $failures.Add('safe_diag_ws_error')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_state: closed') -ne '[M3A_BRIDGE] voice_diag: ws_closed') {
+        $failures.Add('safe_diag_ws_closed')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] terminal: code=0') -ne '[M3A_BRIDGE] voice_diag: terminal_code=0') {
+        $failures.Add('safe_diag_terminal_0')
+    }
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] terminal: code=16') -ne '[M3A_BRIDGE] voice_diag: terminal_code=16') {
+        $failures.Add('safe_diag_terminal_16')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] terminal: code=-1')) {
+        $failures.Add('safe_diag_terminal_negative_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] terminal: code=17')) {
+        $failures.Add('safe_diag_terminal_17_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] session_ready: setup_bytes=0')) {
+        $failures.Add('safe_diag_setup_bytes_zero_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] session_ready: setup_bytes=32768')) {
+        $failures.Add('safe_diag_setup_bytes_32768_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_PROVISION] some_unrelated_log: value=1')) {
+        $failures.Add('safe_diag_unknown_line_suppressed')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line '[V2_WATCHER_VOICE] ws_state: connected EXTRA')) {
+        $failures.Add('safe_diag_suffix_injection_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line 'JUNK[V2_WATCHER_VOICE] ws_state: connected')) {
+        $failures.Add('safe_diag_prefix_injection_rejected')
+    }
+    if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line 'Authorization: Bearer synthetic-token-should-never-match')) {
+        $failures.Add('safe_diag_token_like_line_suppressed')
+    }
+
+    # Overflow suppression: a line exceeding GwSafeDiagnosticLineMaxBytes must never partially match by suffix,
+    # even if its tail bytes exactly spell a recognized marker -- then the SAME state object must recover
+    # cleanly on the very next line after the overflow's terminating newline.
+    $overflowState = New-GwSafeFirmwareDiagnosticState
+    $overflowPrefix = [System.Text.Encoding]::ASCII.GetBytes(('X' * ($Script:GwSafeDiagnosticLineMaxBytes + 8)))
+    $overflowResult = $null
+    foreach ($ob in $overflowPrefix) {
+        $r = Push-GwSafeFirmwareDiagnosticByte -State $overflowState -Byte $ob
+        if ($null -ne $r) { $overflowResult = $r }
+    }
+    $overflowMarkerBytes = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_VOICE] ws_state: connected')
+    foreach ($ob in $overflowMarkerBytes) {
+        $r = Push-GwSafeFirmwareDiagnosticByte -State $overflowState -Byte $ob
+        if ($null -ne $r) { $overflowResult = $r }
+    }
+    $r = Push-GwSafeFirmwareDiagnosticByte -State $overflowState -Byte 10
+    if ($null -ne $r) { $overflowResult = $r }
+    if ($null -ne $overflowResult) { $failures.Add('safe_diag_overflow_suppressed_until_newline') }
+
+    $recoveryResult = $null
+    $recoveryLineBytes = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_VOICE] ws_state: ready')
+    foreach ($rb in $recoveryLineBytes) {
+        $r = Push-GwSafeFirmwareDiagnosticByte -State $overflowState -Byte $rb
+        if ($null -ne $r) { $recoveryResult = $r }
+    }
+    $r = Push-GwSafeFirmwareDiagnosticByte -State $overflowState -Byte 10
+    if ($null -ne $r) { $recoveryResult = $r }
+    if ($recoveryResult -ne '[M3A_BRIDGE] voice_diag: ws_ready') { $failures.Add('safe_diag_recovery_after_overflow_newline') }
+
+    # CRLF single emit: a CR immediately followed by LF must produce exactly one diagnostic event, never two --
+    # the CR parses/clears the buffer, so the LF always finds an already-empty buffer.
+    $crlfState = New-GwSafeFirmwareDiagnosticState
+    $crlfEmitCount = 0
+    $crlfLineBytes = [System.Text.Encoding]::ASCII.GetBytes('[V2_WATCHER_VOICE] ws_state: closed')
+    foreach ($cb in $crlfLineBytes) {
+        $r = Push-GwSafeFirmwareDiagnosticByte -State $crlfState -Byte $cb
+        if ($null -ne $r) { $crlfEmitCount++ }
+    }
+    if ($null -ne (Push-GwSafeFirmwareDiagnosticByte -State $crlfState -Byte 13)) { $crlfEmitCount++ }
+    if ($null -ne (Push-GwSafeFirmwareDiagnosticByte -State $crlfState -Byte 10)) { $crlfEmitCount++ }
+    if ($crlfEmitCount -ne 1) { $failures.Add('safe_diag_crlf_single_emit') }
+
+    # M3B ESP-IDF envelope correction: realistic physical UART line shapes -- "<I|W> (<timestamp>) <tag>:
+    # <payload>", NOT bare-payload-only fixtures -- built from explicit character codes, never dependent on
+    # host terminal coloring. Proves the SAME Resolve-GwSafeFirmwareDiagnosticLine owner recognizes the actual
+    # ESP_LOGI/ESP_LOGW rendered envelope this firmware's own console output uses.
+    $espEnvelopeCases = @(
+        @{ Line = 'I (1234) V2_WATCHER_PROVISION: [V2_WATCHER_PROVISION] session: http_200'; Expected = '[M3A_BRIDGE] voice_diag: session_http_200'; Failure = 'safe_diag_esp_envelope_http_200' }
+        @{ Line = 'I (1234) V2_WATCHER_PROVISION: [V2_WATCHER_PROVISION] terminal: code=7'; Expected = '[M3A_BRIDGE] voice_diag: terminal_code=7'; Failure = 'safe_diag_esp_envelope_terminal' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] session_ready: setup_bytes=1234'; Expected = '[M3A_BRIDGE] voice_diag: session_ready setup_bytes=1234'; Failure = 'safe_diag_esp_envelope_session_ready' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Expected = '[M3A_BRIDGE] voice_diag: ws_connected'; Failure = 'safe_diag_esp_envelope_ws_connected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: setup_sent'; Expected = '[M3A_BRIDGE] voice_diag: ws_setup_sent'; Failure = 'safe_diag_esp_envelope_ws_setup_sent' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: ready'; Expected = '[M3A_BRIDGE] voice_diag: ws_ready'; Failure = 'safe_diag_esp_envelope_ws_ready' }
+        @{ Line = 'W (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006'; Expected = '[M3A_BRIDGE] voice_diag: ws_error type=4 status=1006'; Failure = 'safe_diag_esp_envelope_ws_error' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: closed'; Expected = '[M3A_BRIDGE] voice_diag: ws_closed'; Failure = 'safe_diag_esp_envelope_ws_closed' }
+    )
+    foreach ($case in $espEnvelopeCases) {
+        if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $case.Line) -ne $case.Expected) { $failures.Add($case.Failure) }
+    }
+
+    # ANSI-wrapped envelope: a leading SGR sequence plus a trailing reset -- one Info case (green, 0;32) and
+    # the Warning case with a syntactically different, equally valid SGR prefix (0;33). The parser validates
+    # BOUNDED SGR syntax, never one hardcoded color value -- ESP-IDF's own LOG_COLOR_I/LOG_COLOR_W differ.
+    $ansiInfoLine = "$([char]27)[0;32mI (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected$([char]27)[0m"
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $ansiInfoLine) -ne '[M3A_BRIDGE] voice_diag: ws_connected') {
+        $failures.Add('safe_diag_esp_envelope_ansi')
+    }
+    $ansiWarnLine = "$([char]27)[0;33mW (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006$([char]27)[0m"
+    if ((Resolve-GwSafeFirmwareDiagnosticLine -Line $ansiWarnLine) -ne '[M3A_BRIDGE] voice_diag: ws_error type=4 status=1006') {
+        $failures.Add('safe_diag_esp_envelope_ansi_warn')
+    }
+
+    # Negative envelope fixtures -- each must be rejected ($null), never partially/incorrectly accepted.
+    $negativeEnvelopeCases = @(
+        @{ Line = 'I (1234) view: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_tag_rejected' }
+        @{ Line = 'W (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_severity_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_error: type=4 status=1006'; Failure = 'safe_diag_wrong_severity_ws_error_rejected' }
+        @{ Line = 'I (12x34) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_wrong_timestamp_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE[V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_missing_separator_rejected' }
+        @{ Line = "I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state:$([char]27)[31m connected"; Failure = 'safe_diag_embedded_ansi_rejected' }
+        @{ Line = 'SECRET I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected'; Failure = 'safe_diag_envelope_prefix_injection_rejected' }
+        @{ Line = 'I (1234) V2_WATCHER_VOICE: [V2_WATCHER_VOICE] ws_state: connected EXTRA'; Failure = 'safe_diag_envelope_suffix_injection_rejected' }
+    )
+    foreach ($case in $negativeEnvelopeCases) {
+        if ($null -ne (Resolve-GwSafeFirmwareDiagnosticLine -Line $case.Line)) { $failures.Add($case.Failure) }
+    }
+
     return $failures.ToArray()
 }
 
@@ -1602,6 +1980,10 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
     Write-GwClassifiedError -Message '[M3A_BRIDGE] -ProtocolTimeoutSeconds must be between 1 and 15'
     exit 2
 }
+if (-not (Test-GwVoiceReadyTimeoutSecondsValid -Seconds $VoiceReadyTimeoutSeconds)) {
+    Write-GwClassifiedError -Message '[M3A_BRIDGE] -VoiceReadyTimeoutSeconds must be between 65 and 120'
+    exit 2
+}
 
 # Live-output / exit-status fix: `exit (Invoke-GwLiveBridge ...)` previously forced PowerShell to fully
 # evaluate the parenthesized call as one subexpression -- capturing the function's ENTIRE success/pipeline
@@ -1617,6 +1999,7 @@ if (-not (Test-GwProtocolTimeoutSecondsValid -Seconds $ProtocolTimeoutSeconds)) 
 # regression here would be caught by that dynamic Windows proof, not merely by an unrelated static grep.
 $liveExitCode = Resolve-GwLiveBridgeExitCode -Invoke {
     Invoke-GwLiveBridge -ComPort $ComPort -SshTarget $SshTarget -BaudRate $BaudRate `
-        -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds
+        -DeviceReadyTimeoutSeconds $DeviceReadyTimeoutSeconds -ProtocolTimeoutSeconds $ProtocolTimeoutSeconds `
+        -VoiceReadyTimeoutSeconds $VoiceReadyTimeoutSeconds
 }
 exit $liveExitCode

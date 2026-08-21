@@ -1034,8 +1034,17 @@ def _c113():
     live_body = _extract_c_function(BRIDGE_PS1_RAW, "function Invoke-GwLiveBridge", "function Invoke-GwSelfTest")
     idx_bind = live_body.find("$readBackendExact = {")
     idx_forward = live_body.find("Receive-GwTokenFrameAndForward -ReadBytesExact $readBackendExact")
-    bound_between = "Read-GwStreamExactBounded" in live_body[idx_bind:idx_forward] if idx_bind != -1 and idx_forward != -1 else False
-    return idx_bind != -1 and idx_forward != -1 and bound_between, ""
+    if idx_bind == -1 or idx_forward == -1:
+        return False, ""
+    closure_body = live_body[idx_bind:idx_forward]
+    direct = "Read-GwStreamExactBounded" in closure_body
+    # Bare-name resolution inside .GetNewClosure() throws CommandNotFoundException when the bridge is
+    # invoked via `& scriptPath` from an already-running parent script (proven via a live physical
+    # failure, not a hypothesis) -- the corrected pattern binds the function reference via
+    # ${function:...} before defining the closure, then invokes it through that bound reference.
+    ref_match = re.search(r"\$(\w+) = \$\{function:Read-GwStreamExactBounded\}", live_body[:idx_bind])
+    via_ref = bool(ref_match) and ("& $%s " % ref_match.group(1)) in closure_body
+    return direct or via_ref, "direct=%s via_ref=%s" % (direct, via_ref)
 
 
 @check("114. no old naked unbounded backend stream read remains anywhere in the file")
@@ -1257,8 +1266,16 @@ def _c144():
 
 @check("145. live TOKEN_FRAME reads pass the same $proc into the bounded helper")
 def _c145():
-    n = len(re.findall(r"Read-GwStreamExactBounded -Stream \$outStream -Process \$proc", LIVE_BRIDGE_SOURCE))
-    return n == 2, "found %d (expect header-read closure + decision-read closure)" % n
+    direct = len(re.findall(r"Read-GwStreamExactBounded -Stream \$outStream -Process \$proc", LIVE_BRIDGE_SOURCE))
+    # Corrected pattern (see check 113): bare-name resolution fails inside .GetNewClosure() when the
+    # bridge is invoked via `& scriptPath` from a parent script (proven live) -- each closure instead
+    # invokes a pre-bound function reference captured via ${function:Read-GwStreamExactBounded}.
+    ref_names = re.findall(r"\$(\w+) = \$\{function:Read-GwStreamExactBounded\}", LIVE_BRIDGE_SOURCE)
+    via_ref = 0
+    for name in ref_names:
+        via_ref += len(re.findall(r"& \$%s -Stream \$outStream -Process \$proc" % re.escape(name), LIVE_BRIDGE_SOURCE))
+    n = direct + via_ref
+    return n == 2, "found %d (direct=%d via_ref=%d, expect header-read closure + decision-read closure)" % (n, direct, via_ref)
 
 
 @check("146. TOKEN_FRAME header and payload still share exactly one Stopwatch")

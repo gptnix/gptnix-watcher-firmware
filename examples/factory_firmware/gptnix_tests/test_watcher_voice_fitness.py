@@ -297,7 +297,10 @@ def _c21():
 def _c22():
     text = _read(APP_C)
     hits = len(re.findall(r"esp_websocket_client_send_text\(", text))
-    return hits == 1, "found %d" % hits
+    # M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): 2 legitimate call sites -- the original setup message
+    # send (WEBSOCKET_EVENT_CONNECTED) plus app_gptnix_watcher_voice_send_audio()'s realtimeInput send,
+    # both through this module's own single private ws_client (never exposed externally).
+    return hits == 2, "found %d" % hits
 
 
 # 23. source waits for setupComplete before READY
@@ -376,10 +379,17 @@ def _c33():
     return not hits, "found: %s" % hits
 
 
-# 34. no `realtimeInput` audio construction
-@check("34. no realtimeInput audio construction")
+# 34. realtimeInput audio construction is scoped to exactly one call site
+@check("34. realtimeInput audio construction is scoped to exactly one call site")
 def _c34():
-    return "realtimeInput" not in _read(APP_C), ""
+    # M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): this module's own header always described "runtime
+    # audio wiring" as "a separate, later milestone" -- that milestone has arrived. realtimeInput
+    # construction is now an intentional, in-scope part of this module (app_gptnix_watcher_voice_send_audio),
+    # reusing the module's own private ws_client rather than exposing it externally. The invariant is
+    # narrowed from "never present" to "present exactly once" -- still catches accidental duplication.
+    text = _read(APP_C)
+    hits = len(re.findall(r'"realtimeInput"', text))
+    return hits == 1, "found %d" % hits
 
 
 # 35. no Firebase URLs/functions

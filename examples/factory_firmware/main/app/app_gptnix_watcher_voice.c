@@ -46,6 +46,7 @@
 #include "esp_heap_caps.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "V2_WATCHER_VOICE";
 
@@ -56,6 +57,20 @@ static const char *TAG = "V2_WATCHER_VOICE";
 #define GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES (8192)
 #define GPTNIX_WATCHER_VOICE_WS_BUFFER_BYTES         (4096)
 #define GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS      (10000)
+
+/* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Mic input matches Gemini's expected
+ * realtimeInput rate exactly (16kHz/16-bit/mono, the BSP's fixed capture rate) -- no resampling needed.
+ * Gemini's spoken response is always 24kHz/16-bit/mono; the audio player supports a per-stream sample
+ * rate declared via a standard 44-byte WAV header on the FIRST chunk of a stream (see
+ * app_audio_player.c's __is_wav()/__audio_player_set_fs()), so a synthesized WAV header is used instead
+ * of a software resampler -- avoids touching the shared TX/RX I2S/codec clock config directly. */
+#define GPTNIX_WATCHER_VOICE_AUDIO_OUT_SAMPLE_RATE   (24000)
+#define GPTNIX_WATCHER_VOICE_AUDIO_BITS_PER_SAMPLE   (16)
+#define GPTNIX_WATCHER_VOICE_AUDIO_CHANNELS          (1)
+/* Bounds a single outgoing mic chunk (base64-inflated ~4/3, plus JSON envelope) and a single incoming
+ * Gemini audio chunk (base64-decoded from the RX reassembly buffer) -- generous relative to realistic
+ * per-message sizes (tens of ms of audio), never assumed to hold an entire utterance at once. */
+#define GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES   (16384)
 
 /* Bound is intentionally generous but finite -- no exact model-id length is
  * specified by the backend contract; this only prevents an unbounded copy. */
@@ -76,7 +91,20 @@ struct app_gptnix_watcher_voice {
     uint8_t rx_buf[GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES];
     int rx_accumulated;
     int rx_payload_len;
+
 };
+
+/* M3C: registered by an external module (app_gptnix_watcher_voice_runtime.c) -- this module never calls
+ * the audio player itself (a pre-existing, fitness-enforced separation-of-concerns boundary). Static,
+ * not per-ctx: wiring is a one-time startup concern, not per-session state. */
+static app_gptnix_watcher_voice_audio_cb_t s_audio_cb = NULL;
+static void *s_audio_cb_user_data = NULL;
+
+void app_gptnix_watcher_voice_set_audio_callback(app_gptnix_watcher_voice_audio_cb_t cb, void *user_data)
+{
+    s_audio_cb = cb;
+    s_audio_cb_user_data = user_data;
+}
 
 static struct app_gptnix_watcher_voice *s_ctx = NULL;
 
@@ -536,6 +564,134 @@ app_gptnix_watcher_voice_state_t app_gptnix_watcher_voice_get_state(void)
     return s_ctx->state;
 }
 
+/* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Caller context only (never called
+ * from the WS event handler). Never logs pcm_data content or the base64/JSON it produces -- only a
+ * fixed-shape structural log line with byte counts. */
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio(const uint8_t *pcm_data, size_t pcm_len)
+{
+    if (s_ctx == NULL || pcm_data == NULL || pcm_len == 0
+        || pcm_len > GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+    if (s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_READY) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+
+    size_t b64_cap = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_cap, pcm_data, pcm_len); /* returns required length in b64_cap */
+    char *b64_buf = (char *)heap_caps_malloc(b64_cap + 1, MALLOC_CAP_SPIRAM);
+    if (b64_buf == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    size_t b64_len = 0;
+    int b64_err = mbedtls_base64_encode((uint8_t *)b64_buf, b64_cap, &b64_len, pcm_data, pcm_len);
+    if (b64_err != 0) {
+        free(b64_buf);
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    b64_buf[b64_len] = '\0';
+
+    cJSON *audio_req_root = cJSON_CreateObject();
+    cJSON *realtime_input = cJSON_CreateObject();
+    cJSON *audio = cJSON_CreateObject();
+    if (audio_req_root == NULL || realtime_input == NULL || audio == NULL) {
+        if (audio_req_root != NULL) cJSON_Delete(audio_req_root);
+        else { if (realtime_input) cJSON_Delete(realtime_input); if (audio) cJSON_Delete(audio); }
+        mbedtls_platform_zeroize(b64_buf, b64_len + 1);
+        free(b64_buf);
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    cJSON_AddItemToObject(audio_req_root, "realtimeInput", realtime_input);
+    cJSON_AddItemToObject(realtime_input, "audio", audio);
+    cJSON_AddStringToObject(audio, "data", b64_buf);
+    cJSON_AddStringToObject(audio, "mimeType", "audio/pcm;rate=16000");
+
+    mbedtls_platform_zeroize(b64_buf, b64_len + 1);
+    free(b64_buf);
+
+    char *msg = cJSON_PrintUnformatted(audio_req_root);
+    cJSON_Delete(audio_req_root);
+    if (msg == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    size_t msg_len = strlen(msg);
+
+    int sent = esp_websocket_client_send_text(
+        s_ctx->ws_client, msg, (int)msg_len, pdMS_TO_TICKS(GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS));
+    cJSON_free(msg);
+
+    if (sent != (int)msg_len) {
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE] audio_send: failed pcm_len=%d", (int)pcm_len);
+        return GPTNIX_WATCHER_VOICE_RESULT_WS_SEND_FAILED;
+    }
+    return GPTNIX_WATCHER_VOICE_RESULT_OK;
+}
+
+/* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Handles a fully-reassembled WS text/
+ * binary frame received while state == READY: parses Gemini's serverContent.modelTurn.parts[].inlineData
+ * audio chunks, forwards decoded PCM to the audio player (synthesizing a 44-byte WAV header naming the
+ * fixed 24kHz/16-bit/mono output rate on the FIRST chunk of a stream, matching app_audio_player's own
+ * WAV-detection contract -- avoids touching the shared TX/RX I2S/codec clock directly), and finishes the
+ * player stream on serverContent.turnComplete. Never logs raw JSON/audio content -- only structural,
+ * non-secret integers (parsed/found-part-count/turnComplete booleans, byte counts). Never changes
+ * ctx->state -- a malformed/unexpected serverContent shape is silently ignored (diagnostics-only; matches
+ * this module's general contract that runtime audio issues are non-fatal to the underlying WS session). */
+static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, cJSON *reply, bool full_consumption)
+{
+    (void)ctx;
+    int audio_parts_found = 0;
+    bool turn_complete = false;
+
+    if (full_consumption && reply != NULL && cJSON_IsObject(reply)) {
+        cJSON *server_content = cJSON_GetObjectItemCaseSensitive(reply, "serverContent");
+        if (cJSON_IsObject(server_content)) {
+            cJSON *tc = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
+            turn_complete = cJSON_IsBool(tc) && cJSON_IsTrue(tc);
+
+            cJSON *model_turn = cJSON_GetObjectItemCaseSensitive(server_content, "modelTurn");
+            cJSON *parts = cJSON_IsObject(model_turn)
+                ? cJSON_GetObjectItemCaseSensitive(model_turn, "parts") : NULL;
+            if (cJSON_IsArray(parts) && s_audio_cb != NULL) {
+                cJSON *part = NULL;
+                cJSON_ArrayForEach(part, parts) {
+                    if (!cJSON_IsObject(part)) continue;
+                    cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
+                    if (!cJSON_IsObject(inline_data)) continue;
+                    cJSON *data_item = cJSON_GetObjectItemCaseSensitive(inline_data, "data");
+                    if (!cJSON_IsString(data_item) || data_item->valuestring == NULL) continue;
+
+                    size_t b64_in_len = strlen(data_item->valuestring);
+                    if (b64_in_len == 0 || b64_in_len > GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES) continue;
+                    audio_parts_found++;
+
+                    size_t pcm_cap = 0;
+                    mbedtls_base64_decode(NULL, 0, &pcm_cap,
+                        (const uint8_t *)data_item->valuestring, b64_in_len);
+                    if (pcm_cap == 0 || pcm_cap > GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES) continue;
+
+                    uint8_t *pcm_buf = (uint8_t *)heap_caps_malloc(pcm_cap, MALLOC_CAP_SPIRAM);
+                    if (pcm_buf == NULL) continue;
+
+                    size_t pcm_len = 0;
+                    int dec_err = mbedtls_base64_decode(pcm_buf, pcm_cap, &pcm_len,
+                        (const uint8_t *)data_item->valuestring, b64_in_len);
+                    if (dec_err == 0) {
+                        s_audio_cb(pcm_buf, pcm_len, false, s_audio_cb_user_data);
+                    }
+                    free(pcm_buf);
+                }
+            }
+        }
+    }
+
+    if (turn_complete && s_audio_cb != NULL) {
+        s_audio_cb(NULL, 0, true, s_audio_cb_user_data);
+    }
+
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_content: full=%d parts=%d turn_complete=%d",
+        (int)full_consumption, audio_parts_found, (int)turn_complete);
+}
+
 static void s_ws_event_handler(void *handler_args,
                                 esp_event_base_t base,
                                 int32_t event_id,
@@ -581,11 +737,24 @@ static void s_ws_event_handler(void *handler_args,
             data ? (int)data->data_len : -1);
         if (data == NULL) break;
 
-        if (ctx->state == GPTNIX_WATCHER_VOICE_STATE_READY) {
-            /* M2 never processes/logs body content after READY. */
+        // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with a
+        // long-lived READY session revealed WS control frames (ping=0x9, pong=0xA, close=0x8) arriving
+        // through this same WEBSOCKET_EVENT_DATA path -- the pre-existing opcode check (0x01/0x02 only,
+        // for application-data frames) misclassified every keepalive pong as a protocol error, silently
+        // breaking every session shortly after reaching READY. Never proven with a long-lived connection
+        // before this session (the M3A diagnostic canary always disconnected within seconds of READY).
+        // Control frames carry no application data and never affect ctx->state or the reassembly buffer.
+        if (data->op_code == 0x08 /* close */ || data->op_code == 0x09 /* ping */
+            || data->op_code == 0x0A /* pong */) {
             break;
         }
-        if (ctx->state != GPTNIX_WATCHER_VOICE_STATE_SETUP_SENT) {
+
+        // M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): READY-state frames are no longer ignored -- they
+        // carry Gemini's spoken audio response (serverContent.modelTurn.parts[].inlineData), handled by
+        // s_handle_ready_server_content() further below. The reassembly logic (identical for both states)
+        // is shared; only the FINAL JSON-shape interpretation differs between SETUP_SENT and READY.
+        if (ctx->state != GPTNIX_WATCHER_VOICE_STATE_SETUP_SENT
+            && ctx->state != GPTNIX_WATCHER_VOICE_STATE_READY) {
             ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;
             ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;
             break;
@@ -663,6 +832,21 @@ static void s_ws_event_handler(void *handler_args,
                 (const char *)ctx->rx_buf, (size_t)ctx->rx_accumulated + 1, &parse_end, 1);
             bool full_consumption = (reply != NULL)
                 && (parse_end == (const char *)ctx->rx_buf + ctx->rx_accumulated);
+
+            // M3C: captured BEFORE any further processing below can change ctx->state, since the two
+            // states share this same reassembly block but need different JSON-shape interpretations.
+            bool was_ready = (ctx->state == GPTNIX_WATCHER_VOICE_STATE_READY);
+            if (was_ready) {
+                s_handle_ready_server_content(ctx, reply, full_consumption);
+                if (reply != NULL) {
+                    cJSON_Delete(reply);
+                }
+                mbedtls_platform_zeroize(ctx->rx_buf, sizeof(ctx->rx_buf));
+                ctx->rx_accumulated = 0;
+                ctx->rx_payload_len = 0;
+                break;
+            }
+
             bool is_setup_complete = false;
             int key_count = 0;
             bool has_setup_complete_key = false;

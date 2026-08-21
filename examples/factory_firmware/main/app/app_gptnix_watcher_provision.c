@@ -414,6 +414,14 @@ static app_gptnix_watcher_provision_result_t s_do_session_post(
     config.event_handler = s_http_event_handler;
     config.user_data = &acc;
     config.disable_auto_redirect = true;
+    // M3B fix (plans/M3B_HTTP_BUFFER_TX_CHILD_TASK.md): esp_http_client's default TX buffer
+    // (DEFAULT_HTTP_BUF_SIZE, 512 bytes) is too small to hold the full request header block in one pass --
+    // the Authorization header alone (a Firebase ID token JWT) is typically 800-1500+ bytes. Proven via a
+    // live device capture (nginx debug log, operator-authorized): the device sent only the first ~133
+    // bytes of headers, stalled for exactly GW_HTTP_TIMEOUT_MS, then closed the connection itself
+    // ("client prematurely closed connection while reading client request headers"). Sized generously
+    // above any realistic single-header size, not to the exact observed minimum.
+    config.buffer_size_tx = 4096;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {

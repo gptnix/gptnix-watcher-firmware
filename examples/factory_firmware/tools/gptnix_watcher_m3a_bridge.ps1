@@ -935,9 +935,21 @@ function Invoke-GwLiveBridge {
         }
         Write-Host '[M3A_BRIDGE] device_ready: true'
 
+        # FIX 1/3 (M3A bridge stdin-relay incident, 2026-08-20/21): .NET Framework's Process.StandardInput
+        # StreamWriter defaults to UTF-8 WITH a 3-byte BOM (EF BB BF), taken from [Console]::InputEncoding at
+        # the moment .StandardInput is first accessed (there is no ProcessStartInfo.StandardInputEncoding
+        # pre-.NET 5). This silently prepended a BOM before the real GNX3 magic on every single write to the
+        # backend process's stdin, corrupting every frame the bridge ever sent to the backend -- the true root
+        # cause of every prior "backend_token_frame: bounded read failed or frame invalid" failure. Confirmed
+        # via an isolated ssh.exe stdin-relay test (bytes arrived as EF-BB-BF-47-4E-58-33-... instead of
+        # 47-4E-58-33-...). Restored to the original console encoding immediately after $proc.StandardInput is
+        # first touched, since the StreamWriter's encoding is fixed at that point and does not change later.
+        $origConsoleInputEncoding = [Console]::InputEncoding
+        [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
         $proc = Start-GwBackendProcess -SshTarget $SshTarget
         $inStream = $proc.StandardInput.BaseStream
         $outStream = $proc.StandardOutput.BaseStream
+        [Console]::InputEncoding = $origConsoleInputEncoding
 
         $readyFrame = New-GwFrame -Type $Script:GwMsgBridgeReady -Payload @()
         $inStream.Write($readyFrame, 0, $readyFrame.Length)
@@ -952,9 +964,19 @@ function Invoke-GwLiveBridge {
         # out read's buffer to this closure in the first place.
         $tokenFrameStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $tokenFrameBudgetMs = $ProtocolTimeoutSeconds * 1000
+        # FIX 2/3 (M3A bridge stdin-relay incident): GetNewClosure() does not reliably resolve a script-scoped
+        # FUNCTION by bare name when the closure is later invoked from a DIFFERENT function's scope
+        # (Receive-GwTokenFrameAndForward) AND the bridge script itself was invoked via the call operator
+        # (`& "...\bridge.ps1" ...`) from within an already-running parent script -- confirmed live via full
+        # exception capture: CommandNotFoundException for Read-GwStreamExactBounded, even though the identical
+        # closure pattern works fine when the bridge runs as its own top-level `powershell -File` process
+        # (why -SelfTest always passed and masked this for the entire investigation). Binding the function
+        # reference explicitly via ${function:Name} and invoking it with `&` removes the dependency on ambient
+        # name resolution at call time, regardless of the calling scope.
+        $readStreamExactBoundedRef = ${function:Read-GwStreamExactBounded}
         $readBackendExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
+            $result = & $readStreamExactBoundedRef -Stream $outStream -Process $proc -Count $count -Stopwatch $tokenFrameStopwatch -BudgetMs $tokenFrameBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()
@@ -1015,9 +1037,12 @@ function Invoke-GwLiveBridge {
         # timeout remains the canonical cleanup mechanism for this case.
         $decisionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $decisionBudgetMs = $ProtocolTimeoutSeconds * 1000
+        # FIX 3/3: same root cause as $readBackendExact above (fix 2/3) -- a second occurrence of the same
+        # GetNewClosure() function-resolution bug, for the post-COMMIT decision-frame read. Same fix.
+        $readStreamExactBoundedRef2 = ${function:Read-GwStreamExactBounded}
         $readBackendDecisionExact = {
             param($count)
-            $result = Read-GwStreamExactBounded -Stream $outStream -Process $proc -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
+            $result = & $readStreamExactBoundedRef2 -Stream $outStream -Process $proc -Count $count -Stopwatch $decisionStopwatch -BudgetMs $decisionBudgetMs
             if (-not $result.Ok) { return $null }
             return $result.Bytes
         }.GetNewClosure()

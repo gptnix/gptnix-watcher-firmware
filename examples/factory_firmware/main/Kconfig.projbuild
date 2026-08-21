@@ -80,4 +80,19 @@ menu "Factory Firmware Example Configuration"
             no credential of its own -- the bearer token is supplied
             separately at runtime via the M3A provisioning handoff, never
             embedded in this URL or in firmware source.
+
+    config GPTNIX_WATCHER_VOICE_RUNTIME
+        bool "Enable GPTNiX Watcher M3C runtime audio bridge (mic/speaker <-> Gemini Live)"
+        depends on GPTNIX_WATCHER_PROVISION
+        default n
+        help
+            Enables the M3C runtime audio bridge: once the M3A provisioning
+            sequence reaches a READY Gemini Live WS session, keeps that
+            session alive (instead of the M3A diagnostic canary's
+            connect-then-disconnect behavior) and starts streaming captured
+            microphone audio to Gemini while forwarding Gemini's spoken
+            response to the speaker. This is the first milestone that
+            actually plays audio through the device -- disabled by default,
+            separate from the M3A diagnostic canary path so M3A's existing
+            proven provisioning behavior is unaffected when this is off.
 endmenu

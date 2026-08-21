@@ -60,6 +60,7 @@
 #include "driver/uart.h"
 
 #include "app_gptnix_watcher_voice.h"
+#include "app_gptnix_watcher_voice_runtime.h"
 
 static const char *TAG = "V2_WATCHER_PROVISION";
 
@@ -550,6 +551,19 @@ static app_gptnix_watcher_provision_result_t s_hand_off_to_voice(char *response_
             vTaskDelay(pdMS_TO_TICKS(200));
         }
     }
+
+#if CONFIG_GPTNIX_WATCHER_VOICE_RUNTIME
+    // M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): unlike the M3A diagnostic canary's connect-then-
+    // disconnect behavior (the `cleanup:` path below, still used for every OTHER outcome and whenever
+    // this config is off), a successful READY session is kept alive here -- the WSS client is NOT
+    // disconnected/deinitialized, and the mic-feeding task takes over sending audio. Returns directly,
+    // skipping `cleanup:` entirely, since the voice module's own lifetime now outlives this function.
+    if (result == GPTNIX_WATCHER_PROVISION_RESULT_OK) {
+        app_gptnix_watcher_voice_runtime_start();
+        ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] audio_bridge: started");
+        return result;
+    }
+#endif
 
 cleanup:
     // Terminal cleanup, exactly once, on every path reached from prepare_session() onward. M2's disconnect()/

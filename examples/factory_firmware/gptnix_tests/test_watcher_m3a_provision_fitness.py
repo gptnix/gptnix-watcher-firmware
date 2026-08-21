@@ -35,15 +35,21 @@ WORKFLOW_YML = os.path.join(REPO_ROOT, ".github", "workflows", "gptnix-firmware-
 # runtime -- CI uses fetch-depth: 1.
 PROTECTED_M3A_BLOBS = {
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.c":
-        # M3B fix (plans/M3B_GEMINI_AUTHTOKEN_SCHEMA_CHILD_TASK.md follow-up): updated to add a safe,
-        # integer-only diagnostic (setup_reply: parsed/full/obj/keys/has_sc) inside WEBSOCKET_EVENT_DATA's
-        # setupComplete acceptance check -- the locked contract itself (accepts ONLY {"setupComplete":{}})
-        # is unchanged; this only adds visibility into WHY a real Gemini response gets rejected, proven
-        # necessary by a live physical attempt reaching terminal_code=16 (VOICE_RUNTIME_ERROR) with zero
-        # prior diagnostic detail once M3B's first two root causes were fixed.
-        "76f238b331448ce52d4f45d52b524c07fdb0b776",
+        # M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): the runtime audio bridge milestone this module's own
+        # header always said was "a separate, later milestone" -- adds app_gptnix_watcher_voice_send_audio()
+        # (mic -> Gemini realtimeInput) and extends WEBSOCKET_EVENT_DATA to also handle READY-state frames
+        # (Gemini's spoken response, serverContent.modelTurn.parts[].inlineData -> the audio player, via a
+        # synthesized WAV header declaring the fixed 24kHz output rate rather than touching the shared
+        # TX/RX I2S/codec clock config). The pre-existing setupComplete/M3A contract is unchanged.
+        # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with a long-lived
+        # READY session revealed WS control frames (ping/pong/close) were being misclassified as protocol
+        # errors, silently breaking every session shortly after reaching READY -- never proven with a
+        # long-lived connection before this session. Fixed by skipping control frames entirely.
+        "1a1711ffc691fa3ed3f41250ed8914203a85fb35",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
-        "85399fa916407ab9d8602b62d8a7cc6946b5ec40",
+        # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
+        # blob comment above) -- this module still never touches the player/recorder APIs itself.
+        "d8a24a42bc6d4e705d436d708e21925e2330ae76",
     "examples/factory_firmware/main/app/app_wifi.c":
         "96f3e1a240c70c3500f977d59c9aea7ed51b1077",
     "examples/factory_firmware/main/app/app_wifi.h":

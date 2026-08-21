@@ -55,6 +55,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_timer.h"
 
 #include "driver/uart.h"
 
@@ -440,8 +441,20 @@ static app_gptnix_watcher_provision_result_t s_do_session_post(
 
     // One call site, no retry: exactly one esp_http_client_perform() per provisioning run, only ever reached
     // after COMMIT (see the single call site of this function below).
+    // M3B diagnostic (plans/M3B_HTTP_BUFFER_TX_CHILD_TASK.md follow-up): buffer_size_tx and task stack
+    // size fixes did not resolve the session-POST stall -- logging the exact esp_err_t name and elapsed
+    // wall-clock time to distinguish a real ~10s client-side timeout from a faster, differently-classed
+    // failure. Never logs secret content, only a fixed non-secret error name string and an integer ms count.
+    int64_t perform_start_us = esp_timer_get_time();
     esp_err_t perform_err = esp_http_client_perform(client);
+    int64_t perform_elapsed_ms = (esp_timer_get_time() - perform_start_us) / 1000;
+    ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_perform: err=%d elapsed_ms=%lld",
+        (int)perform_err, (long long)perform_elapsed_ms);
     int status = (perform_err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    // M3B diagnostic (plans/M3B_HTTP_BUFFER_TX_CHILD_TASK.md follow-up): status/overflow/len are all
+    // non-secret integers -- needed now that perform_err alone (ESP_OK) no longer distinguishes the
+    // actual failure branch below.
+    ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_status: code=%d", status);
 
     // Immediately after perform() returns: zeroize the auth buffer and the staged ID token, before any later
     // M2/WSS work -- never deferred, regardless of the outcome below.

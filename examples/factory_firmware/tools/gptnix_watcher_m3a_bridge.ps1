@@ -474,6 +474,45 @@ function Resolve-GwSafeDiagnosticPayload {
         return $null
     }
 
+    if ($Payload -cmatch '^\[V2_WATCHER_PROVISION\] http_perform: err=(-?\d{1,11}) elapsed_ms=(\d{1,11})$') {
+        [int]$errCode = 0
+        [long]$elapsedMs = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$errCode)) { return $null }
+        if (-not [long]::TryParse($Matches[2], [ref]$elapsedMs)) { return $null }
+        if ($elapsedMs -ge 0 -and $elapsedMs -le 60000) {
+            return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: http_perform err=$errCode elapsed_ms=$elapsedMs"; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
+        }
+        return $null
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_PROVISION\] http_status: code=(-?\d{1,5})$') {
+        [int]$httpCode = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$httpCode)) { return $null }
+        return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: http_status code=$httpCode"; ExpectedTag = 'V2_WATCHER_PROVISION'; ExpectedSeverity = 'I' }
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] setup_reply: parsed=([01]) full=([01]) obj=([01]) keys=(\d{1,4}) has_sc=([01])$') {
+        [int]$parsedOk = 0; [int]$fullOk = 0; [int]$objOk = 0; [int]$keys = 0; [int]$hasSc = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$parsedOk)) { return $null }
+        if (-not [int]::TryParse($Matches[2], [ref]$fullOk)) { return $null }
+        if (-not [int]::TryParse($Matches[3], [ref]$objOk)) { return $null }
+        if (-not [int]::TryParse($Matches[4], [ref]$keys)) { return $null }
+        if (-not [int]::TryParse($Matches[5], [ref]$hasSc)) { return $null }
+        return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: setup_reply parsed=$parsedOk full=$fullOk obj=$objOk keys=$keys has_sc=$hasSc"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+    }
+
+    if ($Payload -cmatch '^\[V2_WATCHER_VOICE\] ws_data: state=(-?\d{1,3}) null=([01]) op=(-?\d{1,3}) fin=(-?\d{1,3}) plen=(-?\d{1,6}) poff=(-?\d{1,6}) dlen=(-?\d{1,6})$') {
+        [int]$vState=0; [int]$vNull=0; [int]$vOp=0; [int]$vFin=0; [int]$vPlen=0; [int]$vPoff=0; [int]$vDlen=0
+        if (-not [int]::TryParse($Matches[1], [ref]$vState)) { return $null }
+        if (-not [int]::TryParse($Matches[2], [ref]$vNull)) { return $null }
+        if (-not [int]::TryParse($Matches[3], [ref]$vOp)) { return $null }
+        if (-not [int]::TryParse($Matches[4], [ref]$vFin)) { return $null }
+        if (-not [int]::TryParse($Matches[5], [ref]$vPlen)) { return $null }
+        if (-not [int]::TryParse($Matches[6], [ref]$vPoff)) { return $null }
+        if (-not [int]::TryParse($Matches[7], [ref]$vDlen)) { return $null }
+        return [PSCustomObject]@{ Normalized = "[M3A_BRIDGE] voice_diag: ws_data state=$vState null=$vNull op=$vOp fin=$vFin plen=$vPlen poff=$vPoff dlen=$vDlen"; ExpectedTag = 'V2_WATCHER_VOICE'; ExpectedSeverity = 'I' }
+    }
+
     return $null
 }
 

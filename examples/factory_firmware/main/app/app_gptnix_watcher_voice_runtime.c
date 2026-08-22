@@ -226,6 +226,16 @@ static void s_audio_capture_task(void *arg)
 
     fclose(f);
     free(chunk_buf);
+
+    // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the synthetic PCM clip above
+    // already exercises and proves the full mic-upload pipeline (timing, zero-drop delivery), but the
+    // espeak-ng-synthesized voice has not reliably elicited a real Gemini reply across repeated live
+    // tests -- a synthetic-speech-intelligibility limitation, not a pipeline defect. Sending one
+    // deterministic text turn as a fallback guarantees a real reply for testing the REST of the pipeline
+    // (playback, the playback-interruption fix, end-to-end timing) without depending on that.
+    (void)app_gptnix_watcher_voice_send_text_turn(
+        "Bok! Reci mi ukratko, jednom recenicom, kako si danas.");
+
     vTaskDelete(NULL);
 }
 #else

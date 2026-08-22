@@ -297,10 +297,12 @@ def _c21():
 def _c22():
     text = _read(APP_C)
     hits = len(re.findall(r"esp_websocket_client_send_text\(", text))
-    # M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): 2 legitimate call sites -- the original setup message
-    # send (WEBSOCKET_EVENT_CONNECTED) plus app_gptnix_watcher_voice_send_audio()'s realtimeInput send,
-    # both through this module's own single private ws_client (never exposed externally).
-    return hits == 2, "found %d" % hits
+    # M3C (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): 3 legitimate call sites -- the original setup message
+    # send (WEBSOCKET_EVENT_CONNECTED), app_gptnix_watcher_voice_send_audio()'s realtimeInput send, and
+    # (follow-up) app_gptnix_watcher_voice_send_text_turn()'s clientContent send (test/diagnostic-only,
+    # never called from the normal microphone-streaming path) -- all through this module's own single
+    # private ws_client (never exposed externally).
+    return hits == 3, "found %d" % hits
 
 
 # 23. source waits for setupComplete before READY

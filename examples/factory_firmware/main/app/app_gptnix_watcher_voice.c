@@ -665,6 +665,72 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio(const uint
     return GPTNIX_WATCHER_VOICE_RESULT_OK;
 }
 
+// M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): live testing with the synthetic-audio
+// test mode showed the espeak-ng-synthesized test voice reliably delivering (zero drops) but never
+// eliciting a real Gemini reply across 4 attempts -- an intelligibility limitation of that specific
+// synthetic voice, not a pipeline defect (real human speech has reliably gotten replies). Sending a
+// `clientContent` turn with `turnComplete: true` per the Live API wire contract (ai.google.dev/api/live:
+// "setting turnComplete to true signals the server to start generation with the currently accumulated
+// prompt") guarantees a real reply deterministically, independent of any speech-recognition step,
+// giving round-trip pipeline testing (timing, playback-interruption behavior) a reliable trigger that
+// doesn't depend on synthetic-speech quality. Test/diagnostic use only -- never called from the normal
+// microphone-streaming path.
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_text_turn(const char *text)
+{
+    if (s_ctx == NULL || text == NULL || text[0] == '\0') {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+    if (s_ctx->state != GPTNIX_WATCHER_VOICE_STATE_READY) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+
+    cJSON *text_req_root = cJSON_CreateObject();
+    cJSON *client_content = cJSON_CreateObject();
+    cJSON *turns = cJSON_CreateArray();
+    cJSON *turn = cJSON_CreateObject();
+    cJSON *parts = cJSON_CreateArray();
+    cJSON *part = cJSON_CreateObject();
+    if (text_req_root == NULL || client_content == NULL || turns == NULL || turn == NULL
+        || parts == NULL || part == NULL) {
+        if (text_req_root != NULL) {
+            cJSON_Delete(text_req_root);
+        } else {
+            if (client_content) cJSON_Delete(client_content);
+            if (turns) cJSON_Delete(turns);
+            if (turn) cJSON_Delete(turn);
+            if (parts) cJSON_Delete(parts);
+            if (part) cJSON_Delete(part);
+        }
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    cJSON_AddItemToObject(text_req_root, "clientContent", client_content);
+    cJSON_AddItemToObject(client_content, "turns", turns);
+    cJSON_AddItemToArray(turns, turn);
+    cJSON_AddStringToObject(turn, "role", "user");
+    cJSON_AddItemToObject(turn, "parts", parts);
+    cJSON_AddItemToArray(parts, part);
+    cJSON_AddStringToObject(part, "text", text);
+    cJSON_AddBoolToObject(client_content, "turnComplete", true);
+
+    char *msg = cJSON_PrintUnformatted(text_req_root);
+    cJSON_Delete(text_req_root);
+    if (msg == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    size_t msg_len = strlen(msg);
+
+    int sent = esp_websocket_client_send_text(
+        s_ctx->ws_client, msg, (int)msg_len, pdMS_TO_TICKS(GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS));
+    cJSON_free(msg);
+
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] text_turn_send: sent=%d msg_len=%d", sent, (int)msg_len);
+
+    if (sent != (int)msg_len) {
+        return GPTNIX_WATCHER_VOICE_RESULT_WS_SEND_FAILED;
+    }
+    return GPTNIX_WATCHER_VOICE_RESULT_OK;
+}
+
 /* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Handles a fully-reassembled WS text/
  * binary frame received while state == READY: parses Gemini's serverContent.modelTurn.parts[].inlineData
  * audio chunks, forwards decoded PCM to the audio player (synthesizing a 44-byte WAV header naming the

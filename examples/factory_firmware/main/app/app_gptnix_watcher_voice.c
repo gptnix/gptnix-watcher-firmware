@@ -44,6 +44,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "mbedtls/base64.h"
@@ -54,9 +55,35 @@ static const char *TAG = "V2_WATCHER_VOICE";
 #define GPTNIX_WATCHER_VOICE_ENDPOINT_MAX_BYTES      (512)
 #define GPTNIX_WATCHER_VOICE_TOKEN_MAX_BYTES         (2048)
 #define GPTNIX_WATCHER_VOICE_SETUP_JSON_MAX_BYTES    (32768)
-#define GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES (8192)
-#define GPTNIX_WATCHER_VOICE_WS_BUFFER_BYTES         (4096)
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with real speech
+// revealed Gemini's actual serverContent audio response messages are FAR larger than the original
+// 8192-byte sizing (chosen when this buffer only ever needed to hold the ~26-byte setupComplete message)
+// -- observed real fragments up to 33547 bytes in one message. Sized generously above the largest
+// observed real message with headroom for longer utterances; PSRAM is used for other buffers in this
+// module already and ESP32-S3 has 8MB available, so this is not a scarce resource.
+#define GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES (65536)
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with real speech showed
+// the WS text-send call failing (sent != msg_len) for a realistic-size mic audio chunk (16000 raw PCM
+// bytes -> ~21.4KB once base64-encoded plus the JSON envelope). ESP-IDF's own internal
+// auto-fragmentation for oversized sends has known reliability issues (multiple upstream GitHub issues
+// report corrupted/failed large-payload sends) -- sized generously above the largest realistic outgoing
+// message instead of relying on that path.
+#define GPTNIX_WATCHER_VOICE_WS_BUFFER_BYTES         (32768)
 #define GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS      (10000)
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): two separate live physical tests (multi-turn
+// conversation) showed the ENTIRE session going silent -- not just outgoing sends failing, but Gemini's
+// own incoming replies and even routine turn-signal acks stopping completely -- once the mic-audio-send
+// task fell behind and started retrying a backlog of pieces. Hypothesized cause: app_gptnix_watcher_
+// voice_send_audio() reusing the full 10s GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS per piece, combined
+// with esp_websocket_client's send/receive paths sharing one lock by default, starving receive processing
+// during a long blocked send. Tried 300ms as a dedicated, much shorter timeout for this ONE call site --
+// a live physical test then showed a WORSE regression (complete silence, not even the routine idle acks,
+// reproduced twice including with zero user speech yet). Likely cause: 300ms fails almost every send
+// attempt outright, so the send task now retries in a tight loop, taking/releasing the shared lock far
+// MORE frequently than the original 10s timeout ever did -- more frequent short contentions apparently
+// starve the receive side worse than fewer long ones. Reverted to the original 10000ms pending a
+// differently-shaped fix (e.g. backoff between retries, not just a shorter per-call timeout).
+#define GPTNIX_WATCHER_VOICE_AUDIO_SEND_TIMEOUT_MS   (10000)
 
 /* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Mic input matches Gemini's expected
  * realtimeInput rate exactly (16kHz/16-bit/mono, the BSP's fixed capture rate) -- no resampling needed.
@@ -70,7 +97,9 @@ static const char *TAG = "V2_WATCHER_VOICE";
 /* Bounds a single outgoing mic chunk (base64-inflated ~4/3, plus JSON envelope) and a single incoming
  * Gemini audio chunk (base64-decoded from the RX reassembly buffer) -- generous relative to realistic
  * per-message sizes (tens of ms of audio), never assumed to hold an entire utterance at once. */
-#define GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES   (16384)
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): must stay >= RX_REASSEMBLY_MAX_BYTES,
+// since a single inlineData base64 string can occupy nearly the whole reassembled message.
+#define GPTNIX_WATCHER_VOICE_AUDIO_CHUNK_MAX_BYTES   (65536)
 
 /* Bound is intentionally generous but finite -- no exact model-id length is
  * specified by the backend contract; this only prevents an unbounded copy. */
@@ -616,9 +645,18 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio(const uint
     }
     size_t msg_len = strlen(msg);
 
+    // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the user reported latency far
+    // beyond what tuning buffer sizes/timeouts alone could explain. Timing this ONE call directly settles
+    // whether the bottleneck is achievable network/TLS throughput on this hardware (a real ceiling no
+    // amount of app-level tuning can fix) versus something else. Never logs message content.
+    int64_t send_start_us = esp_timer_get_time();
     int sent = esp_websocket_client_send_text(
-        s_ctx->ws_client, msg, (int)msg_len, pdMS_TO_TICKS(GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS));
+        s_ctx->ws_client, msg, (int)msg_len, pdMS_TO_TICKS(GPTNIX_WATCHER_VOICE_AUDIO_SEND_TIMEOUT_MS));
+    int64_t send_elapsed_ms = (esp_timer_get_time() - send_start_us) / 1000;
     cJSON_free(msg);
+
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] audio_send: elapsed_ms=%lld msg_len=%d pcm_len=%d",
+        (long long)send_elapsed_ms, (int)msg_len, (int)pcm_len);
 
     if (sent != (int)msg_len) {
         ESP_LOGW(TAG, "[V2_WATCHER_VOICE] audio_send: failed pcm_len=%d", (int)pcm_len);
@@ -803,8 +841,20 @@ static void s_ws_event_handler(void *handler_args,
         }
         ctx->rx_accumulated += data->data_len;
 
-        if (!data->fin) {
-            break; /* wait for more fragments */
+        // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with real speech
+        // proved `data->fin` reflects the underlying WS FRAME's own FIN bit (1 for any single,
+        // non-WS-fragmented frame Gemini sends -- confirmed against the real esp_websocket_client.h
+        // source), NOT whether esp_websocket_client's internal buffer-driven chunked delivery (payload_
+        // offset/payload_len, used when a payload exceeds the library's own internal buffer -- see its
+        // own header: "payloads exceeding buffer will be posted through multiple events") has finished.
+        // Every observed real (large) Gemini reply arrived as multiple same-fin=1 chunks, so the OLD
+        // `if (!data->fin) break;` check never actually waited for later chunks -- it silently proceeded
+        // to validate an INCOMPLETE reassembly against rx_payload_len on the very first chunk, which
+        // could only ever pass by coincidence (a message small enough to arrive in exactly one chunk).
+        // The correct signal is the accumulated-vs-total-length comparison, exactly as the header
+        // describes.
+        if (ctx->rx_accumulated < ctx->rx_payload_len) {
+            break; /* wait for more chunks */
         }
         if (ctx->rx_accumulated != ctx->rx_payload_len) {
             ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;

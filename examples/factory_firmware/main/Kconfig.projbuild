@@ -95,4 +95,17 @@ menu "Factory Firmware Example Configuration"
             actually plays audio through the device -- disabled by default,
             separate from the M3A diagnostic canary path so M3A's existing
             proven provisioning behavior is unaffected when this is off.
+
+    config GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO
+        bool "M3C: feed a canned SPIFFS PCM clip instead of live microphone capture (autonomous testing only)"
+        depends on GPTNIX_WATCHER_VOICE_RUNTIME
+        default n
+        help
+            Diagnostic-only mode (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up) letting round-trip
+            latency/quality testing happen without a human physically present to speak. When enabled, the
+            capture task reads /spiffs/gptnix_synth_test.pcm (16kHz/16-bit/mono raw PCM, no WAV header)
+            in real-time-paced chunks INSTEAD OF calling any app_audio_recorder_* API, feeding the exact
+            same downstream local-ring-buffer -> WS-send pipeline a live microphone capture would. Never
+            touches microphone hardware in this mode. Default n -- this is a lab/test aid, not a shipped
+            feature; the speaker/playback path is completely unaffected either way.
 endmenu

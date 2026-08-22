@@ -45,7 +45,38 @@ PROTECTED_M3A_BLOBS = {
         # READY session revealed WS control frames (ping/pong/close) were being misclassified as protocol
         # errors, silently breaking every session shortly after reaching READY -- never proven with a
         # long-lived connection before this session. Fixed by skipping control frames entirely.
-        "1a1711ffc691fa3ed3f41250ed8914203a85fb35",
+        # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): RX reassembly buffer + audio chunk
+        # bound enlarged 8192->65536 -- a live physical test with real speech showed real Gemini audio
+        # response messages (up to 33547 observed bytes) far exceed the original 8192-byte sizing (chosen
+        # for the tiny setupComplete message), silently breaking every session on its first real reply.
+        # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with real speech
+        # proved `data->fin` reflects the WS FRAME's own FIN bit (always 1 for Gemini's non-fragmented
+        # frames), not whether esp_websocket_client's internal buffer-chunked delivery has finished --
+        # confirmed against the real esp_websocket_client.h source ("payloads exceeding buffer will be
+        # posted through multiple events" via payload_offset/payload_len). Every real (large) reply
+        # arrived as multiple same-fin=1 chunks; the old check never actually waited. Fixed to compare
+        # accumulated bytes against the total payload length instead.
+        # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): WS client buffer_size enlarged
+        # 4096->32768 -- a live physical test showed the WS text-send call failing for a realistic-size
+        # mic audio chunk (~21.4KB once base64-encoded). ESP-IDF's internal auto-fragmentation for
+        # oversized sends has known upstream reliability issues; sized generously above the largest
+        # realistic outgoing message instead.
+        # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): two live multi-turn conversation tests
+        # showed the ENTIRE session going silent (not just sends failing -- Gemini's own replies and
+        # routine acks stopped too) once the mic-send task fell behind. Tried a dedicated, much shorter
+        # GPTNIX_WATCHER_VOICE_AUDIO_SEND_TIMEOUT_MS=300 for the audio-send call site -- a live test then
+        # showed a WORSE regression (complete silence, reproduced twice, even before the user spoke):
+        # short timeouts made the send task retry in a tight loop, contending for the shared send/receive
+        # lock far more often than the original 10s timeout, apparently starving receive processing worse.
+        # Reverted GPTNIX_WATCHER_VOICE_AUDIO_SEND_TIMEOUT_MS to 10000 (same value as
+        # GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS, just a separately-named constant) pending a
+        # differently-shaped fix.
+        # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): user-reported latency (over a
+        # minute) far exceeds what buffer/timeout tuning alone should cause -- added a direct esp_timer_
+        # get_time() measurement around the one esp_websocket_client_send_text() call in send_audio() to
+        # settle whether the bottleneck is a real achievable-throughput ceiling on this hardware/network
+        # path, not app-level tuning. Never logs message content, only elapsed_ms/msg_len/pcm_len.
+        "75e7cebde019e55dff0c4cb6fd5c90e6e1347ca7",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.

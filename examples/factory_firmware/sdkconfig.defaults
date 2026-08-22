@@ -83,3 +83,14 @@ CONFIG_SSCMA_MONITOR_TASK_AFFINITY_CPU1=y
 CONFIG_SSCMA_MONITOR_TASK_STACK_ALLOC_EXTERNAL=y
 CONFIG_SSCMA_ALLOC_SMALL_SHORTTERM_MEM_EXTERNALLY=y
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# M3C follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md, live-tested 2026-08-21, DISABLED AGAIN -- do not
+# re-enable without further investigation): CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK cuts the initial
+# response latency from ~50s to ~6-7s, but TWO separate live physical tests -- once as-shipped, once
+# with a local patch (components/esp_websocket_client/, see its own inline comment) bounding the one
+# unbounded portMAX_DELAY wait we found in its send-error path -- both still froze the session completely
+# after the FIRST exchange (zero further WS traffic, local send buffer overflowing nonstop for 60+
+# continuous seconds). The patch fixed the ONE unbounded wait we found and located by code review, but
+# clearly not the actual hang -- there is at least one more root cause in this vendored client (or
+# elsewhere in this call path) still unidentified. Disabled pending that root cause, not just another
+# guess-and-test cycle -- correctness over speed until the actual mechanism is understood.

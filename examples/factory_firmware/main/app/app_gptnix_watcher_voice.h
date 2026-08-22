@@ -74,6 +74,15 @@ app_gptnix_watcher_voice_state_t app_gptnix_watcher_voice_get_state(void);
 app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio(const uint8_t *pcm_data, size_t pcm_len);
 
 /**
+ * M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up). Sends a text turn (Gemini Live's
+ * `clientContent` message, `turnComplete: true`) instead of audio -- deterministically triggers a real
+ * spoken reply (responseModalities is session-wide AUDIO) independent of any speech-recognition step, for
+ * round-trip pipeline testing that doesn't depend on synthetic-speech intelligibility. Requires state ==
+ * READY. Test/diagnostic use only -- never called from the normal microphone-streaming path.
+ */
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_text_turn(const char *text);
+
+/**
  * Invoked once per decoded audio chunk from Gemini's spoken response (pcm_data/pcm_len, 24kHz/16-bit/mono
  * raw PCM, turn_complete=false), and once more with pcm_data=NULL/pcm_len=0/turn_complete=true when
  * Gemini's turn ends. This module deliberately never touches the speaker/audio-player APIs itself (a

@@ -76,11 +76,20 @@ PROTECTED_M3A_BLOBS = {
         # get_time() measurement around the one esp_websocket_client_send_text() call in send_audio() to
         # settle whether the bottleneck is a real achievable-throughput ceiling on this hardware/network
         # path, not app-level tuning. Never logs message content, only elapsed_ms/msg_len/pcm_len.
-        "75e7cebde019e55dff0c4cb6fd5c90e6e1347ca7",
+        # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the autonomous synthetic-audio
+        # test mode reliably delivers its clip (proven zero-drop across 4 live runs) but the espeak-ng
+        # voice hasn't elicited a real Gemini reply -- a synthetic-speech-intelligibility limitation, not
+        # a pipeline defect. Added app_gptnix_watcher_voice_send_text_turn(): a `clientContent`/
+        # `turnComplete:true` message (per ai.google.dev/api/live) that deterministically triggers a real
+        # spoken reply independent of speech recognition -- test/diagnostic use only, never called from
+        # the normal microphone-streaming path.
+        "5537b104c89180b05d24c1ef10256fe07f9a2dbb",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.
-        "d8a24a42bc6d4e705d436d708e21925e2330ae76",
+        # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): adds the
+        # app_gptnix_watcher_voice_send_text_turn() declaration (see .c blob comment above).
+        "38028892fea14ebf6b4b2af1a8520861e131d7c0",
     "examples/factory_firmware/main/app/app_wifi.c":
         "96f3e1a240c70c3500f977d59c9aea7ed51b1077",
     "examples/factory_firmware/main/app/app_wifi.h":

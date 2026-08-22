@@ -333,7 +333,13 @@ def _c27():
 
 @check("28. source bounds RX reassembly <=8192")
 def _c28():
-    return "GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES (8192)" in _read(APP_C), ""
+    # M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): 8192 was sized for the tiny (~26-byte)
+    # setupComplete message this buffer originally only ever needed to hold. A live physical test with
+    # real speech showed Gemini's actual serverContent audio response messages are far larger --
+    # observed real fragments up to 33547 bytes -- which the 8192 bound was silently rejecting as a
+    # protocol error, breaking every session the first time it received a real (non-empty) audio reply.
+    # Enlarged to 65536 (PSRAM-allocated, MALLOC_CAP_SPIRAM -- not a scarce resource) with headroom.
+    return "GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES (65536)" in _read(APP_C), ""
 
 
 # 29. source uses payload_offset/payload_len/data_len/fin

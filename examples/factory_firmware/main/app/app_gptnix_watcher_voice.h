@@ -84,13 +84,19 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_text_turn(const 
 
 /**
  * Invoked once per decoded audio chunk from Gemini's spoken response (pcm_data/pcm_len, 24kHz/16-bit/mono
- * raw PCM, turn_complete=false), and once more with pcm_data=NULL/pcm_len=0/turn_complete=true when
- * Gemini's turn ends. This module deliberately never touches the speaker/audio-player APIs itself (a
- * pre-existing, fitness-enforced separation-of-concerns boundary) -- the callback lets an external module
- * (see app_gptnix_watcher_voice_runtime.c) own that. Called from the WS event handler's context.
+ * raw PCM, turn_complete=false, interrupted=false), once more with pcm_data=NULL/pcm_len=0/
+ * turn_complete=true when Gemini's turn ends normally, and once with pcm_data=NULL/pcm_len=0/
+ * interrupted=true when Gemini reports serverContent.interrupted (its own barge-in signal, per
+ * ai.google.dev/gemini-api/docs/live-api/best-practices). Community-validated pattern (Google AI
+ * Developers Forum "Hard-Won Patterns" thread; eastondev.com Gemini Live tutorial): on interrupted=true
+ * the registered callback should stop playback and discard any buffered/queued audio for the aborted
+ * turn immediately, rather than playing it out once the following turnComplete arrives. This module
+ * deliberately never touches the speaker/audio-player APIs itself (a pre-existing, fitness-enforced
+ * separation-of-concerns boundary) -- the callback lets an external module (see
+ * app_gptnix_watcher_voice_runtime.c) own that. Called from the WS event handler's context.
  */
 typedef void (*app_gptnix_watcher_voice_audio_cb_t)(
-    const uint8_t *pcm_data, size_t pcm_len, bool turn_complete, void *user_data);
+    const uint8_t *pcm_data, size_t pcm_len, bool turn_complete, bool interrupted, void *user_data);
 
 void app_gptnix_watcher_voice_set_audio_callback(app_gptnix_watcher_voice_audio_cb_t cb, void *user_data);
 

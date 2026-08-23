@@ -83,13 +83,28 @@ PROTECTED_M3A_BLOBS = {
         # `turnComplete:true` message (per ai.google.dev/api/live) that deterministically triggers a real
         # spoken reply independent of speech recognition -- test/diagnostic use only, never called from
         # the normal microphone-streaming path.
-        "5537b104c89180b05d24c1ef10256fe07f9a2dbb",
+        # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator reported Gemini's
+        # reply repeatedly cutting off mid-sentence even after two separate playback-buffering fixes --
+        # this field (serverContent.interrupted) was previously never parsed/logged at all. Testing
+        # whether Gemini itself is sending its own barge-in signal (likely acoustic echo from this
+        # device's speaker being picked up by its own microphone despite the existing mute logic).
+        # M3C fix (web research follow-up, 2026-08-23): community-validated pattern for
+        # serverContent.interrupted (Google AI Developers Forum "Hard-Won Patterns" thread; eastondev.com
+        # Gemini Live tutorial; ai.google.dev/gemini-api/docs/live-api/best-practices) is to stop playback
+        # and discard buffered audio immediately -- this field was only ever logged before, never acted
+        # on. Now also invokes the audio callback with interrupted=true (pcm_data=NULL/pcm_len=0/
+        # turn_complete=false) so the runtime module can flush its prebuffer/queue. Callback signature
+        # gained a 5th `bool interrupted` parameter (see .h blob comment below); both existing call sites
+        # (per-chunk audio, turn_complete) updated to pass interrupted=false.
+        "427564cfa7a0a1cbfd7c1198cc6d15b9c6218147",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.
         # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): adds the
         # app_gptnix_watcher_voice_send_text_turn() declaration (see .c blob comment above).
-        "38028892fea14ebf6b4b2af1a8520861e131d7c0",
+        # M3C fix (web research follow-up, 2026-08-23): app_gptnix_watcher_voice_audio_cb_t typedef gains
+        # a 5th `bool interrupted` parameter (see .c blob comment above).
+        "f9ba1b313c955e4a103104fb9cacc73b99b23ecb",
     "examples/factory_firmware/main/app/app_wifi.c":
         "96f3e1a240c70c3500f977d59c9aea7ed51b1077",
     "examples/factory_firmware/main/app/app_wifi.h":

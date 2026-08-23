@@ -36,6 +36,7 @@
 #include "app_audio_player.h"
 #include "app_audio_recorder.h"
 #include "app_voice_interaction.h"
+#include "event_loops.h"
 
 
 #ifdef CONFIG_INTR_TRACKING
@@ -43,6 +44,37 @@
 #endif
 
 static const char *TAG = "app_main";
+
+#if CONFIG_GPTNIX_WATCHER_VOICE_RUNTIME
+// Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): thin trampolines
+// matching bsp_set_btn_long_press_cb()/bsp_set_btn_long_release_cb()'s expected void(void) signature
+// (components/sensecap-watcher/sensecap-watcher.c) -- push-to-talk gesture for the M3C voice runtime.
+// Posts a generic CTRL_EVENT rather than calling into GPTNiX-specific code directly, so main.c itself
+// never references the M2 realtime-voice/runtime API (fitness-enforced boundary, see
+// test_watcher_voice_fitness.py check #42 / test_watcher_m3a_provision_fitness.py check #26) --
+// the M3C runtime module is the sole subscriber to CTRL_EVENT_GW_LISTEN_START/STOP.
+// Registered at the same boot-sequence point the vendor's own app_voice_interaction_init() used to run
+// (see the #if block below), matching the same LVGL-encoder-input-device-must-already-exist ordering
+// constraint that call site already proved works.
+static void gw_on_knob_long_press(void)
+{
+    esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_START,
+        NULL, 0, pdMS_TO_TICKS(1000));
+}
+
+static void gw_on_knob_long_release(void)
+{
+    esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_STOP,
+        NULL, 0, pdMS_TO_TICKS(1000));
+}
+
+static void gw_register_knob_listen_trigger(void)
+{
+    bsp_set_btn_long_press_cb(gw_on_knob_long_press);
+    bsp_set_btn_long_release_cb(gw_on_knob_long_release);
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] knob_listen_trigger: registered");
+}
+#endif
 
 #define SENSECAP                                                                                                                                                                                       \
     "\n\
@@ -175,7 +207,20 @@ void app_init(void)
     app_sensecraft_init();
     app_ota_init();
     app_taskflow_init();
+#if !CONFIG_GPTNIX_WATCHER_VOICE_RUNTIME
+    // Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): the vendor's
+    // own voice_interaction feature registers a long-press callback on this SAME physical knob and drives
+    // the SAME singleton app_audio_recorder_stream_* API our M3C runtime uses -- confirmed via the button
+    // component's source (managed_components/espressif__button/iot_button.c) that multiple long-press
+    // thresholds on one control fire cumulatively (shortest first), not exclusively, so a longer GPTNiX
+    // threshold would NOT avoid the conflict; the vendor's 1500ms default would always fire first on any
+    // sufficiently long hold. Disabling the vendor's own assistant in this build variant (operator
+    // confirmed: "ugasi vendorov asistent") avoids the conflict entirely.
     app_voice_interaction_init();
+#endif
+#if CONFIG_GPTNIX_WATCHER_VOICE_RUNTIME
+    gw_register_knob_listen_trigger();
+#endif
     app_wifi_init();
     app_time_init();
     app_at_cmd_init();

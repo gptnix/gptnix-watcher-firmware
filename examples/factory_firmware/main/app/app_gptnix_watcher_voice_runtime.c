@@ -27,6 +27,9 @@
 #include "app_audio_recorder.h"
 #include "app_audio_player.h"
 #include "esp_heap_caps.h"
+#include "esp_event.h"
+#include "event_loops.h"
+#include "data_defs.h"
 #if CONFIG_GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO
 #include <stdio.h>
 #endif
@@ -129,6 +132,17 @@ static StaticRingbuffer_t s_mic_local_rb_struct;
  * turnComplete. Single-writer (this callback runs on the WS event handler's own task context, same as
  * every other voice.c event -- no locking needed, matching that module's existing threading model). */
 static bool s_player_stream_active = false;
+
+// Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): default OFF
+// (push-to-talk, not always-listening) -- addresses the operator's stated privacy concern about the
+// device "hearing everything" continuously. Only gates the REAL capture task below; the synthetic-test-
+// audio capture task (CONFIG_GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO) never checks this, so autonomous/
+// CI testing is unaffected. Plain bool, single extra reader (the capture task loop) -- same tolerated-
+// cross-task-read pattern already used for s_player_stream_active in this file. Driven exclusively by
+// CTRL_EVENT_GW_LISTEN_START/STOP (see s_ctrl_event_handler below), posted by main.c's knob long-press/
+// long-release trampolines -- main.c itself never references this module directly, preserving the
+// pre-existing "main.c never calls the M2 realtime-voice API" boundary.
+static volatile bool s_listening_active = false;
 
 // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): see GW_PLAYER_PREBUFFER_* comment above --
 // accumulates the start of a reply here before actually starting playback, instead of starting on the
@@ -429,7 +443,7 @@ static void s_audio_capture_task(void *arg)
         // responding -- exactly what a HIGH-sensitivity VAD (tuned for latency, see GeminiLiveTokenBroker.
         // js) would interpret as the user talking over it. Also checking s_prebuffering mutes the instant
         // the reply starts arriving, not just once hardware playback actually begins.
-        if (s_player_stream_active || s_prebuffering) {
+        if (!s_listening_active || s_player_stream_active || s_prebuffering) {
             app_audio_recorder_stream_free(chunk);
             continue;
         }
@@ -501,10 +515,45 @@ static void s_audio_send_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static void s_listen_start(void)
+{
+    s_listening_active = true;
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] listen: start");
+}
+
+static void s_listen_stop(void)
+{
+    s_listening_active = false;
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] listen: stop");
+}
+
+static void s_ctrl_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
+{
+    (void)handler_args;
+    (void)base;
+    (void)event_data;
+    if (id == CTRL_EVENT_GW_LISTEN_START) {
+        s_listen_start();
+    } else if (id == CTRL_EVENT_GW_LISTEN_STOP) {
+        s_listen_stop();
+    }
+}
+
 void app_gptnix_watcher_voice_runtime_start(void)
 {
     s_player_stream_active = false;
     app_gptnix_watcher_voice_set_audio_callback(s_on_audio_received, NULL);
+
+    // Knob-trigger follow-up: registered once per runtime start (this function's own existing
+    // once-per-process-lifetime contract, matching s_mic_local_rb/s_player_feed_queue below).
+    static bool s_ctrl_events_registered = false;
+    if (!s_ctrl_events_registered) {
+        esp_event_handler_register_with(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_START,
+            s_ctrl_event_handler, NULL);
+        esp_event_handler_register_with(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_STOP,
+            s_ctrl_event_handler, NULL);
+        s_ctrl_events_registered = true;
+    }
 
     // Allocated once and kept for the process lifetime (matches app_audio_recorder.c's own
     // psram_malloc'd-static-ring-buffer pattern) -- simpler and safer than trying to coordinate a

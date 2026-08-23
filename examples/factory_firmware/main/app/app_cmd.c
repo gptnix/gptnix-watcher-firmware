@@ -23,6 +23,7 @@
 
 #include "iperf.h"
 #include "app_rgb.h"
+#include "app_gptnix_watcher_voice.h"
 
 static const char *TAG = "cmd";
 
@@ -31,6 +32,56 @@ static const char *TAG = "cmd";
 int max(int a, int b) {
     return (a > b) ? a : b;
 }
+
+#if CONFIG_GPTNIX_WATCHER_VOICE
+/** gw_say command -- M3C test/diagnostic tool (see plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up):
+ * sends an arbitrary Gemini Live clientContent text turn over the already-open serial console, so a test
+ * phrase can be tried on the currently-flashed image without a rebuild/reflash/reset cycle. Requires an
+ * active (READY) M2/M3 voice session -- fails closed with a logged state code otherwise. Delegates
+ * entirely to app_gptnix_watcher_voice_send_text_turn(), which already enforces the READY-state guard and
+ * never logs message content; this command adds nothing beyond console wiring. **/
+static struct {
+    struct arg_str *text;
+    struct arg_end *end;
+} gw_say_args;
+
+static int gw_say_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &gw_say_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, gw_say_args.end, argv[0]);
+        return 1;
+    }
+
+    app_gptnix_watcher_voice_state_t state = app_gptnix_watcher_voice_get_state();
+    if (state != GPTNIX_WATCHER_VOICE_STATE_READY) {
+        ESP_LOGW(TAG, "gw_say: voice session not READY (state=%d) -- nothing sent", (int)state);
+        return 1;
+    }
+
+    app_gptnix_watcher_voice_result_t res =
+        app_gptnix_watcher_voice_send_text_turn(gw_say_args.text->sval[0]);
+    ESP_LOGI(TAG, "gw_say: send_text_turn result=%d", (int)res);
+    return (res == GPTNIX_WATCHER_VOICE_RESULT_OK) ? 0 : 1;
+}
+
+static void register_cmd_gw_say(void)
+{
+    gw_say_args.text = arg_str1(NULL, NULL, "<text>", "text for Gemini to speak (quote if it contains spaces)");
+    gw_say_args.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "gw_say",
+        .help = "Send a Gemini Live clientContent text turn now, over serial -- no rebuild/reflash/reset "
+                "needed. Requires an active (READY) voice session.",
+        .hint = NULL,
+        .func = &gw_say_cmd,
+        .argtable = &gw_say_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif /* CONFIG_GPTNIX_WATCHER_VOICE */
+
 
 /** wifi set command **/
 static struct {
@@ -916,6 +967,9 @@ int app_cmd_prepare_repl(void)
     repl_config.max_cmdline_length = 1024;
 
     register_cmd_wifi_sta();
+#if CONFIG_GPTNIX_WATCHER_VOICE
+    register_cmd_gw_say();
+#endif
     register_cmd_force_ota();
     register_cmd_taskflow();
     register_cmd_factory_info();

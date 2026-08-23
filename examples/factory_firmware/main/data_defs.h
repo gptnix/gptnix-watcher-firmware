@@ -338,6 +338,14 @@ enum {
     CTRL_EVENT_VI_RECORD_WAKEUP, //NULL
     CTRL_EVENT_VI_RECORD_STOP, //NULL
 
+    // Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): posted by
+    // main.c's knob long-press/long-release trampolines, consumed by app_gptnix_watcher_voice_runtime.c
+    // (the sole subscriber) -- keeps main.c decoupled from any direct GPTNiX-specific symbol, preserving
+    // the pre-existing "main.c never calls the M2 realtime-voice API directly" boundary (fitness-enforced,
+    // see test_watcher_voice_fitness.py check #42 / test_watcher_m3a_provision_fitness.py check #26).
+    CTRL_EVENT_GW_LISTEN_START, //NULL
+    CTRL_EVENT_GW_LISTEN_STOP, //NULL
+
     CTRL_EVENT_ALL,
 };
 

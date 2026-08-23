@@ -191,9 +191,44 @@ static void s_start_player_stream_with(const uint8_t *pcm_data, size_t pcm_len)
 /* M3C: registered as app_gptnix_watcher_voice.c's audio callback -- owns the ONLY app_audio_player_*
  * call sites reachable from a Gemini WS event, keeping voice.c itself hardware-agnostic (a pre-existing,
  * fitness-enforced separation-of-concerns boundary). Never logs audio content. */
-static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool turn_complete, void *user_data)
+static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool turn_complete, bool interrupted,
+                                 void *user_data)
 {
     (void)user_data;
+
+    // M3C fix (web research follow-up, plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md): community-validated
+    // pattern for serverContent.interrupted (Google AI Developers Forum "Hard-Won Patterns" thread;
+    // eastondev.com Gemini Live tutorial; ai.google.dev/gemini-api/docs/live-api/best-practices) is to
+    // stop playback and discard buffered/queued audio for the aborted turn immediately -- previously we
+    // only logged this field, so an aborted turn's already-prebuffered/queued audio still played out in
+    // full once the following turnComplete arrived. Complements (does not replace) the mute-timing fix
+    // above, which reduces how often interrupted=true fires falsely in the first place; this handles it
+    // correctly on the rare/legitimate occasions it still does.
+    if (interrupted) {
+        bool had_prebuffer = s_prebuffering && s_prebuffer_len > 0;
+        s_prebuffering = false;
+        s_prebuffer_len = 0;
+
+        int drained = 0;
+        gw_player_feed_item_t stale;
+        while (xQueueReceive(s_player_feed_queue, &stale, 0) == pdTRUE) {
+            if (stale.data != NULL) {
+                free(stale.data);
+            }
+            drained++;
+        }
+
+        if (s_player_stream_active) {
+            // Enqueued (not called directly) so app_audio_player_stream_finish() only ever runs on the
+            // feeder task's own context, matching every other lifecycle transition in this file.
+            gw_player_feed_item_t finish_item = { .data = NULL, .len = 0, .turn_complete = true };
+            (void)xQueueSend(s_player_feed_queue, &finish_item, pdMS_TO_TICKS(2000));
+        }
+
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] interrupted_flush had_prebuffer=%d drained=%d stream_active=%d",
+            (int)had_prebuffer, drained, (int)s_player_stream_active);
+        return;
+    }
 
     if (turn_complete) {
         if (s_prebuffering && s_prebuffer_len > 0) {

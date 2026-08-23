@@ -764,6 +764,15 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
             bool is_interrupted = cJSON_IsBool(interrupted) && cJSON_IsTrue(interrupted);
             if (is_interrupted) {
                 ESP_LOGW(TAG, "[V2_WATCHER_VOICE] server_content: interrupted=true");
+                // Web research follow-up (Google AI Developers Forum "Hard-Won Patterns" thread;
+                // eastondev.com Gemini Live tutorial; ai.google.dev/gemini-api/docs/live-api/best-
+                // practices): the community-standard response to this signal is to stop playback and
+                // discard the client-side audio buffer immediately -- previously this field was only
+                // logged, never acted on, so an aborted turn's already-buffered audio still played out
+                // once the following turnComplete arrived.
+                if (s_audio_cb != NULL) {
+                    s_audio_cb(NULL, 0, false, true, s_audio_cb_user_data);
+                }
             }
 
             cJSON *model_turn = cJSON_GetObjectItemCaseSensitive(server_content, "modelTurn");
@@ -794,7 +803,7 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
                     int dec_err = mbedtls_base64_decode(pcm_buf, pcm_cap, &pcm_len,
                         (const uint8_t *)data_item->valuestring, b64_in_len);
                     if (dec_err == 0) {
-                        s_audio_cb(pcm_buf, pcm_len, false, s_audio_cb_user_data);
+                        s_audio_cb(pcm_buf, pcm_len, false, false, s_audio_cb_user_data);
                     }
                     free(pcm_buf);
                 }
@@ -803,7 +812,7 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
     }
 
     if (turn_complete && s_audio_cb != NULL) {
-        s_audio_cb(NULL, 0, true, s_audio_cb_user_data);
+        s_audio_cb(NULL, 0, true, false, s_audio_cb_user_data);
     }
 
     ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_content: full=%d parts=%d turn_complete=%d",

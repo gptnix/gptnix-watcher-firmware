@@ -83,7 +83,12 @@ PROTECTED_M3A_BLOBS = {
         # `turnComplete:true` message (per ai.google.dev/api/live) that deterministically triggers a real
         # spoken reply independent of speech recognition -- test/diagnostic use only, never called from
         # the normal microphone-streaming path.
-        "5537b104c89180b05d24c1ef10256fe07f9a2dbb",
+        # M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator reported Gemini's
+        # reply repeatedly cutting off mid-sentence even after two separate playback-buffering fixes --
+        # this field (serverContent.interrupted) was previously never parsed/logged at all. Testing
+        # whether Gemini itself is sending its own barge-in signal (likely acoustic echo from this
+        # device's speaker being picked up by its own microphone despite the existing mute logic).
+        "f325f9deaefb16880e8c4a0397d88b7b6cd01cd0",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.

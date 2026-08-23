@@ -21,13 +21,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/queue.h"
 
 #include "app_gptnix_watcher_voice.h"
 #include "app_audio_recorder.h"
 #include "app_audio_player.h"
+#include "esp_heap_caps.h"
 #if CONFIG_GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO
 #include <stdio.h>
-#include "esp_heap_caps.h"
 #endif
 #include "util.h"
 
@@ -57,6 +58,38 @@ static const char *TAG = "V2_WATCHER_VOICE_RUNTIME";
 #define GW_AUDIO_OUT_SAMPLE_RATE          (24000)
 #define GW_AUDIO_OUT_BITS_PER_SAMPLE      (16)
 #define GW_AUDIO_OUT_CHANNELS             (1)
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator directly heard audible
+// stutter/jitter in Gemini's spoken reply even with zero send-failure/overflow warnings logged anywhere
+// -- per Gemini Live's own best-practices doc (ai.google.dev/gemini-api/docs/live-api/best-practices:
+// "wait for a minimum buffer size (~170ms) before beginning playback ... helps prevent stuttering") the
+// old code started playback on the very FIRST chunk with no headroom at all, so any natural gap between
+// receiving/decoding successive WS chunks (network jitter, JSON/base64 decode time) could starve the
+// player's own ring buffer even though nothing "failed". Accumulates roughly this much audio before
+// starting playback, giving the player headroom to absorb delivery jitter without an audible glitch.
+#define GW_PLAYER_PREBUFFER_THRESHOLD_BYTES (48000) /* ~1s of 24kHz/16-bit/mono */
+#define GW_PLAYER_PREBUFFER_MAX_BYTES       (96000) /* ~2s hard cap -- flush early rather than drop data */
+
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the pre-buffer above only smooths the START
+// of a reply -- the operator confirmed it helped but did NOT eliminate stuttering, since every chunk
+// AFTER the first was still fed to app_audio_player_stream_send() directly from this WS-event-driven
+// callback, with no headroom against ongoing delivery jitter (network irregularity, JSON/base64 decode
+// time). Applying the SAME decoupling pattern already proven on the mic-upload side (drain into a local
+// queue, feed from a dedicated task) here too: the callback only enqueues (fast, never blocks on the
+// player), a separate feeder task does the actual (blocking) app_audio_player_stream_send() calls, so
+// WS delivery jitter for the ENTIRE reply is absorbed by the queue instead of only the first chunk.
+typedef struct {
+    uint8_t *data;        /* PSRAM-allocated copy, freed by the feeder task after sending; NULL means
+                              this item is a turn_complete signal, not audio. */
+    size_t len;
+    bool turn_complete;
+} gw_player_feed_item_t;
+
+#define GW_PLAYER_FEED_QUEUE_DEPTH        (32)   /* items, not bytes -- bounded mainly by PSRAM headroom */
+#define GW_PLAYER_FEED_TASK_STACK_BYTES   (8192)
+#define GW_PLAYER_FEED_TASK_PRIO          (12)   /* just under AUDIO_PLAYER_TASK_PRIO(13, app_audio_player.h)
+                                                     so it never starves the player's own task, but still
+                                                     preempts the lower-priority mic send task (10) */
+static QueueHandle_t s_player_feed_queue = NULL;
 
 // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): live testing (user actually speaking, longer
 // utterances) showed response latency growing from ~10s to ~50s -- traced to this task doing BOTH the
@@ -97,6 +130,64 @@ static StaticRingbuffer_t s_mic_local_rb_struct;
  * every other voice.c event -- no locking needed, matching that module's existing threading model). */
 static bool s_player_stream_active = false;
 
+// M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): see GW_PLAYER_PREBUFFER_* comment above --
+// accumulates the start of a reply here before actually starting playback, instead of starting on the
+// very first (possibly tiny) chunk.
+static uint8_t *s_prebuffer = NULL;
+static size_t s_prebuffer_len = 0;
+static bool s_prebuffering = false;
+
+/* Starts the player stream with pcm_data/pcm_len as the FIRST chunk (WAV-header-framed, per
+ * app_audio_player.c's __is_wav() contract). Shared by both the pre-buffer-threshold-reached path and
+ * the turn_complete-before-threshold flush path below. */
+static void s_start_player_stream_with(const uint8_t *pcm_data, size_t pcm_len)
+{
+    esp_err_t init_err = app_audio_player_stream_init(0);
+    esp_err_t start_err = app_audio_player_stream_start();
+    s_player_stream_active = true;
+
+    audio_wav_header_t h;
+    memcpy(h.ChunkID, "RIFF", 4);
+    h.ChunkSize = (int32_t)(36 + pcm_len);
+    memcpy(h.Format, "WAVE", 4);
+    memcpy(h.Subchunk1ID, "fmt ", 4);
+    h.Subchunk1Size = 16;
+    h.AudioFormat = 1;
+    h.NumChannels = GW_AUDIO_OUT_CHANNELS;
+    h.SampleRate = GW_AUDIO_OUT_SAMPLE_RATE;
+    h.ByteRate = GW_AUDIO_OUT_SAMPLE_RATE * GW_AUDIO_OUT_CHANNELS * GW_AUDIO_OUT_BITS_PER_SAMPLE / 8;
+    h.BlockAlign = GW_AUDIO_OUT_CHANNELS * GW_AUDIO_OUT_BITS_PER_SAMPLE / 8;
+    h.BitsPerSample = GW_AUDIO_OUT_BITS_PER_SAMPLE;
+    memcpy(h.Subchunk2ID, "data", 4);
+    h.Subchunk2Size = (int32_t)pcm_len;
+
+    // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the user reported the first
+    // physical audio playback sounded like noise, not clear speech -- logging only non-secret
+    // structural facts (error codes, struct size, byte counts) to narrow down whether the cause is
+    // the sample-rate reconfiguration failing, a header-size mismatch, or something else.
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] first_chunk: init_err=%d start_err=%d hdr_sizeof=%d pcm_len=%d",
+        (int)init_err, (int)start_err, (int)sizeof(h), (int)pcm_len);
+
+    uint8_t *framed = (uint8_t *)heap_caps_malloc(sizeof(h) + pcm_len, MALLOC_CAP_SPIRAM);
+    if (framed == NULL) {
+        return;
+    }
+    memcpy(framed, &h, sizeof(h));
+    memcpy(framed + sizeof(h), pcm_data, pcm_len);
+    esp_err_t send_err = app_audio_player_stream_send(framed, sizeof(h) + pcm_len, pdMS_TO_TICKS(GW_AUDIO_BRIDGE_SEND_TIMEOUT_MS));
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] first_chunk: send_err=%d", (int)send_err);
+    free(framed);
+    // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): live testing traced send_err=-1 on
+    // EVERY first chunk to app_audio_player.c's own AUDIO_TYPE_UNKNOWN/WAV-detection branch (a
+    // protected, fitness-frozen file this codebase never modifies -- see check "45. app_audio_player.c
+    // untouched" -- so the caller must adapt instead): its ring-send condition there is inverted
+    // (`if (xRingbufferSend(...) == pdTRUE) return ESP_FAIL;`), unlike the correct `!= pdTRUE` used
+    // for every later chunk a few lines below it in the same function. So on the FIRST chunk only,
+    // ESP_FAIL from this call means the audio WAS successfully queued -- treating it as a real
+    // failure (and resetting s_player_stream_active) was itself corrupting every stream by
+    // re-sending a bogus second WAV header for what the player already saw as chunk 2 of 1.
+}
+
 /* M3C: registered as app_gptnix_watcher_voice.c's audio callback -- owns the ONLY app_audio_player_*
  * call sites reachable from a Gemini WS event, keeping voice.c itself hardware-agnostic (a pre-existing,
  * fitness-enforced separation-of-concerns boundary). Never logs audio content. */
@@ -105,10 +196,18 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
     (void)user_data;
 
     if (turn_complete) {
-        if (s_player_stream_active) {
-            app_audio_player_stream_finish();
-            s_player_stream_active = false;
+        if (s_prebuffering && s_prebuffer_len > 0) {
+            // Reply ended before the pre-buffer threshold was reached (a short reply) -- flush whatever
+            // was accumulated as the one and only chunk rather than discarding it.
+            s_start_player_stream_with(s_prebuffer, s_prebuffer_len);
         }
+        s_prebuffering = false;
+        s_prebuffer_len = 0;
+        // Enqueued (not called directly) so it's processed by the feeder task AFTER any audio items
+        // already queued ahead of it -- calling stream_finish() synchronously here could race ahead of
+        // still-unsent queued audio from the same turn.
+        gw_player_feed_item_t item = { .data = NULL, .len = 0, .turn_complete = true };
+        (void)xQueueSend(s_player_feed_queue, &item, pdMS_TO_TICKS(2000));
         return;
     }
     // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test showed Gemini
@@ -122,56 +221,71 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
     }
 
     if (!s_player_stream_active) {
-        esp_err_t init_err = app_audio_player_stream_init(0);
-        esp_err_t start_err = app_audio_player_stream_start();
-        s_player_stream_active = true;
-
-        audio_wav_header_t h;
-        memcpy(h.ChunkID, "RIFF", 4);
-        h.ChunkSize = (int32_t)(36 + pcm_len);
-        memcpy(h.Format, "WAVE", 4);
-        memcpy(h.Subchunk1ID, "fmt ", 4);
-        h.Subchunk1Size = 16;
-        h.AudioFormat = 1;
-        h.NumChannels = GW_AUDIO_OUT_CHANNELS;
-        h.SampleRate = GW_AUDIO_OUT_SAMPLE_RATE;
-        h.ByteRate = GW_AUDIO_OUT_SAMPLE_RATE * GW_AUDIO_OUT_CHANNELS * GW_AUDIO_OUT_BITS_PER_SAMPLE / 8;
-        h.BlockAlign = GW_AUDIO_OUT_CHANNELS * GW_AUDIO_OUT_BITS_PER_SAMPLE / 8;
-        h.BitsPerSample = GW_AUDIO_OUT_BITS_PER_SAMPLE;
-        memcpy(h.Subchunk2ID, "data", 4);
-        h.Subchunk2Size = (int32_t)pcm_len;
-
-        // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the user reported the first
-        // physical audio playback sounded like noise, not clear speech -- logging only non-secret
-        // structural facts (error codes, struct size, byte counts) to narrow down whether the cause is
-        // the sample-rate reconfiguration failing, a header-size mismatch, or something else.
-        ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] first_chunk: init_err=%d start_err=%d hdr_sizeof=%d pcm_len=%d",
-            (int)init_err, (int)start_err, (int)sizeof(h), (int)pcm_len);
-
-        uint8_t *framed = (uint8_t *)malloc(sizeof(h) + pcm_len);
-        if (framed == NULL) {
-            return;
+        if (!s_prebuffering) {
+            s_prebuffering = true;
+            s_prebuffer_len = 0;
+            if (s_prebuffer == NULL) {
+                s_prebuffer = (uint8_t *)heap_caps_malloc(GW_PLAYER_PREBUFFER_MAX_BYTES, MALLOC_CAP_SPIRAM);
+            }
         }
-        memcpy(framed, &h, sizeof(h));
-        memcpy(framed + sizeof(h), pcm_data, pcm_len);
-        esp_err_t send_err = app_audio_player_stream_send(framed, sizeof(h) + pcm_len, pdMS_TO_TICKS(GW_AUDIO_BRIDGE_SEND_TIMEOUT_MS));
-        ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] first_chunk: send_err=%d", (int)send_err);
-        free(framed);
-        // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): live testing traced send_err=-1 on
-        // EVERY first chunk to app_audio_player.c's own AUDIO_TYPE_UNKNOWN/WAV-detection branch (a
-        // protected, fitness-frozen file this codebase never modifies -- see check "45. app_audio_player.c
-        // untouched" -- so the caller must adapt instead): its ring-send condition there is inverted
-        // (`if (xRingbufferSend(...) == pdTRUE) return ESP_FAIL;`), unlike the correct `!= pdTRUE` used
-        // for every later chunk a few lines below it in the same function. So on the FIRST chunk only,
-        // ESP_FAIL from this call means the audio WAS successfully queued -- treating it as a real
-        // failure (and resetting s_player_stream_active) was itself corrupting every stream by
-        // re-sending a bogus second WAV header for what the player already saw as chunk 2 of 1.
+        if (s_prebuffer != NULL) {
+            size_t space_left = GW_PLAYER_PREBUFFER_MAX_BYTES - s_prebuffer_len;
+            size_t copy_len = (pcm_len < space_left) ? pcm_len : space_left;
+            memcpy(s_prebuffer + s_prebuffer_len, pcm_data, copy_len);
+            s_prebuffer_len += copy_len;
+        }
+        if (s_prebuffer == NULL || s_prebuffer_len >= GW_PLAYER_PREBUFFER_THRESHOLD_BYTES) {
+            s_prebuffering = false;
+            if (s_prebuffer != NULL && s_prebuffer_len > 0) {
+                s_start_player_stream_with(s_prebuffer, s_prebuffer_len);
+            } else {
+                // Allocation failed -- fall back to the old immediate-start behavior rather than losing
+                // this chunk entirely.
+                s_start_player_stream_with(pcm_data, pcm_len);
+            }
+            s_prebuffer_len = 0;
+        }
         return;
     }
 
-    esp_err_t send_err = app_audio_player_stream_send((uint8_t *)pcm_data, pcm_len, pdMS_TO_TICKS(GW_AUDIO_BRIDGE_SEND_TIMEOUT_MS));
-    if (send_err != ESP_OK) {
-        ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] chunk_send_failed err=%d pcm_len=%d", (int)send_err, (int)pcm_len);
+    uint8_t *copy = (uint8_t *)heap_caps_malloc(pcm_len, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] feed_queue_alloc_failed pcm_len=%d", (int)pcm_len);
+        return;
+    }
+    memcpy(copy, pcm_data, pcm_len);
+    gw_player_feed_item_t item = { .data = copy, .len = pcm_len, .turn_complete = false };
+    if (xQueueSend(s_player_feed_queue, &item, pdMS_TO_TICKS(500)) != pdTRUE) {
+        // Queue genuinely full (feeder stalled for a while) -- drop this piece rather than blocking the
+        // WS event handler's own task indefinitely, which would stall RX processing for the whole session.
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] feed_queue_full dropped_len=%d", (int)pcm_len);
+        free(copy);
+    }
+}
+
+/* Drains s_player_feed_queue and does the actual (blocking) app_audio_player_stream_send() calls --
+ * fully decoupled from the WS event handler's own task, so delivery jitter for the WHOLE reply (not just
+ * the pre-buffered first chunk) is absorbed here instead of causing an audible playback gap. */
+static void s_player_feed_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        gw_player_feed_item_t item;
+        if (xQueueReceive(s_player_feed_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (item.turn_complete) {
+            if (s_player_stream_active) {
+                app_audio_player_stream_finish();
+                s_player_stream_active = false;
+            }
+            continue;
+        }
+        esp_err_t send_err = app_audio_player_stream_send(item.data, item.len, pdMS_TO_TICKS(GW_AUDIO_BRIDGE_SEND_TIMEOUT_MS));
+        if (send_err != ESP_OK) {
+            ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] chunk_send_failed err=%d pcm_len=%d", (int)send_err, (int)item.len);
+        }
+        free(item.data);
     }
 }
 
@@ -214,7 +328,7 @@ static void s_audio_capture_task(void *arg)
             ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] synthetic_playback_complete");
             break;
         }
-        if (s_player_stream_active) {
+        if (s_player_stream_active || s_prebuffering) {
             vTaskDelay(pdMS_TO_TICKS(GW_SYNTHETIC_CHUNK_PERIOD_MS));
             continue;
         }
@@ -273,7 +387,14 @@ static void s_audio_capture_task(void *arg)
         // stream (still drains/frees the recorder's ring buffer to avoid backlog) whenever a player
         // stream is active. Not full echo cancellation -- a pragmatic half-duplex approach for this
         // milestone; real barge-in support is a documented non-goal (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md).
-        if (s_player_stream_active) {
+        // M3C fix (follow-up #2): confirmed live via a new `interrupted` diagnostic that Gemini really
+        // was sending its own barge-in signal. Root cause: `s_player_stream_active` only became true once
+        // the pre-buffer threshold was reached (~1s after Gemini's reply started arriving), so the mic
+        // kept sending real audio for that entire window even though Gemini had ALREADY started
+        // responding -- exactly what a HIGH-sensitivity VAD (tuned for latency, see GeminiLiveTokenBroker.
+        // js) would interpret as the user talking over it. Also checking s_prebuffering mutes the instant
+        // the reply starts arriving, not just once hardware playback actually begins.
+        if (s_player_stream_active || s_prebuffering) {
             app_audio_recorder_stream_free(chunk);
             continue;
         }
@@ -311,7 +432,9 @@ static void s_audio_send_task(void *arg)
         // esp_websocket_client's shared send/receive lock for the very same connection Gemini's response
         // is arriving on, most likely the real cause of the reported ~3s/~10s speech cutouts. Left
         // in the ring buffer (not dropped) until playback finishes, then sent as normal.
-        if (s_player_stream_active) {
+        // Also checking s_prebuffering (see the matching capture-task comment) so this task stops
+        // sending the instant Gemini's reply starts arriving, not just once hardware playback begins.
+        if (s_player_stream_active || s_prebuffering) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -377,6 +500,22 @@ void app_gptnix_watcher_voice_runtime_start(void)
         GW_AUDIO_SEND_TASK_STACK_BYTES, NULL, GW_AUDIO_SEND_TASK_PRIO, &send_handle);
     if (send_created != pdPASS) {
         ESP_LOGE(TAG, "[V2_WATCHER_VOICE_RUNTIME] send_task_create_failed");
+    }
+
+    // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): queue-decoupled player feed -- see the
+    // GW_PLAYER_FEED_* comment above. Allocated once and kept for the process lifetime, same rationale
+    // as s_mic_local_rb above.
+    if (s_player_feed_queue == NULL) {
+        s_player_feed_queue = xQueueCreate(GW_PLAYER_FEED_QUEUE_DEPTH, sizeof(gw_player_feed_item_t));
+        if (s_player_feed_queue == NULL) {
+            ESP_LOGE(TAG, "[V2_WATCHER_VOICE_RUNTIME] player_feed_queue_create_failed");
+        }
+    }
+    TaskHandle_t player_feed_handle = NULL;
+    BaseType_t player_feed_created = xTaskCreate(s_player_feed_task, "gw_player_feed",
+        GW_PLAYER_FEED_TASK_STACK_BYTES, NULL, GW_PLAYER_FEED_TASK_PRIO, &player_feed_handle);
+    if (player_feed_created != pdPASS) {
+        ESP_LOGE(TAG, "[V2_WATCHER_VOICE_RUNTIME] player_feed_task_create_failed");
     }
 }
 

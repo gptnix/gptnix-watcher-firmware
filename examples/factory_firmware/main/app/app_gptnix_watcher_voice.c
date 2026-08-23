@@ -752,6 +752,20 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
             cJSON *tc = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
             turn_complete = cJSON_IsBool(tc) && cJSON_IsTrue(tc);
 
+            // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator reported
+            // Gemini's spoken reply repeatedly cutting off mid-sentence even after two separate playback-
+            // buffering fixes -- testing the hypothesis that Gemini itself is sending `interrupted: true`
+            // (its own barge-in signal, per ai.google.dev/gemini-api/docs/live-api/best-practices: "When
+            // the user speaks while the model is replying, the server sends a server_content message with
+            // interrupted: true"), most likely because this device's own speaker output is being picked
+            // back up by its microphone (acoustic echo) despite the existing mic-mute-during-playback
+            // logic. Never logged before -- this field was previously silently ignored entirely.
+            cJSON *interrupted = cJSON_GetObjectItemCaseSensitive(server_content, "interrupted");
+            bool is_interrupted = cJSON_IsBool(interrupted) && cJSON_IsTrue(interrupted);
+            if (is_interrupted) {
+                ESP_LOGW(TAG, "[V2_WATCHER_VOICE] server_content: interrupted=true");
+            }
+
             cJSON *model_turn = cJSON_GetObjectItemCaseSensitive(server_content, "modelTurn");
             cJSON *parts = cJSON_IsObject(model_turn)
                 ? cJSON_GetObjectItemCaseSensitive(model_turn, "parts") : NULL;

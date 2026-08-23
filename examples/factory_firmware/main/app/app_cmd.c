@@ -33,6 +33,7 @@ int max(int a, int b) {
     return (a > b) ? a : b;
 }
 
+#if CONFIG_GPTNIX_WATCHER_VOICE
 /** gw_say command -- M3C test/diagnostic tool (see plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up):
  * sends an arbitrary Gemini Live clientContent text turn over the already-open serial console, so a test
  * phrase can be tried on the currently-flashed image without a rebuild/reflash/reset cycle. Requires an
@@ -79,6 +80,8 @@ static void register_cmd_gw_say(void)
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
+#endif /* CONFIG_GPTNIX_WATCHER_VOICE */
+
 
 /** wifi set command **/
 static struct {
@@ -964,7 +967,9 @@ int app_cmd_prepare_repl(void)
     repl_config.max_cmdline_length = 1024;
 
     register_cmd_wifi_sta();
+#if CONFIG_GPTNIX_WATCHER_VOICE
     register_cmd_gw_say();
+#endif
     register_cmd_force_ota();
     register_cmd_taskflow();
     register_cmd_factory_info();

@@ -30,9 +30,7 @@
 #include "esp_event.h"
 #include "event_loops.h"
 #include "data_defs.h"
-#if CONFIG_GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO
 #include <stdio.h>
-#endif
 #include "util.h"
 
 static const char *TAG = "V2_WATCHER_VOICE_RUNTIME";
@@ -58,7 +56,21 @@ static const char *TAG = "V2_WATCHER_VOICE_RUNTIME";
  * that tripped the transport failure. */
 #define GW_AUDIO_SEND_PIECE_MAX_BYTES      (3000)
 #define GW_AUDIO_BRIDGE_SEND_TIMEOUT_MS   (2000)
-#define GW_AUDIO_OUT_SAMPLE_RATE          (24000)
+// Shared-codec fix (2026-08-23 follow-up, per Gemini second-opinion review of the same root-cause
+// writeup): 16000 instead of Gemini's native 24000 -- Gemini's raw output is resampled down to 16kHz
+// (matching the mic's fixed capture rate) in s_resample_24k_to_16k() below, BEFORE it ever reaches the
+// player. Root cause this avoids entirely: app_audio_player.c resets its own tracked sample_rate on every
+// stream_init() call, so every single Gemini reply (always declaring 24000 in its WAV header) re-triggered
+// bsp_codec_set_fs() (vendor BSP, sensecap-watcher.c) -- which closes AND reopens BOTH the play AND record
+// esp_codec_dev handles together (confirmed by reading esp_codec_dev_open()'s source: it reconfigures the
+// data_if shared by both directions, consistent with RX/TX sharing one I2S clock on this hardware). That
+// left the recorder task's underlying device desynced after the FIRST reply, silently producing nothing
+// on later mic captures. A first attempt to fix this by explicitly restarting the recorder stream after
+// each reply caused a WORSE regression (a full task-watchdog crash, likely priority starvation or a
+// mutex ordering issue against the player's own codec_mutex use) and was reverted. Normalizing all audio
+// to one fixed 16kHz before it ever reaches the driver layer sidesteps the shared-codec state machine
+// entirely instead of fighting it.
+#define GW_AUDIO_OUT_SAMPLE_RATE          (16000)
 #define GW_AUDIO_OUT_BITS_PER_SAMPLE      (16)
 #define GW_AUDIO_OUT_CHANNELS             (1)
 // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator directly heard audible
@@ -69,8 +81,8 @@ static const char *TAG = "V2_WATCHER_VOICE_RUNTIME";
 // receiving/decoding successive WS chunks (network jitter, JSON/base64 decode time) could starve the
 // player's own ring buffer even though nothing "failed". Accumulates roughly this much audio before
 // starting playback, giving the player headroom to absorb delivery jitter without an audible glitch.
-#define GW_PLAYER_PREBUFFER_THRESHOLD_BYTES (48000) /* ~1s of 24kHz/16-bit/mono */
-#define GW_PLAYER_PREBUFFER_MAX_BYTES       (96000) /* ~2s hard cap -- flush early rather than drop data */
+#define GW_PLAYER_PREBUFFER_THRESHOLD_BYTES (32000) /* ~1s of 16kHz/16-bit/mono (post-resample) */
+#define GW_PLAYER_PREBUFFER_MAX_BYTES       (64000) /* ~2s hard cap -- flush early rather than drop data */
 
 // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the pre-buffer above only smooths the START
 // of a reply -- the operator confirmed it helped but did NOT eliminate stuttering, since every chunk
@@ -131,7 +143,15 @@ static StaticRingbuffer_t s_mic_local_rb_struct;
  * app_audio_player's own WAV-detection contract, see app_audio_player.c's __is_wav()). Reset on
  * turnComplete. Single-writer (this callback runs on the WS event handler's own task context, same as
  * every other voice.c event -- no locking needed, matching that module's existing threading model). */
-static bool s_player_stream_active = false;
+// Cross-task visibility fix (2026-08-23 follow-up): a live physical test proved the mute gate was NOT
+// reliably taking effect -- audio_send lines kept firing continuously for 9+ seconds after
+// s_prebuffering should have gone true (confirmed via server_content parts=1 arriving well before the
+// gate engaged). Root cause: this flag is written by the WS event handler task and read in a tight loop
+// by the separate capture/send tasks, but was never declared volatile -- the compiler is free to cache
+// a non-volatile read across loop iterations (and, on this dual-core target, tasks may run on a
+// different core than the writer), so the reader task could keep observing a stale cached value
+// indefinitely instead of re-reading memory. Same fix applied to s_prebuffering below.
+static volatile bool s_player_stream_active = false;
 
 // Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): default OFF
 // (push-to-talk, not always-listening) -- addresses the operator's stated privacy concern about the
@@ -149,7 +169,7 @@ static volatile bool s_listening_active = false;
 // very first (possibly tiny) chunk.
 static uint8_t *s_prebuffer = NULL;
 static size_t s_prebuffer_len = 0;
-static bool s_prebuffering = false;
+static volatile bool s_prebuffering = false;
 
 /* Starts the player stream with pcm_data/pcm_len as the FIRST chunk (WAV-header-framed, per
  * app_audio_player.c's __is_wav() contract). Shared by both the pre-buffer-threshold-reached path and
@@ -202,6 +222,40 @@ static void s_start_player_stream_with(const uint8_t *pcm_data, size_t pcm_len)
     // re-sending a bogus second WAV header for what the player already saw as chunk 2 of 1.
 }
 
+// Shared-codec fix (2026-08-23 follow-up): streaming linear-interpolation resampler, 24000Hz (Gemini's
+// native output) -> 16000Hz (the mic's fixed capture rate, and now the player's only-ever rate -- see the
+// GW_AUDIO_OUT_SAMPLE_RATE comment above for why). Phase-continuous across chunk boundaries via
+// s_resample_prev/s_resample_pos, since Gemini's audio arrives as many small chunks, not one buffer --
+// without carrying state across calls, every chunk boundary would produce an audible click/warp. Reset on
+// every new turn (interrupted or turn_complete) so one turn's trailing phase never bleeds into the next.
+// Linear interpolation (not a full FIR/polyphase filter) is adequate for voice intelligibility at this
+// milestone and is simple enough to reason about correctness for under time pressure -- a definite,
+// bounded-latency, allocation-free-per-sample transform, not a research-grade resampler.
+static int16_t s_resample_prev = 0;
+static float s_resample_pos = 1.0f;
+
+static size_t s_resample_24k_to_16k(const int16_t *in, size_t in_samples, int16_t *out, size_t out_cap)
+{
+    const float step = 24000.0f / 16000.0f; /* 1.5 input samples advance per output sample */
+    size_t out_count = 0;
+    while (out_count < out_cap) {
+        int i0 = (int)s_resample_pos;
+        if ((size_t)(i0 + 1) > in_samples) {
+            break;
+        }
+        float t = s_resample_pos - (float)i0;
+        int16_t v0 = (i0 == 0) ? s_resample_prev : in[i0 - 1];
+        int16_t v1 = in[i0];
+        out[out_count++] = (int16_t)((float)v0 + t * (float)(v1 - v0));
+        s_resample_pos += step;
+    }
+    if (in_samples > 0) {
+        s_resample_prev = in[in_samples - 1];
+    }
+    s_resample_pos -= (float)in_samples;
+    return out_count;
+}
+
 /* M3C: registered as app_gptnix_watcher_voice.c's audio callback -- owns the ONLY app_audio_player_*
  * call sites reachable from a Gemini WS event, keeping voice.c itself hardware-agnostic (a pre-existing,
  * fitness-enforced separation-of-concerns boundary). Never logs audio content. */
@@ -222,6 +276,8 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
         bool had_prebuffer = s_prebuffering && s_prebuffer_len > 0;
         s_prebuffering = false;
         s_prebuffer_len = 0;
+        s_resample_prev = 0;
+        s_resample_pos = 1.0f;
 
         int drained = 0;
         gw_player_feed_item_t stale;
@@ -252,6 +308,8 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
         }
         s_prebuffering = false;
         s_prebuffer_len = 0;
+        s_resample_prev = 0;
+        s_resample_pos = 1.0f;
         // Enqueued (not called directly) so it's processed by the feeder task AFTER any audio items
         // already queued ahead of it -- calling stream_finish() synchronously here could race ahead of
         // still-unsent queued audio from the same turn.
@@ -266,6 +324,21 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
     // a valid header, silently breaking every subsequent real chunk in that turn. Skips chunks too small
     // to carry a real sample pair (stereo/mono 16-bit) instead of starting a stream on them.
     if (pcm_data == NULL || pcm_len < 4) {
+        return;
+    }
+
+    size_t in_samples = pcm_len / 2;
+    size_t out_cap = (in_samples * 2) / 3 + 4;
+    int16_t *resampled = (int16_t *)heap_caps_malloc(out_cap * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (resampled == NULL) {
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] resample_alloc_failed pcm_len=%d", (int)pcm_len);
+        return;
+    }
+    size_t out_samples = s_resample_24k_to_16k((const int16_t *)pcm_data, in_samples, resampled, out_cap);
+    pcm_data = (const uint8_t *)resampled;
+    pcm_len = out_samples * 2;
+    if (pcm_len < 4) {
+        free(resampled);
         return;
     }
 
@@ -294,12 +367,14 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
             }
             s_prebuffer_len = 0;
         }
+        free(resampled);
         return;
     }
 
     uint8_t *copy = (uint8_t *)heap_caps_malloc(pcm_len, MALLOC_CAP_SPIRAM);
     if (copy == NULL) {
         ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] feed_queue_alloc_failed pcm_len=%d", (int)pcm_len);
+        free(resampled);
         return;
     }
     memcpy(copy, pcm_data, pcm_len);
@@ -310,6 +385,7 @@ static void s_on_audio_received(const uint8_t *pcm_data, size_t pcm_len, bool tu
         ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] feed_queue_full dropped_len=%d", (int)pcm_len);
         free(copy);
     }
+    free(resampled);
 }
 
 /* Drains s_player_feed_queue and does the actual (blocking) app_audio_player_stream_send() calls --
@@ -443,6 +519,13 @@ static void s_audio_capture_task(void *arg)
         // responding -- exactly what a HIGH-sensitivity VAD (tuned for latency, see GeminiLiveTokenBroker.
         // js) would interpret as the user talking over it. Also checking s_prebuffering mutes the instant
         // the reply starts arriving, not just once hardware playback actually begins.
+        // TEMP diagnostic (2026-08-24, live debugging, to be removed): direct visibility into the
+        // three gate flags plus recv_len, since the click-toggle mechanism is confirmed working
+        // (listen: start/stop fire correctly) but audio_send has still been observed at zero for
+        // minutes-long listening windows -- logging every real chunk arrival to see exactly which flag
+        // (if any) is blocking forwarding, no non-secret content, just booleans/counts.
+        ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] gate_check listening=%d player_active=%d prebuffering=%d recv_len=%d",
+            (int)s_listening_active, (int)s_player_stream_active, (int)s_prebuffering, (int)recv_len);
         if (!s_listening_active || s_player_stream_active || s_prebuffering) {
             app_audio_recorder_stream_free(chunk);
             continue;
@@ -517,6 +600,12 @@ static void s_audio_send_task(void *arg)
 
 static void s_listen_start(void)
 {
+    // Show the vendor's own push-to-talk/listening screen (the closest existing UI state to a listening
+    // indicator -- the same VIEW_EVENT the vendor voice assistant posts when IT starts recording, before
+    // we disabled it in this build). Posted to the general-purpose VIEW_EVENT_BASE bus (not GPTNiX-
+    // specific), so this does not cross the M2 API boundary.
+    esp_event_post_to(app_event_loop_handle, VIEW_EVENT_BASE, VIEW_EVENT_VI_RECORDING,
+        NULL, 0, pdMS_TO_TICKS(1000));
     s_listening_active = true;
     ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] listen: start");
 }

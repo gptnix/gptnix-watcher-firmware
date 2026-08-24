@@ -46,9 +46,12 @@
 static const char *TAG = "app_main";
 
 #if CONFIG_GPTNIX_WATCHER_VOICE_RUNTIME
-// Knob-trigger follow-up (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up, 2026-08-23): thin trampolines
-// matching bsp_set_btn_long_press_cb()/bsp_set_btn_long_release_cb()'s expected void(void) signature
-// (components/sensecap-watcher/sensecap-watcher.c) -- push-to-talk gesture for the M3C voice runtime.
+// Knob-trigger follow-up (2026-08-24): click-to-TOGGLE, not hold-to-talk. The operator explicitly
+// clarified the intended UX after repeated confusion tonight: a single click should start listening
+// (with an audible/visual cue), and a SECOND click should end the session -- not a press-and-hold
+// gesture. The original design used BUTTON_LONG_PRESS_START/UP (a ~1.5s hold), which a normal quick
+// click never crosses the threshold for -- almost certainly the root cause of most of tonight's
+// "kotacic ne radi" reports, since the operator was clicking, not holding.
 // Posts a generic CTRL_EVENT rather than calling into GPTNiX-specific code directly, so main.c itself
 // never references the M2 realtime-voice/runtime API (fitness-enforced boundary, see
 // test_watcher_voice_fitness.py check #42 / test_watcher_m3a_provision_fitness.py check #26) --
@@ -56,23 +59,25 @@ static const char *TAG = "app_main";
 // Registered at the same boot-sequence point the vendor's own app_voice_interaction_init() used to run
 // (see the #if block below), matching the same LVGL-encoder-input-device-must-already-exist ordering
 // constraint that call site already proved works.
-static void gw_on_knob_long_press(void)
-{
-    esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_START,
-        NULL, 0, pdMS_TO_TICKS(1000));
-}
+static volatile bool s_gw_knob_listening = false;
 
-static void gw_on_knob_long_release(void)
+static void gw_on_knob_click(void)
 {
-    esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_STOP,
-        NULL, 0, pdMS_TO_TICKS(1000));
+    if (!s_gw_knob_listening) {
+        s_gw_knob_listening = true;
+        esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_START,
+            NULL, 0, pdMS_TO_TICKS(1000));
+    } else {
+        s_gw_knob_listening = false;
+        esp_event_post_to(app_event_loop_handle, CTRL_EVENT_BASE, CTRL_EVENT_GW_LISTEN_STOP,
+            NULL, 0, pdMS_TO_TICKS(1000));
+    }
 }
 
 static void gw_register_knob_listen_trigger(void)
 {
-    bsp_set_btn_long_press_cb(gw_on_knob_long_press);
-    bsp_set_btn_long_release_cb(gw_on_knob_long_release);
-    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] knob_listen_trigger: registered");
+    bsp_set_btn_click_cb(gw_on_knob_click);
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] knob_listen_trigger: registered mode=click_toggle");
 }
 #endif
 

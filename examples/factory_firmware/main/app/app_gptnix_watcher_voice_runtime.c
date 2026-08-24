@@ -492,6 +492,19 @@ static void s_audio_capture_task(void *arg)
     }
     ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] capture_task_started");
 
+    // Diagnostic follow-up (2026-08-24, diag/m3c-recorder-stall-rootcause, Phase A): replaces the prior
+    // per-chunk-only `gate_check` line (which could only ever fire AFTER a non-NULL chunk, and therefore
+    // could not distinguish "stream_recv() keeps returning NULL" from "this task itself stopped
+    // progressing"). These counters are local to this task's own stack frame (no global owner needed,
+    // this task is the sole reader/writer) and are updated on EVERY loop iteration, NULL or not, so a
+    // rate-limited heartbeat below can prove liveness independent of whether any audio was received.
+    uint32_t loop_count = 0;
+    uint32_t chunk_count = 0;
+    uint32_t byte_count = 0;
+    uint32_t null_count = 0;
+    uint32_t null_streak = 0;
+    TickType_t last_diag_tick = xTaskGetTickCount();
+
     for (;;) {
         app_gptnix_watcher_voice_state_t state = app_gptnix_watcher_voice_get_state();
         if (state != GPTNIX_WATCHER_VOICE_STATE_READY) {
@@ -499,9 +512,36 @@ static void s_audio_capture_task(void *arg)
             break;
         }
 
+        loop_count++;
+        TickType_t recv_start_tick = xTaskGetTickCount();
         size_t recv_len = 0;
         uint8_t *chunk = app_audio_recorder_stream_recv(&recv_len,
             pdMS_TO_TICKS(GW_AUDIO_BRIDGE_RECV_TIMEOUT_MS));
+        TickType_t recv_elapsed_ticks = xTaskGetTickCount() - recv_start_tick;
+
+        if (chunk == NULL) {
+            null_count++;
+            null_streak++;
+        } else {
+            chunk_count++;
+            byte_count += (uint32_t)recv_len;
+            null_streak = 0;
+        }
+
+        TickType_t now_tick = xTaskGetTickCount();
+        if ((now_tick - last_diag_tick) >= pdMS_TO_TICKS(2000)) {
+            last_diag_tick = now_tick;
+            ESP_LOGI(TAG,
+                "[V2_WATCHER_VOICE_RUNTIME] capture_diag: loops=%lu chunks=%lu bytes=%lu nulls=%lu "
+                "null_streak=%lu recv_ms=%lu rec_status=%d listen=%d player=%d prebuffer=%d stack_hwm=%lu",
+                (unsigned long)loop_count, (unsigned long)chunk_count, (unsigned long)byte_count,
+                (unsigned long)null_count, (unsigned long)null_streak,
+                (unsigned long)(recv_elapsed_ticks * portTICK_PERIOD_MS),
+                app_audio_recorder_status_get(),
+                (int)s_listening_active, (int)s_player_stream_active, (int)s_prebuffering,
+                (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+        }
+
         if (chunk == NULL) {
             continue; /* no audio arrived within the wait window -- loop and re-check state */
         }
@@ -519,13 +559,6 @@ static void s_audio_capture_task(void *arg)
         // responding -- exactly what a HIGH-sensitivity VAD (tuned for latency, see GeminiLiveTokenBroker.
         // js) would interpret as the user talking over it. Also checking s_prebuffering mutes the instant
         // the reply starts arriving, not just once hardware playback actually begins.
-        // TEMP diagnostic (2026-08-24, live debugging, to be removed): direct visibility into the
-        // three gate flags plus recv_len, since the click-toggle mechanism is confirmed working
-        // (listen: start/stop fire correctly) but audio_send has still been observed at zero for
-        // minutes-long listening windows -- logging every real chunk arrival to see exactly which flag
-        // (if any) is blocking forwarding, no non-secret content, just booleans/counts.
-        ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] gate_check listening=%d player_active=%d prebuffering=%d recv_len=%d",
-            (int)s_listening_active, (int)s_player_stream_active, (int)s_prebuffering, (int)recv_len);
         if (!s_listening_active || s_player_stream_active || s_prebuffering) {
             app_audio_recorder_stream_free(chunk);
             continue;

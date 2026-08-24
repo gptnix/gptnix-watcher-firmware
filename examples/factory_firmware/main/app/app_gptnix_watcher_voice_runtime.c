@@ -414,6 +414,126 @@ static void s_player_feed_task(void *arg)
     }
 }
 
+// Diagnostic follow-up (2026-08-24, diag/m3c-recorder-stall-rootcause, Phase B-E): the Phase A per-loop
+// capture_diag heartbeat proved progress inside s_audio_capture_task stops being externally observable,
+// but that heartbeat ran INSIDE the diagnosed task itself, after stream_recv() and before the rest of the
+// loop -- so its disappearance could not distinguish blocking in the next call after the last heartbeat,
+// from blocking in stream_recv() itself, from app_audio_recorder_stream_free(), from xRingbufferSend(),
+// from task exit/delete/suspend, from scheduler starvation, or even from the ESP_LOGI call itself
+// perturbing/blocking the task. Replaced with a non-blocking, non-logging, critical-section-protected
+// stage snapshot updated by the capture task at every meaningful boundary, observed and logged by a
+// SEPARATE low-priority task -- so the observer keeps reporting even if the capture task itself freezes
+// at any single stage, and the frozen stage_seq pinpoints exactly which boundary it never returned from.
+typedef enum {
+    GW_CAPTURE_STAGE_NOT_STARTED = 0,
+    GW_CAPTURE_STAGE_LOOP_TOP,
+    GW_CAPTURE_STAGE_BEFORE_STATE_READ,
+    GW_CAPTURE_STAGE_AFTER_STATE_READ,
+    GW_CAPTURE_STAGE_BEFORE_RECV,
+    GW_CAPTURE_STAGE_AFTER_RECV_NULL,
+    GW_CAPTURE_STAGE_AFTER_RECV_CHUNK,
+    GW_CAPTURE_STAGE_BEFORE_GATE_FREE,
+    GW_CAPTURE_STAGE_AFTER_GATE_FREE,
+    GW_CAPTURE_STAGE_BEFORE_LOCAL_RB_SEND,
+    GW_CAPTURE_STAGE_AFTER_LOCAL_RB_SEND,
+    GW_CAPTURE_STAGE_BEFORE_FINAL_FREE,
+    GW_CAPTURE_STAGE_AFTER_FINAL_FREE,
+    GW_CAPTURE_STAGE_LOOP_END,
+    GW_CAPTURE_STAGE_EXITING,
+} gw_capture_diag_stage_t;
+
+typedef struct {
+    gw_capture_diag_stage_t stage;
+    uint32_t stage_seq;
+    uint32_t loop_count;
+    TickType_t last_update_tick;
+    int last_core;
+    size_t last_recv_len;
+    bool last_recv_was_null;
+    esp_err_t last_free_result;
+    int last_local_rb_result;
+} gw_capture_diag_snapshot_t;
+
+static gw_capture_diag_snapshot_t s_capture_diag_snapshot;
+static portMUX_TYPE s_capture_diag_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_capture_task_handle = NULL;
+
+/* Only ever called from s_audio_capture_task's own context. Bounded, non-blocking, no logging/allocation/
+ * queue/ringbuffer/network/codec call inside the critical section -- so this call can never itself become
+ * a new blocking boundary the observer would need to distinguish from the ones it instruments. */
+static void s_capture_diag_mark(gw_capture_diag_stage_t stage, uint32_t loop_count, size_t recv_len,
+                                 bool recv_was_null, esp_err_t free_result, BaseType_t local_rb_result)
+{
+    portENTER_CRITICAL(&s_capture_diag_mux);
+    s_capture_diag_snapshot.stage = stage;
+    s_capture_diag_snapshot.stage_seq++;
+    s_capture_diag_snapshot.loop_count = loop_count;
+    s_capture_diag_snapshot.last_update_tick = xTaskGetTickCount();
+    s_capture_diag_snapshot.last_core = (int)xPortGetCoreID();
+    s_capture_diag_snapshot.last_recv_len = recv_len;
+    s_capture_diag_snapshot.last_recv_was_null = recv_was_null;
+    s_capture_diag_snapshot.last_free_result = free_result;
+    s_capture_diag_snapshot.last_local_rb_result = (int)local_rb_result;
+    portEXIT_CRITICAL(&s_capture_diag_mux);
+}
+
+#define GW_CAPTURE_DIAG_TASK_STACK_BYTES   (4096)
+#define GW_CAPTURE_DIAG_TASK_PRIO          (4)
+#define GW_CAPTURE_DIAG_PERIOD_MS          (1000)
+#define GW_CAPTURE_STALL_THRESHOLD_MS      (3000)
+
+/* Independent observer -- deliberately never calls into the recorder/codec/network/player, so it keeps
+ * running (and keeps proving system liveness) even if the capture task freezes on any one of those. */
+static void s_capture_diag_observer_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_reported_seq = 0;
+    bool stall_reported_for_seq = false;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(GW_CAPTURE_DIAG_PERIOD_MS));
+
+        gw_capture_diag_snapshot_t snap;
+        portENTER_CRITICAL(&s_capture_diag_mux);
+        snap = s_capture_diag_snapshot;
+        portEXIT_CRITICAL(&s_capture_diag_mux);
+
+        TickType_t now_tick = xTaskGetTickCount();
+        uint32_t age_ms = (uint32_t)((now_tick - snap.last_update_tick) * portTICK_PERIOD_MS);
+
+        int task_state = -1;
+#if INCLUDE_eTaskGetState
+        if (s_capture_task_handle != NULL) {
+            task_state = (int)eTaskGetState(s_capture_task_handle);
+        }
+#endif
+        uint32_t stack_hwm = 0;
+        if (s_capture_task_handle != NULL) {
+            stack_hwm = (uint32_t)uxTaskGetStackHighWaterMark(s_capture_task_handle);
+        }
+
+        ESP_LOGI(TAG,
+            "[V2_WATCHER_VOICE_RUNTIME] capture_watch: stage=%d seq=%lu age_ms=%lu loop=%lu core=%d "
+            "task_state=%d stack_hwm=%lu recv_len=%lu recv_null=%d free_ret=%d rb_ret=%d",
+            (int)snap.stage, (unsigned long)snap.stage_seq, (unsigned long)age_ms,
+            (unsigned long)snap.loop_count, snap.last_core, task_state, (unsigned long)stack_hwm,
+            (unsigned long)snap.last_recv_len, (int)snap.last_recv_was_null,
+            (int)snap.last_free_result, snap.last_local_rb_result);
+
+        if (age_ms >= GW_CAPTURE_STALL_THRESHOLD_MS) {
+            if (!stall_reported_for_seq || snap.stage_seq != last_reported_seq) {
+                stall_reported_for_seq = true;
+                last_reported_seq = snap.stage_seq;
+                ESP_LOGW(TAG,
+                    "[V2_WATCHER_VOICE_RUNTIME] capture_stall: stage=%d seq=%lu age_ms=%lu task_state=%d",
+                    (int)snap.stage, (unsigned long)snap.stage_seq, (unsigned long)age_ms, task_state);
+            }
+        } else {
+            stall_reported_for_seq = false;
+        }
+    }
+}
+
 #if CONFIG_GPTNIX_WATCHER_VOICE_SYNTHETIC_TEST_AUDIO
 #define GW_SYNTHETIC_TEST_AUDIO_PATH   "/spiffs/gptnix_synth_test.pcm"
 #define GW_SYNTHETIC_CHUNK_BYTES       (16000) /* matches AUDIO_RECORDER_RINGBUF_CHUNK_SIZE pacing */
@@ -492,59 +612,37 @@ static void s_audio_capture_task(void *arg)
     }
     ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] capture_task_started");
 
-    // Diagnostic follow-up (2026-08-24, diag/m3c-recorder-stall-rootcause, Phase A): replaces the prior
-    // per-chunk-only `gate_check` line (which could only ever fire AFTER a non-NULL chunk, and therefore
-    // could not distinguish "stream_recv() keeps returning NULL" from "this task itself stopped
-    // progressing"). These counters are local to this task's own stack frame (no global owner needed,
-    // this task is the sole reader/writer) and are updated on EVERY loop iteration, NULL or not, so a
-    // rate-limited heartbeat below can prove liveness independent of whether any audio was received.
+    // Diagnostic follow-up (2026-08-24, diag/m3c-recorder-stall-rootcause, Phase B-E): replaces the prior
+    // in-task capture_diag heartbeat (Phase A) with a stage-snapshot mark at every meaningful boundary --
+    // see the s_capture_diag_mark/s_capture_diag_observer_task comment above for why the observer must be
+    // a SEPARATE task. This task itself no longer performs any periodic logging.
     uint32_t loop_count = 0;
-    uint32_t chunk_count = 0;
-    uint32_t byte_count = 0;
-    uint32_t null_count = 0;
-    uint32_t null_streak = 0;
-    TickType_t last_diag_tick = xTaskGetTickCount();
 
     for (;;) {
+        s_capture_diag_mark(GW_CAPTURE_STAGE_LOOP_TOP, loop_count, 0, false, ESP_OK, pdFALSE);
+
+        s_capture_diag_mark(GW_CAPTURE_STAGE_BEFORE_STATE_READ, loop_count, 0, false, ESP_OK, pdFALSE);
         app_gptnix_watcher_voice_state_t state = app_gptnix_watcher_voice_get_state();
+        s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_STATE_READ, loop_count, 0, false, ESP_OK, pdFALSE);
         if (state != GPTNIX_WATCHER_VOICE_STATE_READY) {
+            s_capture_diag_mark(GW_CAPTURE_STAGE_EXITING, loop_count, 0, false, ESP_OK, pdFALSE);
             ESP_LOGI(TAG, "[V2_WATCHER_VOICE_RUNTIME] capture_task_ended state=%d", (int)state);
             break;
         }
 
         loop_count++;
-        TickType_t recv_start_tick = xTaskGetTickCount();
+
+        s_capture_diag_mark(GW_CAPTURE_STAGE_BEFORE_RECV, loop_count, 0, false, ESP_OK, pdFALSE);
         size_t recv_len = 0;
         uint8_t *chunk = app_audio_recorder_stream_recv(&recv_len,
             pdMS_TO_TICKS(GW_AUDIO_BRIDGE_RECV_TIMEOUT_MS));
-        TickType_t recv_elapsed_ticks = xTaskGetTickCount() - recv_start_tick;
 
         if (chunk == NULL) {
-            null_count++;
-            null_streak++;
-        } else {
-            chunk_count++;
-            byte_count += (uint32_t)recv_len;
-            null_streak = 0;
-        }
-
-        TickType_t now_tick = xTaskGetTickCount();
-        if ((now_tick - last_diag_tick) >= pdMS_TO_TICKS(2000)) {
-            last_diag_tick = now_tick;
-            ESP_LOGI(TAG,
-                "[V2_WATCHER_VOICE_RUNTIME] capture_diag: loops=%lu chunks=%lu bytes=%lu nulls=%lu "
-                "null_streak=%lu recv_ms=%lu rec_status=%d listen=%d player=%d prebuffer=%d stack_hwm=%lu",
-                (unsigned long)loop_count, (unsigned long)chunk_count, (unsigned long)byte_count,
-                (unsigned long)null_count, (unsigned long)null_streak,
-                (unsigned long)(recv_elapsed_ticks * portTICK_PERIOD_MS),
-                app_audio_recorder_status_get(),
-                (int)s_listening_active, (int)s_player_stream_active, (int)s_prebuffering,
-                (unsigned long)uxTaskGetStackHighWaterMark(NULL));
-        }
-
-        if (chunk == NULL) {
+            s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_RECV_NULL, loop_count, 0, true, ESP_OK, pdFALSE);
+            s_capture_diag_mark(GW_CAPTURE_STAGE_LOOP_END, loop_count, 0, true, ESP_OK, pdFALSE);
             continue; /* no audio arrived within the wait window -- loop and re-check state */
         }
+        s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_RECV_CHUNK, loop_count, recv_len, false, ESP_OK, pdFALSE);
         // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test showed Gemini's
         // spoken response being cut off/interrupted -- the mic keeps sending continuously even while the
         // device's OWN speaker is actively playing Gemini's response, which the mic picks back up
@@ -560,13 +658,22 @@ static void s_audio_capture_task(void *arg)
         // js) would interpret as the user talking over it. Also checking s_prebuffering mutes the instant
         // the reply starts arriving, not just once hardware playback actually begins.
         if (!s_listening_active || s_player_stream_active || s_prebuffering) {
-            app_audio_recorder_stream_free(chunk);
+            s_capture_diag_mark(GW_CAPTURE_STAGE_BEFORE_GATE_FREE, loop_count, recv_len, false, ESP_OK, pdFALSE);
+            esp_err_t gate_free_result = app_audio_recorder_stream_free(chunk);
+            s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_GATE_FREE, loop_count, recv_len, false, gate_free_result, pdFALSE);
+            s_capture_diag_mark(GW_CAPTURE_STAGE_LOOP_END, loop_count, recv_len, false, gate_free_result, pdFALSE);
             continue;
         }
-        if (xRingbufferSend(s_mic_local_rb, chunk, recv_len, pdMS_TO_TICKS(GW_AUDIO_LOCAL_RB_PUSH_TIMEOUT_MS)) != pdTRUE) {
+        s_capture_diag_mark(GW_CAPTURE_STAGE_BEFORE_LOCAL_RB_SEND, loop_count, recv_len, false, ESP_OK, pdFALSE);
+        BaseType_t rb_result = xRingbufferSend(s_mic_local_rb, chunk, recv_len, pdMS_TO_TICKS(GW_AUDIO_LOCAL_RB_PUSH_TIMEOUT_MS));
+        s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_LOCAL_RB_SEND, loop_count, recv_len, false, ESP_OK, rb_result);
+        if (rb_result != pdTRUE) {
             ESP_LOGW(TAG, "[V2_WATCHER_VOICE_RUNTIME] local_rb_overflow dropped_len=%d", (int)recv_len);
         }
-        app_audio_recorder_stream_free(chunk);
+        s_capture_diag_mark(GW_CAPTURE_STAGE_BEFORE_FINAL_FREE, loop_count, recv_len, false, ESP_OK, rb_result);
+        esp_err_t final_free_result = app_audio_recorder_stream_free(chunk);
+        s_capture_diag_mark(GW_CAPTURE_STAGE_AFTER_FINAL_FREE, loop_count, recv_len, false, final_free_result, rb_result);
+        s_capture_diag_mark(GW_CAPTURE_STAGE_LOOP_END, loop_count, recv_len, false, final_free_result, rb_result);
     }
 
     app_audio_recorder_stream_stop();
@@ -699,6 +806,23 @@ void app_gptnix_watcher_voice_runtime_start(void)
         GW_AUDIO_BRIDGE_TASK_STACK_BYTES, NULL, GW_AUDIO_BRIDGE_TASK_PRIO, &capture_handle);
     if (capture_created != pdPASS) {
         ESP_LOGE(TAG, "[V2_WATCHER_VOICE_RUNTIME] capture_task_create_failed");
+    } else {
+        // Diagnostic follow-up (2026-08-24, diag/m3c-recorder-stall-rootcause, Phase E): the observer must
+        // be created AFTER the capture task it observes, using that task's own real handle -- never a
+        // second capture task. Seeding last_update_tick here (instead of leaving it at its static
+        // zero-init default) avoids a false capture_stall on the very first observer tick, before the
+        // capture task has had a chance to reach its own first LOOP_TOP mark.
+        s_capture_task_handle = capture_handle;
+        portENTER_CRITICAL(&s_capture_diag_mux);
+        s_capture_diag_snapshot.last_update_tick = xTaskGetTickCount();
+        portEXIT_CRITICAL(&s_capture_diag_mux);
+
+        TaskHandle_t capture_diag_handle = NULL;
+        BaseType_t capture_diag_created = xTaskCreate(s_capture_diag_observer_task, "gw_capture_diag",
+            GW_CAPTURE_DIAG_TASK_STACK_BYTES, NULL, GW_CAPTURE_DIAG_TASK_PRIO, &capture_diag_handle);
+        if (capture_diag_created != pdPASS) {
+            ESP_LOGE(TAG, "[V2_WATCHER_VOICE_RUNTIME] capture_diag_task_create_failed");
+        }
     }
 
     TaskHandle_t send_handle = NULL;

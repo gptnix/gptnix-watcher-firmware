@@ -96,7 +96,19 @@ PROTECTED_M3A_BLOBS = {
         # turn_complete=false) so the runtime module can flush its prebuffer/queue. Callback signature
         # gained a 5th `bool interrupted` parameter (see .h blob comment below); both existing call sites
         # (per-chunk audio, turn_complete) updated to pass interrupted=false.
-        "427564cfa7a0a1cbfd7c1198cc6d15b9c6218147",
+        # WS close contract audit (diag/m3c-recorder-stall-rootcause follow-up, 2026-08-25): a live
+        # 600-second passive soak proved the audio tasks' apparent "recorder stall" is actually a clean
+        # exit triggered by a remote WS Close frame -- but WEBSOCKET_EVENT_CLOSED always dispatches with
+        # NULL event data (confirmed against the pinned esp_websocket_client 1.7.0 source), so the close
+        # code/reason length is only ever available inside the WEBSOCKET_EVENT_DATA event carrying
+        # op_code=0x08, which the existing short-circuit discarded before this change. Adds a close-frame
+        # diagnostic there (bounded integers only, never the reason text), plus a READY-state top-level
+        # server-message-kind classifier (serverContent/sessionResumptionUpdate/goAway/toolCall/
+        # toolCallCancellation/setupComplete presence only) and bounded parsers for goAway.timeLeft
+        # (protobuf Duration-as-JSON-string, e.g. "58.234s") and sessionResumptionUpdate.newHandle
+        # (presence/length only, never the handle value). No state-machine, reconnect, or task-lifecycle
+        # behavior changed -- diagnostics only, purely additive (163 lines, zero deletions).
+        "575d0f0699e2aff328814c54aadce370544cd628",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.

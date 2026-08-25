@@ -120,7 +120,22 @@ PROTECTED_M3A_BLOBS = {
         # esp_websocket_client 1.7.0 source (HARD GATE B/3). disable_auto_reconnect, task lifecycle,
         # sample rates, resampler, and recorder/player are all untouched. Purely additive (237 lines,
         # zero deletions).
-        "a617efd79ae72d064ab558b4f9c7eeb1ae12542a",
+        # M3C.1B fresh-pin correction (2026-08-25, caught by this task's own Phase B "re-run all reported
+        # M3C.1A tests from clean states" gate, which found this pin stale/failing against PR #19's actual
+        # committed head): a617efd79ae72d064ab558b4f9c7eeb1ae12542a was computed and pinned one edit before
+        # what was actually committed -- a final, purely cosmetic comment-wording fix inside
+        # app_gptnix_watcher_voice_resume_once()'s own docstring (changing "No second
+        # esp_websocket_client_init()" to "No second call to the client-init API", specifically to stop
+        # that comment's own literal text from false-positive-matching fitness check #70 in
+        # test_watcher_voice_fitness.py), made after the pin was computed but never re-pinned before
+        # commit -- a gap in that session's own process, not a functional code change. The stale blob
+        # (a617efd7...) was never committed to git and is no longer independently retrievable to diff
+        # against directly; instead, the CURRENT file (this exact hash) was independently re-verified by
+        # a full fresh run of test_watcher_voice_fitness.py's all 75 checks (token zeroization, single
+        # ws_client, no auto-resume caller, disable_auto_reconnect unchanged, handle never logged, etc.),
+        # PASS, confirming no functional/security regression regardless of the unrecoverable prior hash.
+        # Freshly recomputed via git hash-object against the actual current file.
+        "e04f58cefa4a1b02a8954d63f005db3ed33b0ab5",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.

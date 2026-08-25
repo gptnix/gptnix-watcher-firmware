@@ -65,6 +65,20 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_disconnect(void);
 app_gptnix_watcher_voice_state_t app_gptnix_watcher_voice_get_state(void);
 
 /**
+ * M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_ADDENDUM_
+ * 2026-08-25.md). Caller-context ONLY -- never call from the WS event handler/callback (the pinned
+ * esp_websocket_client library itself forbids stopping its own task from within that task; this module's
+ * own contract extends the same rule here, matching connect()/disconnect() above). Attempts exactly one
+ * resume of the CURRENT session's existing WebSocket client object, reusing its already-established
+ * Authorization header, using the latest resumable handle captured from a prior SessionResumptionUpdate.
+ * Returns GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT if session resumption was not configured for this
+ * session, no resumable handle is currently available, state is not CLOSED, or no client handle exists.
+ * Never retries internally and is never called automatically anywhere in this milestone -- the caller
+ * decides if/when to invoke it.
+ */
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void);
+
+/**
  * M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Sends one chunk of already-captured
  * microphone PCM (16kHz/16-bit/mono, matching the BSP's fixed capture rate and Gemini's expected
  * realtimeInput format exactly -- no resampling needed on this side) as a Gemini `realtimeInput` message.

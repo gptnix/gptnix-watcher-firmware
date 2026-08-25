@@ -731,6 +731,145 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_text_turn(const 
     return GPTNIX_WATCHER_VOICE_RESULT_OK;
 }
 
+// Diagnostic follow-up (2026-08-25, diag/m3c-recorder-stall-rootcause, WS close contract audit): the
+// official Gemini Live API (ai.google.dev/api/live, fresh-checked 2026-08-25) types
+// GoAway.timeLeft as a protobuf Duration, which the JSON wire mapping serializes as a string like
+// "58.234s" (whole seconds, optional fractional part, literal trailing 's') -- never a bare integer.
+// Strict, bounded, allocation-free parser: fails closed (-1) on anything outside that exact shape,
+// rather than falling back to a partial/best-effort read of a provider-controlled string.
+static int s_parse_duration_seconds_to_ms(const char *s, size_t len)
+{
+    if (s == NULL || len < 2 || len > 16 || s[len - 1] != 's') {
+        return -1;
+    }
+    size_t i = 0;
+    long whole = 0;
+    size_t whole_digits = 0;
+    while (i < len - 1 && s[i] != '.') {
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        whole = whole * 10 + (s[i] - '0');
+        whole_digits++;
+        if (whole_digits > 6) {
+            return -1; /* bounded: reject absurd (>999999s) values rather than overflow */
+        }
+        i++;
+    }
+    if (whole_digits == 0) {
+        return -1;
+    }
+    long frac_ms = 0;
+    if (i < len - 1 && s[i] == '.') {
+        i++;
+        size_t frac_digits = 0;
+        long scale = 100; /* first fractional digit contributes hundreds of ms */
+        while (i < len - 1) {
+            if (s[i] < '0' || s[i] > '9') {
+                return -1;
+            }
+            if (frac_digits < 3) {
+                frac_ms += (long)(s[i] - '0') * scale;
+                scale /= 10;
+            }
+            frac_digits++;
+            if (frac_digits > 9) {
+                return -1; /* bounded */
+            }
+            i++;
+        }
+    }
+    if (i != len - 1) {
+        return -1; /* must land exactly on the trailing 's', no trailing garbage */
+    }
+    long total_ms = whole * 1000 + frac_ms;
+    if (total_ms < 0 || total_ms > 86400000L /* 24h, defensive cap */) {
+        return -1;
+    }
+    return (int)total_ms;
+}
+
+// Diagnostic follow-up (2026-08-25): classifies only the fixed, official top-level Gemini Live wire-
+// protocol keys (ai.google.dev/api/live, fresh-checked 2026-08-25) -- never a generic keyword scan.
+// Called once per fully-reassembled READY-state message, before the existing serverContent-specific
+// handling below. Never logs any value FROM these objects, only their presence/shape.
+static void s_log_ready_server_message_kind(cJSON *reply, bool full_consumption)
+{
+    if (!full_consumption || reply == NULL || !cJSON_IsObject(reply)) {
+        return;
+    }
+
+    bool has_server_content = false;
+    bool has_session_resumption = false;
+    bool has_go_away = false;
+    bool has_tool_call = false;
+    bool has_tool_cancel = false;
+    bool has_setup_complete = false;
+    int unknown_keys = 0;
+
+    cJSON *child = NULL;
+    cJSON_ArrayForEach(child, reply) {
+        if (child->string == NULL) {
+            unknown_keys++;
+            continue;
+        }
+        if (strcmp(child->string, "serverContent") == 0) {
+            has_server_content = true;
+        } else if (strcmp(child->string, "sessionResumptionUpdate") == 0) {
+            has_session_resumption = true;
+        } else if (strcmp(child->string, "goAway") == 0) {
+            has_go_away = true;
+        } else if (strcmp(child->string, "toolCall") == 0) {
+            has_tool_call = true;
+        } else if (strcmp(child->string, "toolCallCancellation") == 0) {
+            has_tool_cancel = true;
+        } else if (strcmp(child->string, "setupComplete") == 0) {
+            has_setup_complete = true;
+        } else {
+            unknown_keys++;
+        }
+    }
+
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_msg: server_content=%d session_resumption=%d go_away=%d "
+        "tool_call=%d tool_cancel=%d setup_complete=%d unknown_keys=%d",
+        (int)has_server_content, (int)has_session_resumption, (int)has_go_away,
+        (int)has_tool_call, (int)has_tool_cancel, (int)has_setup_complete, unknown_keys);
+
+    if (has_go_away) {
+        cJSON *go_away = cJSON_GetObjectItemCaseSensitive(reply, "goAway");
+        int time_left_ms = -1;
+        if (cJSON_IsObject(go_away)) {
+            cJSON *time_left = cJSON_GetObjectItemCaseSensitive(go_away, "timeLeft");
+            if (cJSON_IsString(time_left) && time_left->valuestring != NULL) {
+                time_left_ms = s_parse_duration_seconds_to_ms(time_left->valuestring, strlen(time_left->valuestring));
+            }
+        }
+        ESP_LOGW(TAG, "[V2_WATCHER_VOICE] goaway: time_left_ms=%d", time_left_ms);
+    }
+
+    if (has_session_resumption) {
+        // Correction vs. the pre-task VERIFIED EXTERNAL CONTRACT FACTS (which named the field "token"):
+        // ai.google.dev/api/live and ai.google.dev/gemini-api/docs/live-api/session-management, both
+        // fresh-checked 2026-08-25, confirm the actual wire field is SessionResumptionUpdate.newHandle
+        // (string) alongside a separate "resumable" bool -- there is no field literally named "token" in
+        // this message. Parsing the correct field; log line SHAPE (token_present/token_len) kept exactly
+        // as specified for this task's own output contract. Never logs the handle value itself.
+        cJSON *sru = cJSON_GetObjectItemCaseSensitive(reply, "sessionResumptionUpdate");
+        int token_present = 0;
+        int token_len = 0;
+        if (cJSON_IsObject(sru)) {
+            cJSON *new_handle = cJSON_GetObjectItemCaseSensitive(sru, "newHandle");
+            if (cJSON_IsString(new_handle) && new_handle->valuestring != NULL
+                && new_handle->valuestring[0] != '\0') {
+                token_present = 1;
+                token_len = (int)strlen(new_handle->valuestring);
+            }
+        }
+        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] session_resumption_update: token_present=%d token_len=%d",
+            token_present, token_len);
+    }
+}
+
 /* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Handles a fully-reassembled WS text/
  * binary frame received while state == READY: parses Gemini's serverContent.modelTurn.parts[].inlineData
  * audio chunks, forwards decoded PCM to the audio player (synthesizing a 44-byte WAV header naming the
@@ -864,6 +1003,29 @@ static void s_ws_event_handler(void *handler_args,
             data ? (int)data->data_len : -1);
         if (data == NULL) break;
 
+        // Diagnostic follow-up (2026-08-25, diag/m3c-recorder-stall-rootcause, WS close contract audit):
+        // an RFC6455 close frame's payload is a 2-byte big-endian status code followed by an optional
+        // UTF-8 reason string. This is the ONLY point anywhere in this file -- or in the pinned
+        // esp_websocket_client 1.7.0 itself (commit b385915, confirmed by reading esp_websocket_client.c:
+        // WEBSOCKET_EVENT_CLOSED always dispatches with NULL event data) -- where that code is ever
+        // available; the short-circuit immediately below has always discarded it before this point.
+        // Never logs the reason text or any payload byte, only bounded structural integers.
+        if (data->op_code == 0x08 /* close */) {
+            int close_code = -1;
+            int reason_len = -1;
+            if (data->payload_offset == 0 && data->data_len >= 2 && data->data_ptr != NULL) {
+                uint8_t hi = (uint8_t)data->data_ptr[0];
+                uint8_t lo = (uint8_t)data->data_ptr[1];
+                close_code = ((int)hi << 8) | (int)lo;
+                int rl = (int)data->payload_len - 2;
+                reason_len = (rl > 0) ? rl : 0;
+            }
+            ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_close_frame: code=%d reason_len=%d payload_len=%d "
+                "payload_offset=%d data_len=%d fin=%d",
+                close_code, reason_len, (int)data->payload_len, (int)data->payload_offset,
+                (int)data->data_len, (int)data->fin);
+        }
+
         // M3C fix (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): a live physical test with a
         // long-lived READY session revealed WS control frames (ping=0x9, pong=0xA, close=0x8) arriving
         // through this same WEBSOCKET_EVENT_DATA path -- the pre-existing opcode check (0x01/0x02 only,
@@ -976,6 +1138,7 @@ static void s_ws_event_handler(void *handler_args,
             // states share this same reassembly block but need different JSON-shape interpretations.
             bool was_ready = (ctx->state == GPTNIX_WATCHER_VOICE_STATE_READY);
             if (was_ready) {
+                s_log_ready_server_message_kind(reply, full_consumption);
                 s_handle_ready_server_content(ctx, reply, full_consumption);
                 if (reply != NULL) {
                     cJSON_Delete(reply);

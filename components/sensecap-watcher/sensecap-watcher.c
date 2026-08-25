@@ -94,6 +94,32 @@ void bsp_set_btn_long_release_cb(void (*cb)(void))
     lvgl_port_encoder_btn_register_event_cb(tp, BUTTON_LONG_PRESS_UP, bsp_btn_cb, cb);
 }
 
+// GPTNiX Watcher follow-up (2026-08-24): single-click toggle trigger for the M3C push-to-talk
+// listening gate, mirroring the long-press/long-release functions above exactly (same encoder-lookup
+// pattern) but for BUTTON_SINGLE_CLICK -- a proper debounced click event from the button component,
+// not a raw press/release. Added here (not a new file) since it is a one-line variant of the existing
+// pattern, matching this file's own established shape for knob-button callback registration.
+void bsp_set_btn_click_cb(void (*cb)(void))
+{
+    lv_indev_t *tp = NULL;
+    while (1)
+    {
+        tp = lv_indev_get_next(tp);
+        if (tp == NULL || tp->driver->type == LV_INDEV_TYPE_ENCODER)
+        {
+            break;
+        }
+    }
+
+    if (tp == NULL)
+    {
+        ESP_LOGE(TAG, "No encoder found");
+        return;
+    }
+
+    lvgl_port_encoder_btn_register_event_cb(tp, BUTTON_SINGLE_CLICK, bsp_btn_cb, cb);
+}
+
 esp_err_t bsp_i2c_detect(i2c_port_t i2c_num)
 {
     BSP_ERROR_CHECK_RETURN_ERR(bsp_i2c_bus_init());

@@ -56,6 +56,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
+#include <time.h>
 
 #include "driver/uart.h"
 
@@ -446,6 +447,13 @@ static app_gptnix_watcher_provision_result_t s_do_session_post(
     // size fixes did not resolve the session-POST stall -- logging the exact esp_err_t name and elapsed
     // wall-clock time to distinguish a real ~10s client-side timeout from a faster, differently-classed
     // failure. Never logs secret content, only a fixed non-secret error name string and an integer ms count.
+    // Time-desync diagnostic (2026-08-23 follow-up): a live physical test showed a consistent, fast
+    // (90-180ms) ESP_ERR_HTTP_CONNECT failure connecting to a domain independently confirmed reachable
+    // (valid Lets Encrypt cert, correct DNS) from the same WiFi network via a phone browser -- suspected
+    // cause is TLS certificate time-validity failing because SNTP has not yet completed syncing this early
+    // in boot. Logs only the device's own Unix timestamp (a non-secret integer) immediately before the
+    // HTTPS call, to prove or rule this out with real data instead of guessing further.
+    ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] clock: unix_time=%lld", (long long)time(NULL));
     int64_t perform_start_us = esp_timer_get_time();
     esp_err_t perform_err = esp_http_client_perform(client);
     int64_t perform_elapsed_ms = (esp_timer_get_time() - perform_start_us) / 1000;

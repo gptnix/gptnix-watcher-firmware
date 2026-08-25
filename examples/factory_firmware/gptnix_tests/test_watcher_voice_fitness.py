@@ -45,6 +45,7 @@ AUDIO_RECORDER_H = os.path.join(FACTORY_DIR, "main", "app", "app_audio_recorder.
 AUDIO_PLAYER_C = os.path.join(FACTORY_DIR, "main", "app", "app_audio_player.c")
 AUDIO_PLAYER_H = os.path.join(FACTORY_DIR, "main", "app", "app_audio_player.h")
 VOICE_INTERACTION_C = os.path.join(FACTORY_DIR, "main", "app", "app_voice_interaction.c")
+APP_CMD_C = os.path.join(FACTORY_DIR, "main", "app", "app_cmd.c")
 
 FAILURES = []
 
@@ -893,7 +894,91 @@ def _c75():
     return not hits, "hits=%s" % hits
 
 
-FITNESS_CHECK_COUNT = 75
+def _gw_resume_cmd_body():
+    text = _read(APP_CMD_C)
+    fn_start = text.find("static int gw_resume_cmd(int argc, char **argv)\n{")
+    fn_end = text.find("\nstatic void register_cmd_gw_resume(void)", fn_start)
+    return text[fn_start:fn_end]
+
+
+def _register_cmd_gw_resume_body():
+    text = _read(APP_CMD_C)
+    fn_start = text.find("static void register_cmd_gw_resume(void)\n{")
+    fn_end = text.find("\n#endif /* CONFIG_GPTNIX_WATCHER_VOICE */", fn_start)
+    return text[fn_start:fn_end]
+
+
+@check("76. gw_resume console command is registered exactly once")
+def _c76():
+    text = _read(APP_CMD_C)
+    cmd_literal_sites = len(re.findall(r'\.command\s*=\s*"gw_resume"', text))
+    definition_sites = len(re.findall(r"static void register_cmd_gw_resume\(void\)", text))
+    call_sites = len(re.findall(r"register_cmd_gw_resume\(\);", text))
+    return cmd_literal_sites == 1 and definition_sites == 1 and call_sites == 1, \
+        "cmd_literal_sites=%d definition_sites=%d call_sites=%d" % (cmd_literal_sites, definition_sites, call_sites)
+
+
+@check("77. gw_resume_cmd calls app_gptnix_watcher_voice_resume_once() exactly once, no loop/retry")
+def _c77():
+    body = _gw_resume_cmd_body()
+    call_sites = len(re.findall(r"app_gptnix_watcher_voice_resume_once\(\)", body))
+    loop_hits = [kw for kw in ("while (", "while(", "for (", "for(", "do {") if kw in body]
+    return call_sites == 1 and not loop_hits, "call_sites=%d loop_hits=%s" % (call_sites, loop_hits)
+
+
+@check("78. app_gptnix_watcher_voice_resume_once() has exactly one caller in the whole firmware tree (gw_resume_cmd) -- no automatic caller exists anywhere")
+def _c78():
+    voice_text = _read(APP_C)
+    cmd_text = _read(APP_CMD_C)
+    # In APP_C, the symbol appears twice by construction: once in the doc comment above it, once in the
+    # function definition signature itself -- neither is a call (no immediately-following open paren).
+    voice_call_sites = len(re.findall(r"app_gptnix_watcher_voice_resume_once\(\)\s*;", voice_text))
+    cmd_call_sites = len(re.findall(r"app_gptnix_watcher_voice_resume_once\(\)\s*;", cmd_text))
+    return voice_call_sites == 0 and cmd_call_sites == 1, \
+        "voice_call_sites=%d cmd_call_sites=%d" % (voice_call_sites, cmd_call_sites)
+
+
+@check("79. gw_resume_cmd/register_cmd_gw_resume never create a FreeRTOS task")
+def _c79():
+    body = _gw_resume_cmd_body() + _register_cmd_gw_resume_body()
+    hits = len(re.findall(r"\bxTaskCreate\w*\(", body))
+    return hits == 0, "xTaskCreate call count=%d" % hits
+
+
+@check("80. gw_resume_cmd never calls the WS client library directly")
+def _c80():
+    body = _gw_resume_cmd_body()
+    hits = [s for s in re.findall(r"esp_websocket_client_\w+\(", body)]
+    return not hits, "hits=%s" % hits
+
+
+@check("81. gw_resume_cmd never accesses the resumption handle, token, or any private module-owned state")
+def _c81():
+    body = _gw_resume_cmd_body()
+    forbidden = ["resumption_handle", "ctx->token", "ctx->", "s_ctx", "->setup_json"]
+    hits = [s for s in forbidden if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("82. gw_resume_cmd/register_cmd_gw_resume never reference recorder/player/resampler symbols")
+def _c82():
+    body = _gw_resume_cmd_body() + _register_cmd_gw_resume_body()
+    forbidden = ["app_audio_recorder_", "app_audio_player_", "s_resample_24k_to_16k", "GW_AUDIO_OUT_SAMPLE_RATE"]
+    hits = [s for s in forbidden if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("83. gw_resume registered from the same CONFIG_GPTNIX_WATCHER_VOICE guard as gw_say, right after it")
+def _c83():
+    text = _read(APP_CMD_C)
+    m = re.search(
+        r"#if CONFIG_GPTNIX_WATCHER_VOICE\s*\n\s*register_cmd_gw_say\(\);\s*\n\s*register_cmd_gw_resume\(\);\s*\n#endif",
+        text,
+    )
+    return m is not None, "expected register_cmd_gw_say(); register_cmd_gw_resume(); block not found"
+
+
+FITNESS_CHECK_COUNT = 83
 
 
 def main():

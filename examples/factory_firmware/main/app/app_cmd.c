@@ -80,6 +80,36 @@ static void register_cmd_gw_say(void)
     };
     ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
 }
+
+/** gw_resume command -- M3C.1B-GAPS manual session-resumption trigger (docs/v2/V2_WATCHER_GEMINI_LIVE_
+ * SESSION_RESUMPTION_ADDENDUM_2026-08-25.md, plans/M3C1B_GAPS task). Takes no arguments. Calls
+ * app_gptnix_watcher_voice_resume_once() exactly once per invocation -- no loop, no retry, no delay, no
+ * task creation, no direct WS-client call. All preconditions (resumption configured, handle available,
+ * state == CLOSED, client exists) are enforced entirely inside resume_once() itself; this command adds
+ * nothing beyond console wiring and a classified result-code log line. Safe caller context: the esp_console
+ * REPL runs in its own dedicated task (esp_console_new_repl_uart/esp_console_start_repl in
+ * console_main_start() below), never the WS event task -- matching resume_once()'s own documented
+ * caller-context contract. Never logs the resumption handle, token, Authorization header, setup JSON,
+ * pointer, or UID -- only the classified integer result code. **/
+static int gw_resume_cmd(int argc, char **argv)
+{
+    app_gptnix_watcher_voice_result_t res = app_gptnix_watcher_voice_resume_once();
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] resume_cmd: result=%d", (int)res);
+    return (res == GPTNIX_WATCHER_VOICE_RESULT_OK) ? 0 : 1;
+}
+
+static void register_cmd_gw_resume(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "gw_resume",
+        .help = "Attempt exactly one Gemini Live session resumption now, over serial. Requires the voice "
+                "session be CLOSED with a stored resumable handle -- see resume_once() preconditions.",
+        .hint = NULL,
+        .func = &gw_resume_cmd,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
 #endif /* CONFIG_GPTNIX_WATCHER_VOICE */
 
 
@@ -969,6 +999,7 @@ int app_cmd_prepare_repl(void)
     register_cmd_wifi_sta();
 #if CONFIG_GPTNIX_WATCHER_VOICE
     register_cmd_gw_say();
+    register_cmd_gw_resume();
 #endif
     register_cmd_force_ota();
     register_cmd_taskflow();

@@ -719,7 +719,181 @@ def _c60():
     return (not missing) and (not forbidden_hits), "missing=%s forbidden_hits=%s" % (missing, forbidden_hits)
 
 
-FITNESS_CHECK_COUNT = 60
+# M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_ADDENDUM_
+# 2026-08-25.md). All checks below are static-source proof only, same as every check above -- no build,
+# no flash, no physical/live proof claimed (M3C.1B's job).
+
+@check("61. sessionResumptionUpdate.newHandle is only ever accepted when resumable is true")
+def _c61():
+    text = _read(APP_C)
+    fn_start = text.find("static void s_handle_session_resumption_update(")
+    if fn_start < 0:
+        return False, "s_handle_session_resumption_update not found"
+    fn_end = text.find("\n}\n", fn_start)
+    body = text[fn_start:fn_end]
+    has_resumable_check = "!resumable || new_handle == NULL || new_handle_len == 0" in body
+    has_gate_before_store = body.find("!resumable") < body.find("heap_caps_malloc")
+    return has_resumable_check and has_gate_before_store, "has_resumable_check=%s gate_before_store=%s" % (has_resumable_check, has_gate_before_store)
+
+
+@check("62. resumption handle bytes are never passed to an ESP_LOG call")
+def _c62():
+    text = _read(APP_C)
+    log_lines = [ln for ln in text.splitlines() if "ESP_LOG" in ln]
+    offending = [ln for ln in log_lines if "resumption_handle" in ln and "%s" in ln]
+    offending += [ln for ln in log_lines if "new_handle" in ln and "%s" in ln]
+    handle_log_present = any("resumption_handle: updated len=%d" in ln for ln in log_lines)
+    return (not offending) and handle_log_present, "offending=%s handle_log_present=%s" % (offending, handle_log_present)
+
+
+@check("63. resumption_handle has exactly one struct owner and exactly one write call site")
+def _c63():
+    text = _read(APP_C)
+    struct_decls = len(re.findall(r"char \*resumption_handle;", text))
+    write_sites = len(re.findall(r"ctx->resumption_handle = ", text))
+    # Exactly two writes expected: the successful-replace assignment, and NULL on clear.
+    return struct_decls == 1 and write_sites == 2, "struct_decls=%d write_sites=%d" % (struct_decls, write_sites)
+
+
+@check("64. old resumption handle is zeroized+freed before the replacement is installed")
+def _c64():
+    text = _read(APP_C)
+    fn_start = text.find("static void s_handle_session_resumption_update(")
+    fn_end = text.find("\n}\n", fn_start)
+    body = text[fn_start:fn_end]
+    zeroize_idx = body.find("mbedtls_platform_zeroize(ctx->resumption_handle")
+    free_idx = body.find("free(ctx->resumption_handle)")
+    install_idx = body.find("ctx->resumption_handle = replacement")
+    ok = zeroize_idx >= 0 and free_idx >= 0 and install_idx >= 0 and zeroize_idx < free_idx < install_idx
+    return ok, "zeroize_idx=%d free_idx=%d install_idx=%d" % (zeroize_idx, free_idx, install_idx)
+
+
+@check("65. resumption handle is zeroized on final cleanup (deinit/replace-session/disconnect, via the single s_clear_session_material owner)")
+def _c65():
+    text = _read(APP_C)
+    fn_start = text.find("static void s_clear_resumption_handle(")
+    fn_end = text.find("\n}\n", fn_start)
+    body = text[fn_start:fn_end]
+    zeroizes = "mbedtls_platform_zeroize(ctx->resumption_handle, ctx->resumption_handle_len)" in body
+    frees = "free(ctx->resumption_handle)" in body
+    wired_into_clear_session_material = "s_clear_resumption_handle(ctx)" in text[text.find("static void s_clear_session_material("):]
+    return zeroizes and frees and wired_into_clear_session_material, "zeroizes=%s frees=%s wired=%s" % (zeroizes, frees, wired_into_clear_session_material)
+
+
+@check("66. resumption handle is NOT cleared merely because a resumable remote close occurred (CLOSED/DISCONNECTED handler never calls the clear helper)")
+def _c66():
+    text = _read(APP_C)
+    m = re.search(r"case WEBSOCKET_EVENT_CLOSED:\s*\n\s*case WEBSOCKET_EVENT_DISCONNECTED: \{(.*?)\n    \}\n\n    default:", text, re.DOTALL)
+    if not m:
+        return False, "CLOSED/DISCONNECTED case block not found"
+    body = m.group(1)
+    return "s_clear_resumption_handle" not in body and "s_clear_session_material" not in body, "body_excerpt_len=%d" % len(body)
+
+
+@check("67. app_gptnix_watcher_voice_resume_once() is never called from s_ws_event_handler")
+def _c67():
+    text = _read(APP_C)
+    # The DEFINITION (ending in "{"), not the earlier forward declaration (ending in ";") -- both share
+    # the same "static void s_ws_event_handler(" prefix, so find() alone would land on the declaration
+    # (which appears first in the file) and sweep the entire rest of the file as "body", producing a
+    # false positive on any later, unrelated use of the word "resume_once" (e.g. its own definition).
+    def_marker = "static void s_ws_event_handler(void *handler_args,\n                                esp_event_base_t base,\n                                int32_t event_id,\n                                void *event_data)\n{"
+    fn_start = text.find(def_marker)
+    fn_end = text.find("\n#else /* !CONFIG_GPTNIX_WATCHER_VOICE */")
+    if fn_start < 0 or fn_end < 0:
+        return False, "s_ws_event_handler definition span not found"
+    body = text[fn_start:fn_end]
+    return "resume_once" not in body, "resume_once found inside s_ws_event_handler definition span"
+
+
+@check("68. app_gptnix_watcher_voice_resume_once has exactly one call site (its own definition) anywhere in this milestone's modified/read firmware sources")
+def _c68():
+    text_c = _read(APP_C)
+    def_sites = len(re.findall(r"app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once\(void\)\n\{", text_c))
+    # A C call site to a void-argument function never repeats "void" (e.g. "= foo();"), so this pattern
+    # structurally cannot overlap with a def_sites match ("...resume_once(void)\n{") -- no subtraction
+    # needed, this count is already call-sites-only.
+    call_sites_in_c = len(re.findall(r"\bapp_gptnix_watcher_voice_resume_once\(\)", text_c))
+    runtime_c_path = os.path.join(FACTORY_DIR, "main", "app", "app_gptnix_watcher_voice_runtime.c")
+    runtime_text = _read(runtime_c_path)
+    runtime_refs = runtime_text.count("resume_once")
+    # Two definitions expected (real + disabled-config stub); zero call sites of the symbol anywhere in
+    # this file or in the runtime bridge module -- never called automatically in this milestone.
+    return def_sites == 2 and call_sites_in_c == 0 and runtime_refs == 0, "def_sites=%d call_sites_in_c=%d runtime_refs=%d" % (def_sites, call_sites_in_c, runtime_refs)
+
+
+@check("69. resume_once() preconditions require resumption_configured, resumption_available, state==CLOSED, and a non-NULL ws_client before any mutation")
+def _c69():
+    text = _read(APP_C)
+    fn_start = text.find("app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void)\n{")
+    fn_end = text.find("\napp_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio", fn_start)
+    body = text[fn_start:fn_end]
+    required = [
+        "!ctx->resumption_configured",
+        "!ctx->resumption_available",
+        "ctx->state != GPTNIX_WATCHER_VOICE_STATE_CLOSED",
+        "ctx->ws_client == NULL",
+    ]
+    missing = [s for s in required if s not in body]
+    return not missing, "missing=%s" % missing
+
+
+@check("70. resume_once() never creates a second esp_websocket_client_init instance -- exactly one call site in the whole file, inside connect() only")
+def _c70():
+    text = _read(APP_C)
+    init_sites = len(re.findall(r"esp_websocket_client_init\(", text))
+    fn_start = text.find("app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void)\n{")
+    fn_end = text.find("\napp_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio", fn_start)
+    resume_body = text[fn_start:fn_end]
+    return init_sites == 1 and "esp_websocket_client_init(" not in resume_body, "init_sites=%d" % init_sites
+
+
+@check("71. resume_once() never references the module-owned ephemeral token (no retention added)")
+def _c71():
+    text = _read(APP_C)
+    fn_start = text.find("app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void)\n{")
+    fn_end = text.find("\napp_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_send_audio", fn_start)
+    resume_body = text[fn_start:fn_end]
+    return "ctx->token" not in resume_body, "ctx->token referenced inside resume_once()"
+
+
+@check("72. disable_auto_reconnect remains exactly one assignment, unchanged, only inside connect()")
+def _c72():
+    text = _read(APP_C)
+    sites = len(re.findall(r"config\.disable_auto_reconnect = true;", text))
+    other_values = len(re.findall(r"disable_auto_reconnect\s*=\s*false", text))
+    return sites == 1 and other_values == 0, "sites=%d other_values=%d" % (sites, other_values)
+
+
+@check("73. app_gptnix_watcher_voice.c never #includes the M3C audio runtime bridge header or calls its/the driver-layer functions")
+def _c73():
+    text = _read(APP_C)
+    # A plain-English comment naming a sibling file for architectural context (e.g. the pre-existing
+    # "registered by an external module (app_gptnix_watcher_voice_runtime.c)" docstring) is expected,
+    # legitimate documentation, not a violation -- only an actual #include directive or a real call-shaped
+    # reference (name immediately followed by an open paren) to these driver-layer symbols would be.
+    include_hit = re.search(r'#include\s*"app_gptnix_watcher_voice_runtime\.h"', text) is not None
+    call_forbidden = ["s_audio_capture_task", "s_audio_send_task", "app_audio_recorder_", "app_audio_player_"]
+    call_hits = [s for s in call_forbidden if re.search(re.escape(s) + r"\w*\(", text)]
+    return (not include_hit) and (not call_hits), "include_hit=%s call_hits=%s" % (include_hit, call_hits)
+
+
+@check("74. app_gptnix_watcher_voice.c never creates a FreeRTOS task")
+def _c74():
+    text = _read(APP_C)
+    hits = len(re.findall(r"\bxTaskCreate\w*\(", text))
+    return hits == 0, "xTaskCreate call count=%d" % hits
+
+
+@check("75. app_gptnix_watcher_voice.c never references resampler/sample-rate symbols owned by the runtime bridge")
+def _c75():
+    text = _read(APP_C)
+    forbidden = ["s_resample_24k_to_16k", "GW_AUDIO_OUT_SAMPLE_RATE", "s_resample_prev", "s_resample_pos"]
+    hits = [s for s in forbidden if s in text]
+    return not hits, "hits=%s" % hits
+
+
+FITNESS_CHECK_COUNT = 75
 
 
 def main():

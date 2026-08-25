@@ -121,6 +121,15 @@ struct app_gptnix_watcher_voice {
     int rx_accumulated;
     int rx_payload_len;
 
+    // M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_ADDENDUM_
+    // 2026-08-25.md). resumption_configured is set once by prepare_session() from the validated backend
+    // setup only -- never enabled by any firmware-local flag, backend remains the capability authority.
+    // resumption_handle is the latest server-provided SessionResumptionUpdate.newHandle, dynamically
+    // allocated (no exact provider maximum is officially documented), RAM-only, never logged/persisted.
+    bool resumption_configured;
+    bool resumption_available;
+    char *resumption_handle;
+    size_t resumption_handle_len;
 };
 
 /* M3C: registered by an external module (app_gptnix_watcher_voice_runtime.c) -- this module never calls
@@ -142,6 +151,26 @@ static void s_ws_event_handler(void *handler_args,
                                 int32_t event_id,
                                 void *event_data);
 
+/* M3C.1A session-resumption foundation: canonical single owner of resumption_handle's lifecycle. Zeroizes
+ * bytes, frees, NULLs the pointer, zeroes length, marks unavailable. Called at the exact final lifecycle
+ * boundaries the addendum requires (deinit, a new unrelated prepare_session replacing the prior session,
+ * explicit final disconnect) by being folded into s_clear_session_material() below, which is already
+ * called at exactly those three call sites and nowhere else -- in particular, NOT from the WS event
+ * handler's CLOSED/DISCONNECTED case, so a resumable remote close never clears the handle. */
+static void s_clear_resumption_handle(struct app_gptnix_watcher_voice *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->resumption_handle != NULL) {
+        mbedtls_platform_zeroize(ctx->resumption_handle, ctx->resumption_handle_len);
+        free(ctx->resumption_handle);
+        ctx->resumption_handle = NULL;
+    }
+    ctx->resumption_handle_len = 0;
+    ctx->resumption_available = false;
+}
+
 /* Zeroizes every session-material representation this module owns. Does not
  * free s_ctx itself -- callers decide lifetime (reused across sessions by
  * prepare_session, or released once by deinit). */
@@ -159,6 +188,7 @@ static void s_clear_session_material(struct app_gptnix_watcher_voice *ctx)
     ctx->setup_json_len = 0;
     ctx->rx_accumulated = 0;
     ctx->rx_payload_len = 0;
+    s_clear_resumption_handle(ctx);
 }
 
 /* Recursively zeroizes every non-NULL valuestring reachable from `item`
@@ -314,6 +344,7 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
     size_t local_token_len = 0;
     char *local_setup_json = NULL;
     size_t local_setup_json_len = 0;
+    bool local_resumption_configured = false; /* M3C.1A: see sessionResumption detection below */
     memset(local_endpoint, 0, sizeof(local_endpoint));
     memset(local_token, 0, sizeof(local_token));
 
@@ -443,6 +474,13 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
                     if (audio_count != 1) { s_sensitive_cjson_free_string(&printed); break; }
                 }
 
+                // M3C.1A session-resumption foundation: capability detection ONLY, from the already-
+                // validated backend-provided setup -- never enabled by a firmware-local flag. An empty
+                // object is the correct/only shape the backend ever sends when the capability is on (see
+                // GeminiLiveTokenBroker.js); its presence as an object (not its contents) is what matters.
+                cJSON *session_resumption_item = cJSON_GetObjectItemCaseSensitive(inner_setup, "sessionResumption");
+                local_resumption_configured = cJSON_IsObject(session_resumption_item);
+
                 if (endpoint_len >= sizeof(local_endpoint)
                     || token_len >= sizeof(local_token)
                     || printed_len >= GPTNIX_WATCHER_VOICE_SETUP_JSON_MAX_BYTES) {
@@ -483,6 +521,8 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_prepare_session(
         s_ctx->token_len = local_token_len;
         memcpy(s_ctx->setup_json, local_setup_json, local_setup_json_len + 1);
         s_ctx->setup_json_len = local_setup_json_len;
+        s_ctx->resumption_configured = local_resumption_configured; /* M3C.1A: cleared above by
+            s_clear_session_material(), set here from THIS session's own validated setup only */
         s_ctx->state = GPTNIX_WATCHER_VOICE_STATE_SESSION_READY;
         ESP_LOGI(TAG, "[V2_WATCHER_VOICE] session_ready: setup_bytes=%d", (int)local_setup_json_len);
     }
@@ -591,6 +631,146 @@ app_gptnix_watcher_voice_state_t app_gptnix_watcher_voice_get_state(void)
         return GPTNIX_WATCHER_VOICE_STATE_UNINITIALIZED;
     }
     return s_ctx->state;
+}
+
+/* M3C.1A session-resumption foundation. Rebuilds the next setup message from the canonical backend-
+ * provided setup ALREADY held by this module (ctx->setup_json -- byte-for-byte what connect() sent the
+ * first time, and untouched by a remote close since s_clear_session_material() is not called from the WS
+ * event handler's CLOSED/DISCONNECTED case), changing only sessionResumption.handle to the latest
+ * server-provided handle. Never mutates any other field independently. Caller owns the returned buffer
+ * and must release it via s_sensitive_cjson_free_string(). */
+static app_gptnix_watcher_voice_result_t s_build_resumed_setup_json(
+    struct app_gptnix_watcher_voice *ctx, char **out_json, size_t *out_len)
+{
+    *out_json = NULL;
+    *out_len = 0;
+    if (ctx->setup_json_len == 0) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+
+    const char *parse_end = NULL;
+    cJSON *root = cJSON_ParseWithLengthOpts(ctx->setup_json, ctx->setup_json_len + 1, &parse_end, 1);
+    if (root == NULL || !cJSON_IsObject(root)) {
+        if (root != NULL) {
+            s_sensitive_cjson_delete(&root);
+        }
+        return GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;
+    }
+    cJSON *setup_obj = cJSON_GetObjectItemCaseSensitive(root, "setup");
+    if (!cJSON_IsObject(setup_obj)) {
+        s_sensitive_cjson_delete(&root);
+        return GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;
+    }
+    cJSON *session_resumption = cJSON_GetObjectItemCaseSensitive(setup_obj, "sessionResumption");
+    if (!cJSON_IsObject(session_resumption)) {
+        /* Defensive: unreachable given resume_once()'s own resumption_configured precondition check. */
+        s_sensitive_cjson_delete(&root);
+        return GPTNIX_WATCHER_VOICE_RESULT_UNSUPPORTED_CONTRACT;
+    }
+    cJSON *handle_str = cJSON_CreateString(ctx->resumption_handle);
+    if (handle_str == NULL) {
+        s_sensitive_cjson_delete(&root);
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(session_resumption, "handle");
+    cJSON_AddItemToObject(session_resumption, "handle", handle_str);
+
+    char *printed = cJSON_PrintUnformatted(root);
+    s_sensitive_cjson_delete(&root);
+    if (printed == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_NO_MEMORY;
+    }
+    size_t printed_len = strlen(printed);
+    if (printed_len == 0 || printed_len >= GPTNIX_WATCHER_VOICE_SETUP_JSON_MAX_BYTES) {
+        s_sensitive_cjson_free_string(&printed);
+        return GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;
+    }
+    *out_json = printed;
+    *out_len = printed_len;
+    return GPTNIX_WATCHER_VOICE_RESULT_OK;
+}
+
+/* M3C.1A: narrower than s_fail_before_running_client() -- a failed resume attempt does not invalidate the
+ * ws_client's own already-proven config (endpoint/headers, per HARD GATE B/3), and per the addendum must
+ * NOT destroy the last known-good resumption handle without official proof of invalidation. Only the
+ * state/last_result reflect the failed attempt; the client object itself is left exactly as the pinned
+ * source (HARD GATE B point 4) proves it remains safely restartable. */
+static app_gptnix_watcher_voice_result_t s_fail_resume_once(
+    struct app_gptnix_watcher_voice *ctx, app_gptnix_watcher_voice_result_t result)
+{
+    ctx->state = GPTNIX_WATCHER_VOICE_STATE_CLOSED;
+    ctx->last_result = result;
+    return result;
+}
+
+/* M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_ADDENDUM_
+ * 2026-08-25.md). Caller-context ONLY -- the pinned esp_websocket_client 1.7.0 source itself forbids
+ * stop() from the client's own task (esp_websocket_client.c stop_wait_task(): "Client cannot be stopped
+ * from websocket task"); this module extends the identical caller-context-only contract to this function,
+ * matching connect()/disconnect() above. Exactly one resume connection attempt per call -- never retries
+ * internally, never recurses. Never called automatically anywhere in this milestone (grep confirms no
+ * call site exists outside this file). No second call to the client-init API, no second Authorization
+ * construction, no token retention, no second backend call. */
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void)
+{
+    if (s_ctx == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+    struct app_gptnix_watcher_voice *ctx = s_ctx;
+
+    /* G1 preconditions -- otherwise a classified result, no mutation. */
+    if (!ctx->resumption_configured || !ctx->resumption_available
+        || ctx->state != GPTNIX_WATCHER_VOICE_STATE_CLOSED || ctx->ws_client == NULL) {
+        return GPTNIX_WATCHER_VOICE_RESULT_INVALID_ARGUMENT;
+    }
+
+    char *resumed_json = NULL;
+    size_t resumed_len = 0;
+    app_gptnix_watcher_voice_result_t build_result =
+        s_build_resumed_setup_json(ctx, &resumed_json, &resumed_len);
+    if (build_result != GPTNIX_WATCHER_VOICE_RESULT_OK) {
+        return s_fail_resume_once(ctx, build_result);
+    }
+    if (resumed_len >= sizeof(ctx->setup_json)) {
+        /* Defensive: unreachable given s_build_resumed_setup_json()'s own bound check above. */
+        s_sensitive_cjson_free_string(&resumed_json);
+        return s_fail_resume_once(ctx, GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR);
+    }
+    /* In place: the existing WEBSOCKET_EVENT_CONNECTED handler already sends ctx->setup_json verbatim on
+     * the next successful connect -- overwriting it here (rather than adding a second, parallel
+     * "pending resumed setup" field) means that existing, unmodified code path correctly sends the
+     * resumed setup with zero further changes needed anywhere else in this file. */
+    mbedtls_platform_zeroize(ctx->setup_json, sizeof(ctx->setup_json));
+    memcpy(ctx->setup_json, resumed_json, resumed_len + 1);
+    ctx->setup_json_len = resumed_len;
+    s_sensitive_cjson_free_string(&resumed_json);
+
+    /* G3/HARD GATE 3 (proven from the pinned esp_websocket_client 1.7.0 source,
+     * esp_websocket_client_task(), esp_websocket_client.c ~line 1378-1402): on a remote close with
+     * enable_close_reconnect unset (this module's config never sets it), the client's own task sets
+     * client->state = WEBSOCKET_STATE_UNKNOW and client->run = false itself, BEFORE calling
+     * vTaskDelete(NULL). esp_websocket_client_stop() is safe to call here regardless of whether that has
+     * already happened: if STOPPED_BIT is already set it returns ESP_FAIL immediately (an expected,
+     * harmless no-op signal in this call path, not a real error) instead of blocking; otherwise it blocks
+     * (portMAX_DELAY) until the task itself confirms STOPPED_BIT. Either outcome proves the prior task
+     * has fully terminated before esp_websocket_client_start() below ever runs. */
+    esp_websocket_client_stop(ctx->ws_client);
+
+    ctx->state = GPTNIX_WATCHER_VOICE_STATE_CONNECTING;
+
+    /* G3 (proven, HARD GATE B point 3): esp_websocket_client_start() creates a fresh transport via
+     * esp_websocket_client_create_transport(), which re-applies client->config->headers (our already-
+     * appended, still-intact Authorization header -- append_header() stores it on the persistent client
+     * object, not the transport, and it is only ever freed by esp_websocket_client_destroy_config(),
+     * never called here) to the new transport via set_websocket_transport_optional_settings(). No new
+     * Authorization construction, no token, no second client instance -- this is the SAME ctx->ws_client
+     * used since the original connect(). */
+    esp_err_t start_err = esp_websocket_client_start(ctx->ws_client);
+    if (start_err != ESP_OK) {
+        return s_fail_resume_once(ctx, GPTNIX_WATCHER_VOICE_RESULT_WS_START_FAILED);
+    }
+
+    return GPTNIX_WATCHER_VOICE_RESULT_OK;
 }
 
 /* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Caller context only (never called
@@ -870,6 +1050,57 @@ static void s_log_ready_server_message_kind(cJSON *reply, bool full_consumption)
     }
 }
 
+/* M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_ADDENDUM_
+ * 2026-08-25.md). Separate from s_log_ready_server_message_kind() above (which stays a pure, storage-free
+ * diagnostic classifier, unchanged from the prior WS-close-audit task) -- this is the single RAM-retention
+ * owner for the latest resumable handle. Per the addendum: only a valid resumable=true + non-empty
+ * newHandle replaces the stored handle; resumable=false or a missing/empty newHandle leaves the last
+ * known-good handle untouched (the official contract gives no evidence that condition invalidates it).
+ * Never logs the handle bytes -- only its length, via the fixed shape the milestone's own task specifies. */
+static void s_handle_session_resumption_update(struct app_gptnix_watcher_voice *ctx, cJSON *reply, bool full_consumption)
+{
+    if (ctx == NULL || !full_consumption || reply == NULL || !cJSON_IsObject(reply)) {
+        return;
+    }
+    cJSON *sru = cJSON_GetObjectItemCaseSensitive(reply, "sessionResumptionUpdate");
+    if (!cJSON_IsObject(sru)) {
+        return;
+    }
+    cJSON *resumable_item = cJSON_GetObjectItemCaseSensitive(sru, "resumable");
+    bool resumable = cJSON_IsBool(resumable_item) && cJSON_IsTrue(resumable_item);
+    cJSON *new_handle_item = cJSON_GetObjectItemCaseSensitive(sru, "newHandle");
+    const char *new_handle = (cJSON_IsString(new_handle_item) && new_handle_item->valuestring != NULL)
+        ? new_handle_item->valuestring : NULL;
+    size_t new_handle_len = (new_handle != NULL) ? strlen(new_handle) : 0;
+
+    if (!resumable || new_handle == NULL || new_handle_len == 0) {
+        return;
+    }
+    /* Defensive bound derived from an existing protocol buffer bound (not an invented constant): this
+     * string necessarily arrived inside one fully-reassembled READY-state message, so it can never
+     * legitimately exceed the reassembly buffer it was parsed out of. No exact provider maximum for
+     * newHandle length is officially documented. */
+    if (new_handle_len >= GPTNIX_WATCHER_VOICE_RX_REASSEMBLY_MAX_BYTES) {
+        return;
+    }
+
+    char *replacement = (char *)heap_caps_malloc(new_handle_len + 1, MALLOC_CAP_SPIRAM);
+    if (replacement == NULL) {
+        return; /* allocation failure: keep the last known-good handle, do not destroy it */
+    }
+    memcpy(replacement, new_handle, new_handle_len + 1);
+
+    if (ctx->resumption_handle != NULL) {
+        mbedtls_platform_zeroize(ctx->resumption_handle, ctx->resumption_handle_len);
+        free(ctx->resumption_handle);
+    }
+    ctx->resumption_handle = replacement;
+    ctx->resumption_handle_len = new_handle_len;
+    ctx->resumption_available = true;
+
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] resumption_handle: updated len=%d", (int)new_handle_len);
+}
+
 /* M3C runtime audio bridge (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md). Handles a fully-reassembled WS text/
  * binary frame received while state == READY: parses Gemini's serverContent.modelTurn.parts[].inlineData
  * audio chunks, forwards decoded PCM to the audio player (synthesizing a 44-byte WAV header naming the
@@ -1139,6 +1370,7 @@ static void s_ws_event_handler(void *handler_args,
             bool was_ready = (ctx->state == GPTNIX_WATCHER_VOICE_STATE_READY);
             if (was_ready) {
                 s_log_ready_server_message_kind(reply, full_consumption);
+                s_handle_session_resumption_update(ctx, reply, full_consumption);
                 s_handle_ready_server_content(ctx, reply, full_consumption);
                 if (reply != NULL) {
                     cJSON_Delete(reply);
@@ -1259,6 +1491,11 @@ app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_disconnect(void)
 app_gptnix_watcher_voice_state_t app_gptnix_watcher_voice_get_state(void)
 {
     return GPTNIX_WATCHER_VOICE_STATE_UNINITIALIZED;
+}
+
+app_gptnix_watcher_voice_result_t app_gptnix_watcher_voice_resume_once(void)
+{
+    return GPTNIX_WATCHER_VOICE_RESULT_DISABLED;
 }
 
 #endif /* CONFIG_GPTNIX_WATCHER_VOICE */

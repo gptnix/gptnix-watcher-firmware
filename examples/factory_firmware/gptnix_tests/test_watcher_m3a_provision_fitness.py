@@ -108,7 +108,19 @@ PROTECTED_M3A_BLOBS = {
         # (protobuf Duration-as-JSON-string, e.g. "58.234s") and sessionResumptionUpdate.newHandle
         # (presence/length only, never the handle value). No state-machine, reconnect, or task-lifecycle
         # behavior changed -- diagnostics only, purely additive (163 lines, zero deletions).
-        "575d0f0699e2aff328814c54aadce370544cd628",
+        # M3C.1A session-resumption foundation (docs/v2/V2_WATCHER_GEMINI_LIVE_SESSION_RESUMPTION_
+        # ADDENDUM_2026-08-25.md, stacked firmware PR on top of PR #18): struct app_gptnix_watcher_voice
+        # gains resumption_configured/resumption_available/resumption_handle/resumption_handle_len;
+        # prepare_session() detects sessionResumption presence in the already-validated backend setup
+        # only; a new RAM-only s_handle_session_resumption_update() stores the latest resumable newHandle
+        # (zeroize-old-then-install-new, never destroyed on a resumable close, never logged); a new
+        # public app_gptnix_watcher_voice_resume_once() (caller-context only, never called automatically
+        # anywhere in this milestone) reuses the SAME esp_websocket_client instance/already-appended
+        # Authorization header to attempt exactly one resumed reconnect, proven safe from the pinned
+        # esp_websocket_client 1.7.0 source (HARD GATE B/3). disable_auto_reconnect, task lifecycle,
+        # sample rates, resampler, and recorder/player are all untouched. Purely additive (237 lines,
+        # zero deletions).
+        "a617efd79ae72d064ab558b4f9c7eeb1ae12542a",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.
@@ -116,7 +128,9 @@ PROTECTED_M3A_BLOBS = {
         # app_gptnix_watcher_voice_send_text_turn() declaration (see .c blob comment above).
         # M3C fix (web research follow-up, 2026-08-23): app_gptnix_watcher_voice_audio_cb_t typedef gains
         # a 5th `bool interrupted` parameter (see .c blob comment above).
-        "f9ba1b313c955e4a103104fb9cacc73b99b23ecb",
+        # M3C.1A session-resumption foundation: adds the app_gptnix_watcher_voice_resume_once()
+        # declaration (see .c blob comment above). Purely additive (14 lines, zero deletions).
+        "1f2fa100240263415f0770db7319213026eb3a70",
     "examples/factory_firmware/main/app/app_wifi.c":
         "96f3e1a240c70c3500f977d59c9aea7ed51b1077",
     "examples/factory_firmware/main/app/app_wifi.h":

@@ -978,7 +978,188 @@ def _c83():
     return m is not None, "expected register_cmd_gw_say(); register_cmd_gw_resume(); block not found"
 
 
-FITNESS_CHECK_COUNT = 83
+def _server_content_handler_body():
+    text = _read(APP_C)
+    fn_start = text.find("static void s_handle_ready_server_content(")
+    fn_end = text.find("\nstatic void s_ws_event_handler(", fn_start)
+    return text[fn_start:fn_end]
+
+
+def _server_terminal_log_call():
+    body = _server_content_handler_body()
+    start = body.find('ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_terminal:')
+    end = body.find(");", start) + 2
+    return body[start:end]
+
+
+@check("84. server_terminal diagnostic marker is emitted exactly once, immediately after the existing server_content log line")
+def _c84():
+    body = _server_content_handler_body()
+    marker_count = len(re.findall(r'"\[V2_WATCHER_VOICE\] server_terminal:', body))
+    sc_idx = body.find('"[V2_WATCHER_VOICE] server_content:')
+    st_idx = body.find('"[V2_WATCHER_VOICE] server_terminal:')
+    ordered = sc_idx != -1 and st_idx != -1 and sc_idx < st_idx
+    return marker_count == 1 and ordered, "marker_count=%d sc_idx=%d st_idx=%d" % (marker_count, sc_idx, st_idx)
+
+
+@check("85. tc_p (turnComplete presence) is derived from pointer presence, not boolean value, reusing the single existing turnComplete lookup")
+def _c85():
+    body = _server_content_handler_body()
+    lookup_count = len(re.findall(r'cJSON_GetObjectItemCaseSensitive\(server_content,\s*"turnComplete"\)', body))
+    presence_line = re.search(r'tc_present\s*=\s*\(tc\s*!=\s*NULL\);', body) is not None
+    return lookup_count == 1 and presence_line, "lookup_count=%d presence_line=%s" % (lookup_count, presence_line)
+
+
+@check("86. tc value in server_terminal reuses the existing turn_complete variable directly, no duplicate computation")
+def _c86():
+    log_call = _server_terminal_log_call()
+    uses_existing = "(int)turn_complete" in log_call
+    body = _server_content_handler_body()
+    tc_value_var_count = len(re.findall(r'\btc_value\b', body))
+    return uses_existing and tc_value_var_count == 0, "uses_existing=%s tc_value_var_count=%d" % (uses_existing, tc_value_var_count)
+
+
+@check("87. generationComplete presence (gc_p) and value (gc) are each computed via exactly one new cJSON lookup")
+def _c87():
+    body = _server_content_handler_body()
+    lookup_count = len(re.findall(r'cJSON_GetObjectItemCaseSensitive\(server_content,\s*"generationComplete"\)', body))
+    presence_line = re.search(r'gc_present\s*=\s*\(gc\s*!=\s*NULL\);', body) is not None
+    value_line = re.search(r'gc_value\s*=\s*cJSON_IsBool\(gc\)\s*&&\s*cJSON_IsTrue\(gc\);', body) is not None
+    return lookup_count == 1 and presence_line and value_line, \
+        "lookup_count=%d presence_line=%s value_line=%s" % (lookup_count, presence_line, value_line)
+
+
+@check("88. generationComplete's value is never read outside the server_terminal log line (cannot drive turn_complete or any state transition)")
+def _c88():
+    body = _server_content_handler_body()
+    log_call = _server_terminal_log_call()
+    # Exclude the diagnostic ESP_LOGI call itself: its format string's field label "gc=%d" is a bare
+    # "gc" token to a naive word-boundary regex, but it is a print label, not a code read -- the real
+    # question this check answers is whether anything OTHER than that log call reads gc/gc_value.
+    code_only = body.replace(log_call, "")
+    gc_value_occurrences = len(re.findall(r'\bgc_value\b', code_only))
+    gc_occurrences = len(re.findall(r'\bgc\b', code_only))
+    in_condition = re.search(r'\b(if|while|switch)\s*\([^)]*\bgc(_value)?\b', body) is not None
+    # Expected occurrences outside the log call: declaration + assignment = 2 for gc_value;
+    # declaration + presence-check + IsBool + IsTrue = 4 for gc.
+    return gc_value_occurrences == 2 and gc_occurrences == 4 and not in_condition, \
+        "gc_value_occurrences=%d gc_occurrences=%d in_condition=%s" % (gc_value_occurrences, gc_occurrences, in_condition)
+
+
+@check("89. interrupted presence (int_p) and value (int) reuse the existing interrupted/is_interrupted lookups -- no duplicate cJSON lookup")
+def _c89():
+    body = _server_content_handler_body()
+    lookup_count = len(re.findall(r'cJSON_GetObjectItemCaseSensitive\(server_content,\s*"interrupted"\)', body))
+    presence_line = re.search(r'int_present\s*=\s*\(interrupted\s*!=\s*NULL\);', body) is not None
+    value_line = re.search(r'int_value\s*=\s*is_interrupted;', body) is not None
+    return lookup_count == 1 and presence_line and value_line, \
+        "lookup_count=%d presence_line=%s value_line=%s" % (lookup_count, presence_line, value_line)
+
+
+@check("90. modelTurn presence (mt_p) reuses the existing modelTurn lookup -- no duplicate cJSON lookup, no value/content exposed")
+def _c90():
+    body = _server_content_handler_body()
+    lookup_count = len(re.findall(r'cJSON_GetObjectItemCaseSensitive\(server_content,\s*"modelTurn"\)', body))
+    presence_line = re.search(r'model_turn_present\s*=\s*\(model_turn\s*!=\s*NULL\);', body) is not None
+    log_call = _server_terminal_log_call()
+    no_value_logged = "model_turn_present" not in log_call.replace("(int)model_turn_present", "")
+    return lookup_count == 1 and presence_line and no_value_logged, \
+        "lookup_count=%d presence_line=%s no_value_logged=%s" % (lookup_count, presence_line, no_value_logged)
+
+
+@check("91. server_terminal log line uses only bounded %d integer format specifiers, matching its 7 arguments exactly")
+def _c91():
+    log_call = _server_terminal_log_call()
+    fmt_match = re.search(r'"\[V2_WATCHER_VOICE\] server_terminal:[^"]*"', log_call)
+    fmt = fmt_match.group(0) if fmt_match else ""
+    specifiers = re.findall(r"%\w", fmt)
+    all_d = specifiers != [] and all(s == "%d" for s in specifiers)
+    arg_count = len(re.findall(r"\(int\)\w+", log_call))
+    return all_d and len(specifiers) == 7 and arg_count == 7, \
+        "specifiers=%s arg_count=%d" % (specifiers, arg_count)
+
+
+@check("92. server_terminal log line references no raw JSON object/reply/parts/data (no raw payload logged)")
+def _c92():
+    log_call = _server_terminal_log_call()
+    # Word-boundary match, not substring: "model_turn_present" legitimately contains "model_turn" as a
+    # substring (it is the presence-only flag for that field), so a naive `in` check would false-positive.
+    forbidden = ["reply", "server_content", "parts", "data_item", "cJSON_Print", "valuestring"]
+    hits = [s for s in forbidden if s in log_call]
+    if re.search(r'\bmodel_turn\b', log_call):
+        hits.append("model_turn")
+    return not hits, "hits=%s" % hits
+
+
+@check("93. server_terminal log line references no resumption handle or token")
+def _c93():
+    log_call = _server_terminal_log_call()
+    forbidden = ["resumption_handle", "resumption_handle_len", "ctx->token", "handle"]
+    hits = [s for s in forbidden if s in log_call]
+    return not hits, "hits=%s" % hits
+
+
+@check("94. server_terminal log line references no Authorization/API-key/UID or module-owned ctx-> state")
+def _c94():
+    log_call = _server_terminal_log_call()
+    forbidden = ["Authorization", "api_key", "API_KEY", "uid", "UID", "ctx->"]
+    hits = [s for s in forbidden if s in log_call]
+    return not hits, "hits=%s" % hits
+
+
+@check("95. existing turn_complete control-flow (audio callback + server_content log line) is unchanged and precedes server_terminal")
+def _c95():
+    body = _server_content_handler_body()
+    cb_block = "if (turn_complete && s_audio_cb != NULL) {\n        s_audio_cb(NULL, 0, true, false, s_audio_cb_user_data);\n    }" in body
+    log_line = 'ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_content: full=%d parts=%d turn_complete=%d",' in body
+    return cb_block and log_line, "cb_block=%s log_line=%s" % (cb_block, log_line)
+
+
+@check("96. existing interrupted side-effect block (ESP_LOGW + audio flush) is unchanged and still gated solely on is_interrupted")
+def _c96():
+    body = _server_content_handler_body()
+    warn_line = 'ESP_LOGW(TAG, "[V2_WATCHER_VOICE] server_content: interrupted=true");' in body
+    gate = re.search(r'if\s*\(is_interrupted\)\s*\{', body) is not None
+    flush_call = "s_audio_cb(NULL, 0, false, true, s_audio_cb_user_data);" in body
+    return warn_line and gate and flush_call, "warn_line=%s gate=%s flush_call=%s" % (warn_line, gate, flush_call)
+
+
+@check("97. generationComplete never appears inside any if/while/switch condition anywhere in the file (diagnostics-only, no control-flow use)")
+def _c97():
+    text = _read(APP_C)
+    hits = re.findall(r'\b(if|while|switch)\s*\([^)]*\bgc(_present|_value)?\b', text)
+    return not hits, "hits=%s" % hits
+
+
+@check("98. the diagnostic adds no new WebSocket send/provider call and no new retry/loop construct")
+def _c98():
+    body = _server_content_handler_body()
+    ws_send_hits = len(re.findall(r"esp_websocket_client_send\w*\(", body))
+    new_loop_hits = len(re.findall(r"\bwhile\s*\(", body))
+    return ws_send_hits == 0 and new_loop_hits == 0, \
+        "ws_send_hits=%d new_loop_hits=%d" % (ws_send_hits, new_loop_hits)
+
+
+@check("99. the diagnostic adds no new ctx->state transition (function body only ever discards ctx via (void)ctx;)")
+def _c99():
+    body = _server_content_handler_body()
+    ctx_refs = re.findall(r"\bctx\s*->", body)
+    void_ctx = "(void)ctx;" in body
+    return not ctx_refs and void_ctx, "ctx_refs=%s void_ctx=%s" % (ctx_refs, void_ctx)
+
+
+@check("100. diagnostic variables (tc_present/gc_present/gc_value/int_present/int_value/model_turn_present) are function-scoped locals only, never added to the struct")
+def _c100():
+    header_text = _read(APP_H)
+    forbidden = ["tc_present", "gc_present", "gc_value", "int_present", "int_value", "model_turn_present"]
+    hits = [s for s in forbidden if s in header_text]
+    body = _server_content_handler_body()
+    all_declared_local = all(("bool %s = false;" % name) in body for name in forbidden)
+    return not hits and all_declared_local, "header_hits=%s all_declared_local=%s" % (hits, all_declared_local)
+
+
+FITNESS_CHECK_COUNT = 100
+
 
 
 def main():

@@ -2645,5 +2645,145 @@ def _c298():
     return not missing and tag_ok, "missing=%s tag_ok=%s" % (missing, tag_ok)
 
 
+def _do_session_post_body():
+    return _extract_c_function(
+        PROVISION_C_CODE,
+        "static app_gptnix_watcher_provision_result_t s_do_session_post(",
+        "static app_gptnix_watcher_provision_result_t s_hand_off_to_voice(",
+    )
+
+
+@check("299. session HTTP connect-failure transport diagnostic: esp_http_client_get_errno is called exactly once, reusing the existing client handle -- no new esp_http_client_init/perform call site")
+def _c299():
+    body = _do_session_post_body()
+    call_count = len(re.findall(r"esp_http_client_get_errno\(client\)", body))
+    init_count = len(re.findall(r"esp_http_client_init\(", body))
+    return call_count == 1 and init_count == 1, "call_count=%d init_count=%d" % (call_count, init_count)
+
+
+@check("300. connect_errno diagnostic occurs strictly AFTER esp_http_client_perform() -- never gates or precedes the canonical HTTP attempt")
+def _c300():
+    body = _do_session_post_body()
+    perform_idx = body.find("esp_http_client_perform(client)")
+    errno_idx = body.find("esp_http_client_get_errno(client)")
+    return perform_idx != -1 and errno_idx != -1 and perform_idx < errno_idx, \
+        "perform_idx=%d errno_idx=%d" % (perform_idx, errno_idx)
+
+
+@check("301. esp_http_client_perform() is still called exactly once in s_do_session_post() -- diagnostic added no second call")
+def _c301():
+    body = _do_session_post_body()
+    n = len(re.findall(r"esp_http_client_perform\(", body))
+    return n == 1, "perform_count=%d" % n
+
+
+@check("302. s_do_session_post() is still called exactly once from s_run_provision_cycle() -- diagnostic added no second session POST")
+def _c302():
+    n = len(re.findall(r"\bs_do_session_post\(", PROVISION_C_CODE))
+    # exactly one definition site + exactly one call site = 2 total occurrences of the bare identifier
+    # followed by an opening paren, excluding the function's own forward-facing prototype-less definition.
+    return n == 2, "occurrences=%d" % n
+
+
+@check("303. GW_HTTP_TIMEOUT_MS remains 10000, unchanged by this diagnostic")
+def _c303():
+    return "GW_HTTP_TIMEOUT_MS       10000" in PROVISION_C_CODE, ""
+
+
+@check("304. existing provisioning terminal-result mapping (HTTP_FAILED on perform_err != ESP_OK) is unchanged")
+def _c304():
+    body = _do_session_post_body()
+    return "result = GPTNIX_WATCHER_PROVISION_RESULT_HTTP_FAILED;" in body and \
+        "if (perform_err != ESP_OK) {" in body, ""
+
+
+@check("305. no new retry loop added around the HTTP attempt -- s_do_session_post() contains no while/for construct")
+def _c305():
+    body = _do_session_post_body()
+    while_hits = len(re.findall(r"\bwhile\s*\(", body))
+    for_hits = len(re.findall(r"\bfor\s*\(", body))
+    return while_hits == 0 and for_hits == 0, "while_hits=%d for_hits=%d" % (while_hits, for_hits)
+
+
+@check("306. no new sleep/delay added -- s_do_session_post() contains no vTaskDelay/sleep/usleep call")
+def _c306():
+    body = _do_session_post_body()
+    hits = [s for s in ("vTaskDelay(", "sleep(", "usleep(", "ets_delay_us(") if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("307. the new diagnostic log line matches the required [WATCHER_HTTP] action: detail contract with a single bounded %d integer, no string/pointer format specifiers")
+def _c307():
+    m = re.search(r'ESP_LOGI\(TAG, "\[WATCHER_HTTP\] connect_errno: value=%d",\s*connect_errno\);', PROVISION_C_CODE)
+    return m is not None, ""
+
+
+@check("308. the new diagnostic log line references no hostname, URL, token, or Authorization content")
+def _c308():
+    m = re.search(r'ESP_LOGI\(TAG, "\[WATCHER_HTTP\] connect_errno:[^;]*;', PROVISION_C_CODE, re.DOTALL)
+    line = m.group(0) if m else ""
+    forbidden = ["session_url", "host", "auth_value", "Authorization", "token", "%s"]
+    hits = [s for s in forbidden if s in line]
+    return m is not None and not hits, "hits=%s" % hits
+
+
+@check("309. no new #include was added for this diagnostic -- esp_http_client_get_errno is declared by the already-included esp_http_client.h")
+def _c309():
+    include_lines = [ln for ln in PROVISION_C_RAW.splitlines() if ln.strip().startswith("#include")]
+    expected = [
+        '#include "app_gptnix_watcher_provision.h"', '#include "sdkconfig.h"', '#include <stdbool.h>',
+        '#include <stddef.h>', '#include <stdint.h>', '#include <string.h>', '#include "mbedtls/platform_util.h"',
+        '#include <stdio.h>', '#include <stdlib.h>', '#include "freertos/FreeRTOS.h"', '#include "freertos/task.h"',
+        '#include "freertos/semphr.h"', '#include "esp_log.h"', '#include "esp_err.h"', '#include "esp_event.h"',
+        '#include "esp_netif.h"', '#include "esp_heap_caps.h"', '#include "esp_http_client.h"',
+        '#include "esp_crt_bundle.h"', '#include "esp_timer.h"', '#include <time.h>', '#include "driver/uart.h"',
+        '#include "app_gptnix_watcher_voice.h"', '#include "app_gptnix_watcher_voice_runtime.h"',
+    ]
+    extra = [ln.strip() for ln in include_lines if ln.strip() not in expected]
+    return not extra, "extra_includes=%s" % extra
+
+
+@check("310. no new DNS-resolution API call was introduced anywhere in the file (no getaddrinfo/gethostbyname/dns_gethostbyname/lwip_getaddrinfo -- the pre-connect probe design was rejected on Heisenberg-risk grounds)")
+def _c310():
+    forbidden = ["getaddrinfo(", "gethostbyname(", "dns_gethostbyname(", "lwip_getaddrinfo("]
+    hits = [s for s in forbidden if s in PROVISION_C_CODE]
+    return not hits, "hits=%s" % hits
+
+
+@check("311. the diagnostic reads connect_errno unconditionally (both success and failure paths), matching this file's existing always-emit structural-log convention -- not gated behind an if")
+def _c311():
+    body = _do_session_post_body()
+    m = re.search(r'\bint connect_errno = esp_http_client_get_errno\(client\);\s*\n\s*ESP_LOGI', body)
+    return m is not None, ""
+
+
+@check("312. existing http_perform/http_status diagnostic lines remain byte-unchanged immediately before the new diagnostic")
+def _c312():
+    body = _do_session_post_body()
+    return ('ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_perform: err=%d elapsed_ms=%lld",' in body and
+            'ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_status: code=%d", status);' in body), ""
+
+
+@check("313. the module's secret-lifetime discipline is unaffected -- all 9 pre-existing auth_value/token_buf/acc.buf zeroization call sites remain present unchanged, and the immediate-post-perform() auth_value+token_buf pair still precedes esp_http_client_cleanup() exactly as before this diagnostic")
+def _c313():
+    body = _do_session_post_body()
+    zeroize_count = len(re.findall(r"mbedtls_platform_zeroize\(", body))
+    # The exact pre-existing sequence: zeroize auth_value, free it, zeroize token_buf, free it, THEN cleanup --
+    # unchanged verbatim from before this diagnostic was added (only the new connect_errno lines were
+    # inserted earlier, above this block, per check #312's own byte-exact confirmation of the two lines
+    # immediately preceding it).
+    pre_cleanup_sequence = (
+        "mbedtls_platform_zeroize(auth_value, auth_len + 1);\n"
+        "    free(auth_value);\n"
+        "    mbedtls_platform_zeroize(token_buf, token_len + 1);\n"
+        "    free(token_buf);\n"
+        "\n"
+        "    esp_http_client_cleanup(client);"
+    )
+    sequence_intact = pre_cleanup_sequence in body
+    return zeroize_count == 9 and sequence_intact, \
+        "zeroize_count=%d sequence_intact=%s" % (zeroize_count, sequence_intact)
+
+
 if __name__ == "__main__":
     sys.exit(main())

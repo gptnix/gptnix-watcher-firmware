@@ -464,6 +464,28 @@ static app_gptnix_watcher_provision_result_t s_do_session_post(
     // non-secret integers -- needed now that perform_err alone (ESP_OK) no longer distinguishes the
     // actual failure branch below.
     ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_status: code=%d", status);
+    // Session HTTP connect-failure transport diagnostic (2026-08-27 follow-up): a live physical audit of
+    // an ESP_ERR_HTTP_CONNECT failure (elapsed_ms=80, dramatically faster than every successful connect's
+    // 2.3-2.9s) directly DISPROVED the 2026-08-23 comment's SNTP/TLS-time-validity hypothesis above --
+    // three prior successful runs had the same unsynced-clock signature (unix_time=44) and connected fine
+    // anyway. The real gap: esp_transport_connect()/esp_tls_conn_new_sync() bundle DNS resolution, TCP
+    // connect, and TLS handshake into one opaque failure with no way to tell which sub-step failed. Adding
+    // a pre-connect DNS probe to distinguish them was explicitly rejected as too risky: lwIP's DNS
+    // resolver cache (dns_table[DNS_TABLE_SIZE], components/lwip/lwip/src/core/dns.c in the pinned
+    // ESP-IDF v5.2.1 tree) is a single process-wide cache shared by every DNS lookup on the device -- a
+    // probe that succeeds would warm it, so the real connect's own internal DNS resolution would then hit
+    // the cache instead of performing its own independent lookup, eliminating the exact race this
+    // diagnostic exists to observe. Reading purely passively instead: esp_http_client_get_errno() (already
+    // part of the public esp_http_client.h API this file already includes) reads a POSIX errno the
+    // transport layer already captured via its own esp_transport_set_errors() call inside ssl_connect()'s
+    // existing failure path (pinned ESP-IDF v5.2.1, components/tcp_transport/transport_ssl.c) -- zero new
+    // network activity, no state change to the connection attempt that already happened. A value of 0
+    // means no system-level socket errno was ever captured (most consistent with a DNS-layer failure,
+    // before any socket syscall); a nonzero value is a real POSIX errno from an actual TCP-level connect()
+    // attempt (proving DNS succeeded and the failure was at the TCP layer). Bounded integer only, never a
+    // hostname, URL, or token.
+    int connect_errno = esp_http_client_get_errno(client);
+    ESP_LOGI(TAG, "[WATCHER_HTTP] connect_errno: value=%d", connect_errno);
 
     // Immediately after perform() returns: zeroize the auth buffer and the staged ID token, before any later
     // M2/WSS work -- never deferred, regardless of the outcome below.

@@ -1115,12 +1115,33 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
     (void)ctx;
     int audio_parts_found = 0;
     bool turn_complete = false;
+    // M3C.1B S9 diagnostic (plans/M3C1B_S9_TURN_TERMINAL_CHILD_TASK.md): presence tracked SEPARATELY from
+    // boolean value for every terminal-metadata field below, so "field missing" and "field explicitly
+    // false" are no longer collapsed into the identical structural log line they previously produced
+    // (proven ambiguity: turn_complete's own computation, and interrupted's, already discarded this
+    // distinction). Reuses the exact same cJSON lookups already performed below for
+    // turnComplete/interrupted/modelTurn -- generationComplete is the only new lookup added, and its
+    // value is NEVER read by any existing control flow: it cannot drive turn_complete, the state machine, or any
+    // side effect, it is diagnostics-only. Official field names confirmed against
+    // ai.google.dev/api/live (BidiGenerateContentServerContent: generationComplete, turnComplete,
+    // interrupted, modelTurn).
+    bool tc_present = false;
+    bool gc_present = false;
+    bool gc_value = false;
+    bool int_present = false;
+    bool int_value = false;
+    bool model_turn_present = false;
 
     if (full_consumption && reply != NULL && cJSON_IsObject(reply)) {
         cJSON *server_content = cJSON_GetObjectItemCaseSensitive(reply, "serverContent");
         if (cJSON_IsObject(server_content)) {
             cJSON *tc = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
             turn_complete = cJSON_IsBool(tc) && cJSON_IsTrue(tc);
+            tc_present = (tc != NULL);
+
+            cJSON *gc = cJSON_GetObjectItemCaseSensitive(server_content, "generationComplete");
+            gc_present = (gc != NULL);
+            gc_value = cJSON_IsBool(gc) && cJSON_IsTrue(gc);
 
             // M3C diagnostic (plans/M3C_AUDIO_BRIDGE_CHILD_TASK.md follow-up): the operator reported
             // Gemini's spoken reply repeatedly cutting off mid-sentence even after two separate playback-
@@ -1132,6 +1153,8 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
             // logic. Never logged before -- this field was previously silently ignored entirely.
             cJSON *interrupted = cJSON_GetObjectItemCaseSensitive(server_content, "interrupted");
             bool is_interrupted = cJSON_IsBool(interrupted) && cJSON_IsTrue(interrupted);
+            int_present = (interrupted != NULL);
+            int_value = is_interrupted;
             if (is_interrupted) {
                 ESP_LOGW(TAG, "[V2_WATCHER_VOICE] server_content: interrupted=true");
                 // Web research follow-up (Google AI Developers Forum "Hard-Won Patterns" thread;
@@ -1146,6 +1169,7 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
             }
 
             cJSON *model_turn = cJSON_GetObjectItemCaseSensitive(server_content, "modelTurn");
+            model_turn_present = (model_turn != NULL);
             cJSON *parts = cJSON_IsObject(model_turn)
                 ? cJSON_GetObjectItemCaseSensitive(model_turn, "parts") : NULL;
             if (cJSON_IsArray(parts) && s_audio_cb != NULL) {
@@ -1187,6 +1211,12 @@ static void s_handle_ready_server_content(struct app_gptnix_watcher_voice *ctx, 
 
     ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_content: full=%d parts=%d turn_complete=%d",
         (int)full_consumption, audio_parts_found, (int)turn_complete);
+    // M3C.1B S9 diagnostic: bounded structural integers only -- no raw JSON, no model text/audio content,
+    // no resumption handle, no token. generationComplete is logged here for visibility ONLY; it is never
+    // read anywhere else in this file.
+    ESP_LOGI(TAG, "[V2_WATCHER_VOICE] server_terminal: tc_p=%d tc=%d gc_p=%d gc=%d int_p=%d int=%d mt_p=%d",
+        (int)tc_present, (int)turn_complete, (int)gc_present, (int)gc_value,
+        (int)int_present, (int)int_value, (int)model_turn_present);
 }
 
 static void s_ws_event_handler(void *handler_args,

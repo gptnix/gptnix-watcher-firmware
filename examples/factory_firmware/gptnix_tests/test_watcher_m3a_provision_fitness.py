@@ -135,7 +135,13 @@ PROTECTED_M3A_BLOBS = {
         # ws_client, no auto-resume caller, disable_auto_reconnect unchanged, handle never logged, etc.),
         # PASS, confirming no functional/security regression regardless of the unrecoverable prior hash.
         # Freshly recomputed via git hash-object against the actual current file.
-        "e04f58cefa4a1b02a8954d63f005db3ed33b0ab5",
+        # M3C.1B S9 diagnostic (plans/M3C1B_S9_TURN_TERMINAL_CHILD_TASK.md): adds presence-vs-value
+        # tracking (tc_present/gc_present/gc_value/int_present/int_value/model_turn_present) to
+        # s_handle_ready_server_content() and one new additive log line
+        # ("[V2_WATCHER_VOICE] server_terminal: ..."), plus a single new generationComplete lookup whose
+        # value is never read outside that log line -- no existing behavior/state transition changed.
+        # Freshly recomputed via git hash-object against the actual current file.
+        "86ff268409451789fcf61f24d7d1c5370419a91f",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.

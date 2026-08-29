@@ -54,6 +54,7 @@
 #include "esp_netif.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include <time.h>
@@ -353,14 +354,50 @@ typedef struct {
     size_t len;
     size_t cap;
     bool overflow;
+    // ESP-TLS provenance marker (2026-08-29 follow-up to the 2026-08-27 connect_errno diagnostic above):
+    // captured from the existing HTTP_EVENT_ERROR event on the same esp_http_client_perform() call this
+    // struct already exists for -- no new event owner, no new call site. First-capture-only, never a
+    // control-flow input. See s_http_event_handler and the tls_esp_error log site below for the full
+    // provenance chain and why this is needed (connect_errno alone proved ambiguous).
+    bool tls_esp_error_seen;
+    int tls_esp_error;
 } gw_http_response_accumulator_t;
 
 static esp_err_t s_http_event_handler(esp_http_client_event_t *evt)
 {
+    if (evt == NULL) {
+        return ESP_OK;
+    }
+
+    gw_http_response_accumulator_t *acc =
+        (gw_http_response_accumulator_t *)evt->user_data;
+
+    // ESP-TLS provenance marker (2026-08-29): passive read of the independent ESP_TLS_ERR_TYPE_ESP slot
+    // inside the same esp_tls_error_handle_t that esp_http_client_open()'s connect-failure path already
+    // passes as evt->data on this event (pinned ESP-IDF v5.2.1, esp_http_client.c -- confirmed by source
+    // audit, not assumed). This slot is entirely independent of the SYSTEM/sock_errno slot the existing
+    // esp_http_client_get_errno() call below already reads -- clearing one never disturbs the other
+    // (esp_tls_error_capture.c stores each error type in its own separate struct field). Zero new network
+    // I/O: this only reads state ESP-TLS already captured internally during the perform() call already
+    // made. First occurrence only; never influences readiness or any control-flow decision.
+    if (evt->event_id == HTTP_EVENT_ERROR) {
+        if (acc != NULL && evt->data != NULL && !acc->tls_esp_error_seen) {
+            int esp_code = 0;
+            esp_err_t read_err = esp_tls_get_and_clear_error_type(
+                (esp_tls_error_handle_t)evt->data,
+                ESP_TLS_ERR_TYPE_ESP,
+                &esp_code);
+            if (read_err == ESP_OK) {
+                acc->tls_esp_error_seen = true;
+                acc->tls_esp_error = esp_code;
+            }
+        }
+        return ESP_OK;
+    }
+
     if (evt->event_id != HTTP_EVENT_ON_DATA) {
         return ESP_OK;
     }
-    gw_http_response_accumulator_t *acc = (gw_http_response_accumulator_t *)evt->user_data;
     if (acc == NULL || acc->overflow) {
         return ESP_OK;
     }
@@ -464,6 +501,41 @@ static app_gptnix_watcher_provision_result_t s_do_session_post(
     // non-secret integers -- needed now that perform_err alone (ESP_OK) no longer distinguishes the
     // actual failure branch below.
     ESP_LOGI(TAG, "[V2_WATCHER_PROVISION] http_status: code=%d", status);
+    // Session HTTP connect-failure transport diagnostic (2026-08-27 follow-up): a live physical audit of
+    // an ESP_ERR_HTTP_CONNECT failure (elapsed_ms=80, dramatically faster than every successful connect's
+    // 2.3-2.9s) directly DISPROVED the 2026-08-23 comment's SNTP/TLS-time-validity hypothesis above --
+    // three prior successful runs had the same unsynced-clock signature (unix_time=44) and connected fine
+    // anyway. The real gap: esp_transport_connect()/esp_tls_conn_new_sync() bundle DNS resolution, TCP
+    // connect, and TLS handshake into one opaque failure with no way to tell which sub-step failed. Adding
+    // a pre-connect DNS probe to distinguish them was explicitly rejected as too risky: lwIP's DNS
+    // resolver cache (dns_table[DNS_TABLE_SIZE], components/lwip/lwip/src/core/dns.c in the pinned
+    // ESP-IDF v5.2.1 tree) is a single process-wide cache shared by every DNS lookup on the device -- a
+    // probe that succeeds would warm it, so the real connect's own internal DNS resolution would then hit
+    // the cache instead of performing its own independent lookup, eliminating the exact race this
+    // diagnostic exists to observe. Reading purely passively instead: esp_http_client_get_errno() (already
+    // part of the public esp_http_client.h API this file already includes) reads a POSIX errno the
+    // transport layer already captured via its own esp_transport_set_errors() call inside ssl_connect()'s
+    // existing failure path (pinned ESP-IDF v5.2.1, components/tcp_transport/transport_ssl.c) -- zero new
+    // network activity, no state change to the connection attempt that already happened.
+    //
+    // Provenance correction (2026-08-29, after a pinned ESP-IDF v5.2.1/lwIP source audit following a third
+    // physical recurrence, Attempt #12): connect_errno is SUPPLEMENTAL evidence only -- it does NOT prove
+    // DNS succeeded or that TCP connect() was reached. Two distinct source paths can both surface the same
+    // nonzero value here: (1) the DNS-resolution-failure capture site never explicitly sets errno on a
+    // getaddrinfo() failure, so it can inherit an arbitrary stale/ambient errno with zero TCP connect()
+    // involvement; and (2) even a genuine post-connect() SO_ERROR capture routes through lwIP's own
+    // err_to_errno() table, where distinct internal conditions (a genuine connection timeout vs. a
+    // transient would-block state) collapse to the identical POSIX value -- so a nonzero connect_errno
+    // does not by itself distinguish "connect still normally in progress" from "the attempt genuinely
+    // failed inside lwIP." The independent ESP_TLS_ERR_TYPE_ESP marker captured in s_http_event_handler
+    // above (tls_esp_error_seen / tls_esp_error, logged just below) is the canonical DNS-vs-connect
+    // classification source for future physical diagnostics; connect_errno remains present for supplemental
+    // low-level detail only. Bounded integer only, never a hostname, URL, or token.
+    if (acc.tls_esp_error_seen) {
+        ESP_LOGI(TAG, "[WATCHER_HTTP] tls_esp_error: value=%d", acc.tls_esp_error);
+    }
+    int connect_errno = esp_http_client_get_errno(client);
+    ESP_LOGI(TAG, "[WATCHER_HTTP] connect_errno: value=%d", connect_errno);
 
     // Immediately after perform() returns: zeroize the auth buffer and the staged ID token, before any later
     // M2/WSS work -- never deferred, regardless of the outcome below.

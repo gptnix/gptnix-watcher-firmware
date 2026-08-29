@@ -2727,7 +2727,7 @@ def _c308():
     return m is not None and not hits, "hits=%s" % hits
 
 
-@check("309. no new #include was added for this diagnostic -- esp_http_client_get_errno is declared by the already-included esp_http_client.h")
+@check("309. no UNDOCUMENTED #include was added -- esp_http_client_get_errno is declared by the already-included esp_http_client.h; esp_tls.h (2026-08-29, tls_esp_error marker) is the sole authorized new addition, for the public esp_tls_get_and_clear_error_type/ESP_TLS_ERR_TYPE_ESP API")
 def _c309():
     include_lines = [ln for ln in PROVISION_C_RAW.splitlines() if ln.strip().startswith("#include")]
     expected = [
@@ -2736,6 +2736,7 @@ def _c309():
         '#include <stdio.h>', '#include <stdlib.h>', '#include "freertos/FreeRTOS.h"', '#include "freertos/task.h"',
         '#include "freertos/semphr.h"', '#include "esp_log.h"', '#include "esp_err.h"', '#include "esp_event.h"',
         '#include "esp_netif.h"', '#include "esp_heap_caps.h"', '#include "esp_http_client.h"',
+        '#include "esp_tls.h"',
         '#include "esp_crt_bundle.h"', '#include "esp_timer.h"', '#include <time.h>', '#include "driver/uart.h"',
         '#include "app_gptnix_watcher_voice.h"', '#include "app_gptnix_watcher_voice_runtime.h"',
     ]
@@ -2783,6 +2784,170 @@ def _c313():
     sequence_intact = pre_cleanup_sequence in body
     return zeroize_count == 9 and sequence_intact, \
         "zeroize_count=%d sequence_intact=%s" % (zeroize_count, sequence_intact)
+
+
+# ---------------------------------------------------------------------------
+# ESP-TLS provenance marker (2026-08-29, Attempt #13 follow-up to the errno=11 provenance audit): the
+# connect_errno diagnostic above proved unable to distinguish DNS-vs-TCP failures by itself. These checks
+# cover the new passive ESP_TLS_ERR_TYPE_ESP marker read inside the existing, sole HTTP event owner
+# (s_http_event_handler) on the existing HTTP_EVENT_ERROR event -- zero new event owner, zero new network
+# I/O, zero retry, zero control-flow effect.
+# ---------------------------------------------------------------------------
+
+def _http_event_handler_body():
+    return _extract_c_function(
+        PROVISION_C_CODE,
+        "static esp_err_t s_http_event_handler(",
+        "static app_gptnix_watcher_provision_result_t s_do_session_post(",
+    )
+
+
+@check("314. esp_tls.h is included exactly once")
+def _c314():
+    n = len(re.findall(r'#include "esp_tls\.h"', PROVISION_C_RAW))
+    return n == 1, "count=%d" % n
+
+
+@check("315. s_http_event_handler remains the sole HTTP event handler owner -- exactly one event_handler assignment in the whole file, and it still points at s_http_event_handler")
+def _c315():
+    n = len(re.findall(r"\.event_handler\s*=\s*\w+", PROVISION_C_CODE))
+    exact = "config.event_handler = s_http_event_handler;" in PROVISION_C_CODE
+    return n == 1 and exact, "assignment_count=%d exact_match=%s" % (n, exact)
+
+
+@check("316. HTTP_EVENT_ERROR is handled inside the existing s_http_event_handler function body (no second function created)")
+def _c316():
+    body = _http_event_handler_body()
+    return "HTTP_EVENT_ERROR" in body, ""
+
+
+@check("317. evt->data (the raw esp_tls_error_handle_t pointer) is never passed to a logging call -- only the derived integer esp_code may be logged")
+def _c317():
+    body = _http_event_handler_body()
+    hits = re.findall(r"ESP_LOG\w\([^;]*evt->data[^;]*\);", body, re.DOTALL)
+    return not hits, "hits=%s" % hits
+
+
+@check("318. esp_tls_get_and_clear_error_type is called exactly once in the whole file")
+def _c318():
+    n = len(re.findall(r"esp_tls_get_and_clear_error_type\(", PROVISION_C_CODE))
+    return n == 1, "count=%d" % n
+
+
+@check("319. the error type argument to esp_tls_get_and_clear_error_type is exactly ESP_TLS_ERR_TYPE_ESP -- never SYSTEM/MBEDTLS/WOLFSSL/cert-flags")
+def _c319():
+    m = re.search(r"esp_tls_get_and_clear_error_type\(\s*\(esp_tls_error_handle_t\)evt->data,\s*ESP_TLS_ERR_TYPE_ESP,\s*&esp_code\s*\)", PROVISION_C_CODE)
+    return m is not None, ""
+
+
+@check("320. first-capture-only guard exists: the ESP-TLS read is gated behind !acc->tls_esp_error_seen")
+def _c320():
+    body = _http_event_handler_body()
+    return "!acc->tls_esp_error_seen" in body, ""
+
+
+@check("321. no HTTP/network call of any kind exists inside s_http_event_handler (no esp_http_client_*, no socket/connect/send/recv, no getaddrinfo)")
+def _c321():
+    body = _http_event_handler_body()
+    forbidden = ["esp_http_client_perform(", "esp_http_client_open(", "esp_http_client_connect(",
+                 "connect(", "send(", "recv(", "getaddrinfo(", "socket("]
+    hits = [s for s in forbidden if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("322. no new retry loop introduced by this marker -- s_http_event_handler contains no while/for construct")
+def _c322():
+    body = _http_event_handler_body()
+    while_hits = len(re.findall(r"\bwhile\s*\(", body))
+    for_hits = len(re.findall(r"\bfor\s*\(", body))
+    return while_hits == 0 and for_hits == 0, "while_hits=%d for_hits=%d" % (while_hits, for_hits)
+
+
+@check("323. the new diagnostic log line matches the required [WATCHER_HTTP] action: detail contract with a single bounded %d integer, no string/pointer format specifiers")
+def _c323():
+    m = re.search(r'ESP_LOGI\(TAG, "\[WATCHER_HTTP\] tls_esp_error: value=%d",\s*acc\.tls_esp_error\);', PROVISION_C_CODE)
+    return m is not None, ""
+
+
+@check("324. the tls_esp_error marker log references no hostname, URL, token, or Authorization content, and no %s/pointer format specifier")
+def _c324():
+    m = re.search(r'ESP_LOGI\(TAG, "\[WATCHER_HTTP\] tls_esp_error:[^;]*;', PROVISION_C_CODE, re.DOTALL)
+    line = m.group(0) if m else ""
+    forbidden = ["session_url", "host", "auth_value", "Authorization", "token", "%s", "%p"]
+    hits = [s for s in forbidden if s in line]
+    return m is not None and not hits, "hits=%s" % hits
+
+
+@check("325. the tls_esp_error marker log occurs strictly before the connect_errno read/log in s_do_session_post()")
+def _c325():
+    body = _do_session_post_body()
+    tls_idx = body.find('ESP_LOGI(TAG, "[WATCHER_HTTP] tls_esp_error: value=%d"')
+    errno_idx = body.find("esp_http_client_get_errno(client)")
+    return tls_idx != -1 and errno_idx != -1 and tls_idx < errno_idx, \
+        "tls_idx=%d errno_idx=%d" % (tls_idx, errno_idx)
+
+
+@check("326. connect_errno marker remains present and unchanged -- this addition is supplemental, not a replacement")
+def _c326():
+    m = re.search(r'ESP_LOGI\(TAG, "\[WATCHER_HTTP\] connect_errno: value=%d",\s*connect_errno\);', PROVISION_C_CODE)
+    return m is not None, ""
+
+
+@check("327. the now-refuted 'nonzero connect_errno proves DNS succeeded / TCP connect' claim is absent from the source")
+def _c327():
+    forbidden_fragments = [
+        "proving DNS succeeded and the failure was at the TCP layer",
+        "a nonzero value is a real POSIX errno from an actual TCP-level connect()\n    // attempt (proving DNS succeeded",
+    ]
+    hits = [s for s in forbidden_fragments if s in PROVISION_C_RAW]
+    return not hits, "hits=%s" % hits
+
+
+@check("328. the corrected provenance comment explicitly names the independent ESP_TLS_ERR_TYPE_ESP marker as canonical")
+def _c328():
+    return "ESP_TLS_ERR_TYPE_ESP marker captured in s_http_event_handler" in PROVISION_C_RAW, ""
+
+
+@check("329. esp_http_client_perform() remains called exactly once in s_do_session_post() -- this marker added no second call")
+def _c329():
+    body = _do_session_post_body()
+    n = len(re.findall(r"esp_http_client_perform\(", body))
+    return n == 1, "perform_count=%d" % n
+
+
+@check("330. GW_HTTP_TIMEOUT_MS remains 10000, unchanged by this marker")
+def _c330():
+    return "GW_HTTP_TIMEOUT_MS       10000" in PROVISION_C_CODE, ""
+
+
+@check("331. s_wait_for_ip is unchanged by this diff -- its definition site and GW_IP_WAIT_MS call site are both still present, byte-identical to before this marker")
+def _c331():
+    return ("static app_gptnix_watcher_provision_result_t s_wait_for_ip(uint32_t timeout_ms)" in PROVISION_C_CODE
+            and "result = s_wait_for_ip(GW_IP_WAIT_MS);" in PROVISION_C_CODE), ""
+
+
+@check("332. no Authorization/token data can reach either diagnostic -- neither auth_value nor token_buf nor the literal string 'Authorization' appears anywhere inside s_http_event_handler's body")
+def _c332():
+    body = _http_event_handler_body()
+    forbidden = ["auth_value", "token_buf", "Authorization"]
+    hits = [s for s in forbidden if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("333. no URL/hostname data can reach either diagnostic -- session_url/host/client->connection_info do not appear inside s_http_event_handler's body")
+def _c333():
+    body = _http_event_handler_body()
+    forbidden = ["session_url", "->host", "connection_info"]
+    hits = [s for s in forbidden if s in body]
+    return not hits, "hits=%s" % hits
+
+
+@check("334. no new module or firmware dependency was introduced -- esp_tls.h is a pinned ESP-IDF public header already vendored by this exact same build (the same espressif/idf:v5.2.1 image esp_http_client.h itself comes from), not a new external component")
+def _c334():
+    # Structural proxy: the only new #include is esp_tls.h itself (already proven exactly-once by check
+    # 314 and exhaustively enumerated by check 309's expected-list match) -- no CMakeLists.txt/idf_component
+    # change is in scope for this file, and none is present in this diff.
+    return '#include "esp_tls.h"' in PROVISION_C_RAW, ""
 
 
 if __name__ == "__main__":

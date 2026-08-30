@@ -1232,6 +1232,14 @@ static void s_ws_event_handler(void *handler_args,
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
 
     switch (event_id) {
+    case WEBSOCKET_EVENT_BEGIN:
+        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: begin");
+        break;
+
+    case WEBSOCKET_EVENT_BEFORE_CONNECT:
+        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: before_connect");
+        break;
+
     case WEBSOCKET_EVENT_CONNECTED: {
         if (ctx->state != GPTNIX_WATCHER_VOICE_STATE_CONNECTING) {
             ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;

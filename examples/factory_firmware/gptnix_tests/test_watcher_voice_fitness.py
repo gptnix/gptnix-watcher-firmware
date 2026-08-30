@@ -1158,7 +1158,191 @@ def _c100():
     return not hits and all_declared_local, "header_hits=%s all_declared_local=%s" % (hits, all_declared_local)
 
 
-FITNESS_CHECK_COUNT = 100
+
+# ==== M3C.1B BEGIN/BEFORE_CONNECT passive observability (2026-08-30) ====
+# Reuses the SAME def_marker-based full-handler-span extraction as check 67 (not the DOTALL-greedy regex
+# from check 31/66, since this task's constraints need to search the WHOLE handler body reliably, including
+# past nested braces) -- see check 67's own comment for why find()-by-declaration-vs-definition matters here.
+def _s_ws_event_handler_body():
+    text = _read(APP_C)
+    def_marker = "static void s_ws_event_handler(void *handler_args,\n                                esp_event_base_t base,\n                                int32_t event_id,\n                                void *event_data)\n{"
+    fn_start = text.find(def_marker)
+    fn_end = text.find("\n#else /* !CONFIG_GPTNIX_WATCHER_VOICE */")
+    if fn_start < 0 or fn_end < 0:
+        return ""
+    return text[fn_start:fn_end]
+
+
+def _case_block_body(marker, next_marker):
+    body = _s_ws_event_handler_body()
+    start = body.find(marker)
+    if start < 0:
+        return None
+    end = body.find(next_marker, start)
+    if end < 0:
+        return None
+    return body[start:end]
+
+
+@check("101. WEBSOCKET_EVENT_BEGIN case exists exactly once in s_ws_event_handler")
+def _c101():
+    body = _s_ws_event_handler_body()
+    return len(re.findall(r"case WEBSOCKET_EVENT_BEGIN:", body)) == 1, ""
+
+
+@check("102. WEBSOCKET_EVENT_BEFORE_CONNECT case exists exactly once in s_ws_event_handler")
+def _c102():
+    body = _s_ws_event_handler_body()
+    return len(re.findall(r"case WEBSOCKET_EVENT_BEFORE_CONNECT:", body)) == 1, ""
+
+
+@check("103. exact begin log literal exists exactly once")
+def _c103():
+    text = _read(APP_C)
+    return text.count('ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: begin");') == 1, ""
+
+
+@check("104. exact before_connect log literal exists exactly once")
+def _c104():
+    text = _read(APP_C)
+    return text.count('ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: before_connect");') == 1, ""
+
+
+@check("105. BEGIN case block: no event_data/ctx->state/ctx->last_result/esp_websocket_client_/vTaskDelay/retry-loop")
+def _c105():
+    block = _case_block_body("case WEBSOCKET_EVENT_BEGIN:", "case WEBSOCKET_EVENT_BEFORE_CONNECT:")
+    if block is None:
+        return False, "BEGIN case block not found"
+    forbidden_hits = []
+    if "event_data" in block:
+        forbidden_hits.append("event_data")
+    if "ctx->state" in block:
+        forbidden_hits.append("ctx->state")
+    if "ctx->last_result" in block:
+        forbidden_hits.append("ctx->last_result")
+    if "esp_websocket_client_" in block:
+        forbidden_hits.append("esp_websocket_client_")
+    if "vTaskDelay" in block:
+        forbidden_hits.append("vTaskDelay")
+    if re.search(r"\b(for|while)\s*\(", block):
+        forbidden_hits.append("retry/loop")
+    return not forbidden_hits, "hits=%s" % forbidden_hits
+
+
+@check("106. BEFORE_CONNECT case block: no event_data/ctx->state/ctx->last_result/esp_websocket_client_/vTaskDelay/retry-loop")
+def _c106():
+    block = _case_block_body("case WEBSOCKET_EVENT_BEFORE_CONNECT:", "case WEBSOCKET_EVENT_CONNECTED:")
+    if block is None:
+        return False, "BEFORE_CONNECT case block not found"
+    forbidden_hits = []
+    if "event_data" in block:
+        forbidden_hits.append("event_data")
+    if "ctx->state" in block:
+        forbidden_hits.append("ctx->state")
+    if "ctx->last_result" in block:
+        forbidden_hits.append("ctx->last_result")
+    if "esp_websocket_client_" in block:
+        forbidden_hits.append("esp_websocket_client_")
+    if "vTaskDelay" in block:
+        forbidden_hits.append("vTaskDelay")
+    if re.search(r"\b(for|while)\s*\(", block):
+        forbidden_hits.append("retry/loop")
+    return not forbidden_hits, "hits=%s" % forbidden_hits
+
+
+@check("107. existing CONNECTED block still sends setup exactly as before (byte-identical block)")
+def _c107():
+    text = _read(APP_C)
+    expected = (
+        '    case WEBSOCKET_EVENT_CONNECTED: {\n'
+        '        if (ctx->state != GPTNIX_WATCHER_VOICE_STATE_CONNECTING) {\n'
+        '            ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;\n'
+        '            ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;\n'
+        '            break;\n'
+        '        }\n'
+        '        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: connected");\n'
+        '        int sent = esp_websocket_client_send_text(\n'
+        '            ctx->ws_client, ctx->setup_json, (int)ctx->setup_json_len,\n'
+        '            pdMS_TO_TICKS(GPTNIX_WATCHER_VOICE_NETWORK_TIMEOUT_MS));\n'
+        '        if (sent != (int)ctx->setup_json_len) {\n'
+        '            ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;\n'
+        '            ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_WS_SEND_FAILED;\n'
+        '            break;\n'
+        '        }\n'
+        '        ctx->state = GPTNIX_WATCHER_VOICE_STATE_SETUP_SENT;\n'
+        '        ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: setup_sent");\n'
+        '        break;\n'
+        '    }\n'
+    )
+    return expected in text, ""
+
+
+@check("108. existing READY transition logic unchanged (byte-identical is_setup_complete branch)")
+def _c108():
+    text = _read(APP_C)
+    expected = (
+        '            if (is_setup_complete) {\n'
+        '                ctx->state = GPTNIX_WATCHER_VOICE_STATE_READY;\n'
+        '                ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: ready");\n'
+        '            } else {\n'
+        '                ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;\n'
+        '                ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;\n'
+        '            }\n'
+    )
+    return expected in text, ""
+
+
+@check("109. existing ERROR case logic unchanged (byte-identical block)")
+def _c109():
+    text = _read(APP_C)
+    expected = (
+        '    case WEBSOCKET_EVENT_ERROR: {\n'
+        '        ctx->state = GPTNIX_WATCHER_VOICE_STATE_ERROR;\n'
+        '        ctx->last_result = GPTNIX_WATCHER_VOICE_RESULT_PROTOCOL_ERROR;\n'
+        '        int err_type = 0;\n'
+        '        int status = 0;\n'
+        '        if (data != NULL) {\n'
+        '            err_type = (int)data->error_handle.error_type;\n'
+        '            status = data->error_handle.esp_ws_handshake_status_code;\n'
+        '        }\n'
+        '        ESP_LOGW(TAG, "[V2_WATCHER_VOICE] ws_error: type=%d status=%d", err_type, status);\n'
+        '        break;\n'
+        '    }\n'
+    )
+    return expected in text, ""
+
+
+@check("110. existing CLOSED/DISCONNECTED case logic unchanged (byte-identical shared block)")
+def _c110():
+    text = _read(APP_C)
+    expected = (
+        '    case WEBSOCKET_EVENT_CLOSED:\n'
+        '    case WEBSOCKET_EVENT_DISCONNECTED: {\n'
+        '        if (ctx->state != GPTNIX_WATCHER_VOICE_STATE_ERROR) {\n'
+        '            ctx->state = GPTNIX_WATCHER_VOICE_STATE_CLOSED;\n'
+        '            ESP_LOGI(TAG, "[V2_WATCHER_VOICE] ws_state: closed");\n'
+        '        }\n'
+    )
+    return expected in text, ""
+
+
+@check("111. dependency remains pinned exactly 1.7.0 (re-proof alongside checks 4/5, specific to this task's own scope)")
+def _c111():
+    text = _read(IDF_COMPONENT_YML)
+    matches = re.findall(r'espressif/esp_websocket_client:\s*["\']1\.7\.0["\']', text)
+    return len(matches) == 1, "matches=%d" % len(matches)
+
+
+@check("112. BEGIN/BEFORE_CONNECT cases are placed immediately before CONNECTED, purely additive to the switch (no other case removed/reordered)")
+def _c112():
+    body = _s_ws_event_handler_body()
+    order = re.findall(r"case (WEBSOCKET_EVENT_\w+):", body)
+    expected_prefix = ["WEBSOCKET_EVENT_BEGIN", "WEBSOCKET_EVENT_BEFORE_CONNECT", "WEBSOCKET_EVENT_CONNECTED",
+                        "WEBSOCKET_EVENT_DATA", "WEBSOCKET_EVENT_ERROR", "WEBSOCKET_EVENT_CLOSED", "WEBSOCKET_EVENT_DISCONNECTED"]
+    return order == expected_prefix, "order=%s" % order
+
+
+FITNESS_CHECK_COUNT = 112
 
 
 

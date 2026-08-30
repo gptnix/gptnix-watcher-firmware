@@ -141,7 +141,12 @@ PROTECTED_M3A_BLOBS = {
         # ("[V2_WATCHER_VOICE] server_terminal: ..."), plus a single new generationComplete lookup whose
         # value is never read outside that log line -- no existing behavior/state transition changed.
         # Freshly recomputed via git hash-object against the actual current file.
-        "86ff268409451789fcf61f24d7d1c5370419a91f",
+        # M3C.1B passive BEGIN/BEFORE_CONNECT observability (2026-08-30, REV3, see
+        # GPTNIX_WATCHER_M3C1B_BEGIN_BEFORE_CONNECT_OBSERVABILITY_REV3_TASK_2026-08-30.md):
+        # adds fixed non-secret logs for WEBSOCKET_EVENT_BEGIN and WEBSOCKET_EVENT_BEFORE_CONNECT only;
+        # no state/reconnect/timeout/retry behavior changed.
+        # Freshly recomputed via git hash-object against the actual current file.
+        "88d1abaf80bd0cccba01e447fe57be8708988ef7",
     "examples/factory_firmware/main/app/app_gptnix_watcher_voice.h":
         # M3C: adds the app_gptnix_watcher_voice_send_audio()/set_audio_callback() declarations (see .c
         # blob comment above) -- this module still never touches the player/recorder APIs itself.
